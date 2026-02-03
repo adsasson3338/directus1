@@ -86,9 +86,9 @@ services:
       - "traefik.http.routers.nocodb.rule=Host(`nocodb.asasson.xyz`)" 
       - "traefik.http.routers.nocodb.entrypoints=websecure" 
       - "traefik.http.routers.nocodb.tls.certresolver=letsencrypt" 
-      - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
-    networks:
-      - traefik
+      - "traefik.http.services.nocodb.loadbalancer.server.port=8080#"
+#    networks:
+#      - traefik
       
 volumes:
   n8n_data:
