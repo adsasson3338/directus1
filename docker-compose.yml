@@ -14,33 +14,6 @@ services:
       timeout: 5s
       retries: 5
 
-  n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
-    restart: always
-    expose:
-      - "5678"
-    environment:
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=n8n_db
-      - DB_POSTGRESDB_USER=n8n_user
-      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
-      - N8N_HOST=server.asasson.xyz
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=http
-      - N8N_EDITOR_BASE_URL=https://server.asasson.xyz
-      - N8N_PUBLIC_API_BASE_URL=https://server.asasson.xyz
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-      - WEBHOOK_URL=https://server.asasson.xyz/
-      - NODE_ENV=production
-      - GENERIC_TIMEZONE=America/New_York
-    volumes:
-      - n8n_data:/home/node/.n8n
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   nocodb:
     image: nocodb/nocodb:latest
     restart: always
@@ -53,33 +26,6 @@ services:
       - nocodb_data:/usr/app/data
     depends_on:
       - postgres
-
-  nginx:
-    image: jc21/nginx-proxy-manager:latest
-    restart: always
-    ports:
-      - "80:80"
-      - "443:443"
-      - "81:81"
-    volumes:
-      - /home/aaron/npm/data:/data
-      - /home/aaron/npm/letsencrypt:/etc/letsencrypt
-    depends_on:
-      - n8n
-      - nocodb
-      
-  cloudflare-ddns:
-    image: oznu/cloudflare-ddns
-    container_name: cloudflare-ddns
-    restart: unless-stopped
-    environment:
-      - API_KEY=${CF_API_TOKEN}
-      - ZONE=${CF_ZONE}
-      - SUBDOMAIN=${CF_SUBDOMAIN}      
-
 volumes:
   postgres_data:
-  n8n_data:
   nocodb_data:
-  nginx_data:
-  nginx_letsencrypt:
