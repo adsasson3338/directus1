@@ -50,11 +50,11 @@ services:
       - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
       - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
       - TZ=${GENERIC_TIMEZONE}
-      - DB_TYPE=postgresdb 
-      - DB_POSTGRESDB_HOST=postgres 
-      - DB_POSTGRESDB_PORT=5432 
-      - DB_POSTGRESDB_DATABASE=n8n_db 
-      - DB_POSTGRESDB_USER=n8n_user 
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n_db
+      - DB_POSTGRESDB_USER=n8n_user
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - n8n_data:/home/node/.n8n
