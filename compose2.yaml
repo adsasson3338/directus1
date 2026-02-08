@@ -123,7 +123,7 @@ services:
       MYSQL_USER: mautic
       MYSQL_PASSWORD: mauticpass
     volumes:
-      - mautic_db_data:/var/lib/mysql
+      - n8n-compose_mautic_db_data:/var/lib/mysql
     
   mautic:
     image: mautic/mautic:latest
@@ -140,26 +140,13 @@ services:
       MAUTIC_ADMIN_USERNAME: admin
       MAUTIC_ADMIN_PASSWORD: admin123
     volumes:
-      - mautic_data:/var/www/html
+      - n8n-compose_mautic_data:/var/www/html
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.mautic.rule=Host(`mautic.${DOMAIN_NAME}`)"
       - "traefik.http.routers.mautic.entrypoints=websecure"
       - "traefik.http.routers.mautic.tls.certresolver=mytlschallenge"
       - "traefik.http.services.mautic.loadbalancer.server.port=80"
-
-  grapesjs:
-    image: nginx:alpine
-    container_name: grapesjs
-    restart: unless-stopped
-    volumes:
-      - ./grapesjs:/usr/share/nginx/html:ro
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.grapesjs.rule=Host(`builder.${DOMAIN_NAME}`)"
-      - "traefik.http.routers.grapesjs.entrypoints=websecure"
-      - "traefik.http.routers.grapesjs.tls.certresolver=mytlschallenge"
-      - "traefik.http.services.grapesjs.loadbalancer.server.port=80"
       
 volumes:
   n8n_data:
