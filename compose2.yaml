@@ -112,10 +112,22 @@ services:
       - "traefik.http.routers.grav.entrypoints=websecure"
       - "traefik.http.routers.grav.tls.certresolver=letsencrypt"
       - "traefik.http.services.grav.loadbalancer.server.port=80"
-     
+
+  silex:
+    image: silexlabs/silex
+    container_name: silex
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.silex.rule=Host(`builder.asasson.xyz`)"
+      - "traefik.http.routers.silex.entrypoints=websecure"
+      - "traefik.http.routers.silex.tls.certresolver=letsencrypt" 
+    volumes: - silex_data:/usr/share/nginx/html
+    
 volumes:
   n8n_data:
   traefik_data:
   postgres_data:
   nocodb_data:
   grav_data:
+  silex_data:
