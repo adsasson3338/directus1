@@ -140,7 +140,8 @@ services:
       MAUTIC_ADMIN_USERNAME: admin
       MAUTIC_ADMIN_PASSWORD: admin123
     volumes:
-      - mautic_data:/var/www/html
+      - mautic_data:/var/www/html/var
+      - mautic_media:/var/www/html/media
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.mautic.rule=Host(`mautic.${DOMAIN_NAME}`)"
