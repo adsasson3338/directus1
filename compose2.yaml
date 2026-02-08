@@ -113,7 +113,7 @@ services:
       - "traefik.http.routers.grav.tls.certresolver=letsencrypt"
       - "traefik.http.services.grav.loadbalancer.server.port=80"
 
-  mautic-db
+  mautic-db:
     image: mariadb:10.6
     container_name: mautic-db
     restart: unless-stopped
@@ -122,7 +122,8 @@ services:
       MYSQL_DATABASE: mautic
       MYSQL_USER: mautic
       MYSQL_PASSWORD: mauticpass
-    volumes: - mautic_db_data:/var/lib/mysql
+    volumes:
+      - mautic_db_data:/var/lib/mysql
     
   mautic:
     image: mautic/mautic:latest
