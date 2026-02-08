@@ -129,17 +129,17 @@ services:
 
   silex-public:
     image: nginx:alpine
-      container_name: silex-public
-      restart: unless-stopped
-      networks: 
-        - traefik
-      volumes:
-        - silex_data:/usr/share/nginx/html:ro
-      labels:
-        - "traefik.enable=true"
-        - "traefik.http.routers.silex-public.rule=Host(`site.asasson.xyz`)"
-        - "traefik.http.routers.silex-public.entrypoints=websecure"
-        - "traefik.http.routers.silex-public.tls.certresolver=letsencrypt"
+    container_name: silex-public
+    restart: unless-stopped
+    networks: 
+      - traefik
+    volumes:
+      - silex_data:/usr/share/nginx/html:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.silex-public.rule=Host(`site.asasson.xyz`)"
+      - "traefik.http.routers.silex-public.entrypoints=websecure"
+      - "traefik.http.routers.silex-public.tls.certresolver=letsencrypt"
 
 volumes:
   n8n_data:
