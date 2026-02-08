@@ -125,6 +125,10 @@ services:
       - "traefik.http.routers.silex.middlewares=silex-auth"
       # Basic Auth Middleware 
       - "traefik.http.middlewares.silex-auth.basicauth.users=admin:$$apr1$$fDWo9E.1$$LecGWBofaVGkwjw9Qll7n0"
+
+      - "traefik.http.routers.silex-public.rule=Host(`site.asasson.xyz`)"
+      - "traefik.http.routers.silex-public.entrypoints=websecure"
+      - "traefik.http.routers.silex-public.tls.certresolver=letsencrypt"
     volumes:
       - silex_data:/usr/share/nginx/html
 
