@@ -157,3 +157,4 @@ volumes:
   grav_data:
   mautic_db_data:
   mautic_data:
+  mautic_media:
