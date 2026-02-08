@@ -122,7 +122,8 @@ services:
       - "traefik.http.routers.silex.rule=Host(`builder.asasson.xyz`)"
       - "traefik.http.routers.silex.entrypoints=websecure"
       - "traefik.http.routers.silex.tls.certresolver=letsencrypt" 
-    volumes: - silex_data:/usr/share/nginx/html
+    volumes:
+      - silex_data:/usr/share/nginx/html
     
 volumes:
   n8n_data:
