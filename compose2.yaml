@@ -125,14 +125,14 @@ services:
       - "traefik.http.routers.silex-editor.middlewares=silex-auth"
       - "traefik.http.middlewares.silex-auth.basicauth.users=admin:$$apr1$$fDWo9E.1$$LecGWBofaVGkwjw9Qll7n0"
     volumes:
-      - silex_data:/usr/share/nginx/html
+      - silex_data:/workspace
+    environment:
+      - PUBLISH_FOLDER=/workspace
 
   silex-public:
     image: nginx:alpine
     container_name: silex-public
     restart: unless-stopped
-    networks: 
-      - traefik
     volumes:
       - silex_data:/usr/share/nginx/html:ro
     labels:
