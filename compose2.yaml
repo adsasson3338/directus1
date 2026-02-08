@@ -119,31 +119,27 @@ services:
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
-
-      # ------------------------- 
-      # Editor (password-protected)
-      # ------------------------- 
       - "traefik.http.routers.silex-editor.rule=Host(`builder.asasson.xyz`)"
       - "traefik.http.routers.silex-editor.entrypoints=websecure"
       - "traefik.http.routers.silex-editor.tls.certresolver=letsencrypt"
       - "traefik.http.routers.silex-editor.middlewares=silex-auth"
-      - "traefik.http.routers.silex-editor.service=silex-editor-service"
-      - "traefik.http.services.silex-editor-service.loadbalancer.server.port=80"
-      - "traefik.http.services.silex-editor-service.loadbalancer.server.scheme=http"
       - "traefik.http.middlewares.silex-auth.basicauth.users=admin:$$apr1$$fDWo9E.1$$LecGWBofaVGkwjw9Qll7n0"
-
-      # ------------------------- 
-      # Public site (no password) 
-      # ------------------------- 
-      - "traefik.http.routers.silex-public.rule=Host(`site.asasson.xyz`)"
-      - "traefik.http.routers.silex-public.entrypoints=websecure"
-      - "traefik.http.routers.silex-public.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.silex-public.service=silex-public-service"
-      - "traefik.http.services.silex-public-service.loadbalancer.server.port=80"
-      - "traefik.http.services.silex-public-service.loadbalancer.server.scheme=http"
-      
     volumes:
       - silex_data:/usr/share/nginx/html
+
+  silex-public:
+    image: nginx:alpine
+      container_name: silex-public
+      restart: unless-stopped
+      networks: 
+        - traefik
+      volumes:
+        - silex_data:/usr/share/nginx/html:ro
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.silex-public.rule=Host(`site.asasson.xyz`)"
+        - "traefik.http.routers.silex-public.entrypoints=websecure"
+        - "traefik.http.routers.silex-public.tls.certresolver=letsencrypt"
 
 volumes:
   n8n_data:
