@@ -123,7 +123,7 @@ services:
       MYSQL_USER: mautic
       MYSQL_PASSWORD: mauticpass
     volumes:
-      - n8n-compose_mautic_db_data:/var/lib/mysql
+      - mautic_db_data:/var/lib/mysql
     
   mautic:
     image: mautic/mautic:latest
@@ -140,7 +140,7 @@ services:
       MAUTIC_ADMIN_USERNAME: admin
       MAUTIC_ADMIN_PASSWORD: admin123
     volumes:
-      - n8n-compose_mautic_data:/var/www/html
+      - mautic_data:/var/www/html
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.mautic.rule=Host(`mautic.${DOMAIN_NAME}`)"
