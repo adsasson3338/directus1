@@ -96,16 +96,16 @@ services:
       - "traefik.http.routers.nocodb.tls.certresolver=letsencrypt" 
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080#"
 
-   grav: 
-     image: lscr.io/linuxserver/grav:latest
-     container_name: grav
-     restart: unless-stopped
-     environment:
-       - PUID=1000
-       - PGID=1000
-       - TZ=America/New_York
-     volumes:
-       - grav_data:/config
+  grav: 
+    image: lscr.io/linuxserver/grav:latest
+    container_name: grav
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - grav_data:/config
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.grav.rule=Host(`web.asasson.xyz`)"
