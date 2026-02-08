@@ -123,7 +123,7 @@ services:
       - "traefik.http.routers.silex.entrypoints=websecure"
       - "traefik.http.routers.silex.tls.certresolver=letsencrypt"
       # Basic Auth Middleware 
-      - "traefik.http.middlewares.silex-auth.basicauth.users=admin:$apr1$fDWo9E.1$LecGWBofaVGkwjw9Qll7n0"
+      - "traefik.http.middlewares.silex-auth.basicauth.users=admin:$$apr1$$fDWo9E.1$$LecGWBofaVGkwjw9Qll7n0"
     volumes:
       - silex_data:/usr/share/nginx/html
 
