@@ -134,7 +134,7 @@ services:
     volumes:
       - ./backups:/backups
       - ./rclone-config:/root/.config/rclone:ro
-      - ./backup-script-all-dbs.sh:/backup-script.sh:ro
+      - ./backup-script.sh:/backup-script.sh:ro
     depends_on:
       postgres:
         condition: service_healthy
