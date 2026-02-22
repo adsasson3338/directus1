@@ -96,56 +96,8 @@ services:
       - "traefik.http.routers.nocodb.tls.certresolver=letsencrypt"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080#"
 
-  grav:
-    image: lscr.io/linuxserver/grav:latest
-    container_name: grav
-    restart: unless-stopped
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/New_York
-    volumes:
-      - grav_data:/config
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.grav.rule=Host(`web.asasson.xyz`)"
-      - "traefik.http.routers.grav.entrypoints=websecure"
-      - "traefik.http.routers.grav.tls.certresolver=letsencrypt"
-      - "traefik.http.services.grav.loadbalancer.server.port=80"
-
-  silex:
-    image: silexlabs/silex
-    container_name: silex
-    restart: unless-stopped
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.silex-editor.rule=Host(`builder.asasson.xyz`)"
-      - "traefik.http.routers.silex-editor.entrypoints=websecure"
-      - "traefik.http.routers.silex-editor.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.silex-editor.middlewares=silex-auth"
-      - "traefik.http.middlewares.silex-auth.basicauth.users=admin:$$apr1$$fDWo9E.1$$LecGWBofaVGkwjw9Qll7n0"
-    volumes:
-      - silex_data:/workspace
-    environment:
-      - PUBLISH_FOLDER=/workspace
-
-  silex-public:
-    image: nginx:alpine
-    container_name: silex-public
-    restart: unless-stopped
-    volumes:
-      - silex_data:/usr/share/nginx/html:ro
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.silex-public.rule=Host(`site.asasson.xyz`)"
-      - "traefik.http.routers.silex-public.entrypoints=websecure"
-      - "traefik.http.routers.silex-public.tls.certresolver=letsencrypt"
-
 volumes:
   n8n_data:
   traefik_data:
   postgres_data:
   nocodb_data:
-  grav_data:
-  silex_data:
