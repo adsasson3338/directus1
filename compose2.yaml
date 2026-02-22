@@ -60,7 +60,8 @@ services:
       - n8n_data:/home/node/.n8n
       - ./local-files:/files
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: postgres:16
@@ -71,6 +72,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backups:/var/lib/postgresql/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U n8n_user -d n8n_db"]
       interval: 10s
@@ -88,16 +90,60 @@ services:
     volumes:
       - nocodb_data:/usr/app/data
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.nocodb.rule=Host(`nocodb.asasson.xyz`)"
       - "traefik.http.routers.nocodb.entrypoints=websecure"
-      - "traefik.http.routers.nocodb.tls.certresolver=letsencrypt"
-      - "traefik.http.services.nocodb.loadbalancer.server.port=8080#"
+      - "traefik.http.routers.nocodb.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
+
+  # Ollama - Local LLM service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    # Uncomment for GPU support (NVIDIA)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Automated Backup Service - Backs up ALL databases
+  postgres-backup:
+    image: postgres:16-alpine
+    container_name: postgres-backup
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      RCLONE_REMOTE: ${RCLONE_REMOTE:-gdrive}
+      RCLONE_PATH: ${RCLONE_PATH:-postgres-backups}
+    volumes:
+      - ./backups:/backups
+      - ./rclone-config:/root/.config/rclone:ro
+      - ./backup-script-all-dbs.sh:/backup-script.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: -c "while true; do /backup-script.sh; sleep 86400; done"
 
 volumes:
   n8n_data:
   traefik_data:
   postgres_data:
   nocodb_data:
+  ollama_data:
