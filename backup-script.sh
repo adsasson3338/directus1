@@ -1,6 +1,7 @@
 #!/bin/sh
 
 # PostgreSQL Backup Script - Backs up ALL databases
+# Works with Postgres that only has n8n_user (no postgres superuser)
 # Automatically discovers all databases, creates organized backups
 # Uploads to Google Drive via rclone
 # Auto-cleans old backups per database
@@ -10,6 +11,7 @@ set -e
 BACKUP_BASE_DIR="/backups"
 DB_USER="${POSTGRES_USER:-n8n_user}"
 DB_HOST="${POSTGRES_HOST:-postgres}"
+DB_PASSWORD="${POSTGRES_PASSWORD}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive}"
 RCLONE_PATH="${RCLONE_PATH:-postgres-backups}"
@@ -22,23 +24,31 @@ mkdir -p "$BACKUP_BASE_DIR"
 echo "[$(date)] =========================================="
 echo "[$(date)] Starting comprehensive PostgreSQL backup"
 echo "[$(date)] Backup timestamp: $TIMESTAMP"
+echo "[$(date)] User: $DB_USER"
+echo "[$(date)] Host: $DB_HOST"
 echo "[$(date)] =========================================="
 
-# Get list of all databases (excluding system databases)
-DATABASES=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -t -c "
+# Get list of all databases that n8n_user can access
+# Use -d n8n_db as the connection database since it should exist
+echo "[$(date)] Fetching database list from $DB_HOST..."
+
+DATABASES=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d n8n_db -t -A -c "
   SELECT datname FROM pg_database 
   WHERE datistemplate = false 
   AND datname NOT IN ('postgres', 'template0', 'template1')
-  ORDER BY datname;
-")
+  ORDER BY datname;" 2>&1)
 
-if [ -z "$DATABASES" ]; then
+if [ $? -ne 0 ] || [ -z "$DATABASES" ]; then
     echo "[$(date)] ✗ ERROR: Could not fetch database list" >&2
+    echo "[$(date)] Attempted: psql -h $DB_HOST -U $DB_USER -d n8n_db" >&2
+    echo "[$(date)] Response: $DATABASES" >&2
+    echo "[$(date)] Verify that n8n_db exists and n8n_user has access" >&2
     exit 1
 fi
 
 DB_COUNT=$(echo "$DATABASES" | wc -l)
 echo "[$(date)] Found $DB_COUNT database(s) to backup"
+echo "[$(date)] Databases: $(echo $DATABASES | tr '\n' ' ')"
 echo "[$(date)] =========================================="
 
 FAILED_DBS=""
@@ -47,7 +57,8 @@ TOTAL_SIZE=0
 
 # Backup each database
 for DB in $DATABASES; do
-    # Skip empty lines
+    # Skip empty lines and whitespace
+    DB=$(echo "$DB" | xargs)
     [ -z "$DB" ] && continue
     
     # Create database-specific backup directory
@@ -58,7 +69,7 @@ for DB in $DATABASES; do
     
     echo "[$(date)] Backing up database: $DB"
     
-    if PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h "$DB_HOST" -U "$DB_USER" "$DB" | gzip -9 > "$BACKUP_FILE" 2>/dev/null; then
+    if PGPASSWORD="$DB_PASSWORD" pg_dump -h "$DB_HOST" -U "$DB_USER" "$DB" 2>/dev/null | gzip -9 > "$BACKUP_FILE"; then
         FILE_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
         FILE_SIZE_BYTES=$(stat -f%z "$BACKUP_FILE" 2>/dev/null || stat -c%s "$BACKUP_FILE" 2>/dev/null || echo "0")
         TOTAL_SIZE=$((TOTAL_SIZE + FILE_SIZE_BYTES))
@@ -77,7 +88,8 @@ echo "[$(date)] Successful: $SUCCESSFUL_COUNT/$DB_COUNT"
 if [ -n "$FAILED_DBS" ]; then
     echo "[$(date)] Failed:$FAILED_DBS"
 fi
-echo "[$(date)] Total backup size: $(numfmt --to=iec-i --suffix=B $TOTAL_SIZE 2>/dev/null || echo '$((TOTAL_SIZE/1024/1024))MB')"
+TOTAL_SIZE_MB=$((TOTAL_SIZE / 1024 / 1024))
+echo "[$(date)] Total backup size: ${TOTAL_SIZE_MB}MB"
 echo "[$(date)] =========================================="
 
 # Upload to Google Drive if rclone is available
@@ -88,6 +100,7 @@ if command -v rclone &> /dev/null; then
     UPLOAD_FAILED=0
     
     for DB in $DATABASES; do
+        DB=$(echo "$DB" | xargs)
         [ -z "$DB" ] && continue
         DB_BACKUP_DIR="$BACKUP_BASE_DIR/$DB"
         
@@ -117,11 +130,12 @@ if command -v rclone &> /dev/null; then
     DELETED_COUNT=0
     
     for DB in $DATABASES; do
+        DB=$(echo "$DB" | xargs)
         [ -z "$DB" ] && continue
         DB_BACKUP_DIR="$BACKUP_BASE_DIR/$DB"
         
         if [ -d "$DB_BACKUP_DIR" ]; then
-            DELETED=$(find "$DB_BACKUP_DIR" -name "${DB}_*.sql.gz" -mtime +$LOCAL_RETENTION_DAYS -delete -print | wc -l)
+            DELETED=$(find "$DB_BACKUP_DIR" -name "${DB}_*.sql.gz" -mtime +$LOCAL_RETENTION_DAYS -delete -print 2>/dev/null | wc -l)
             if [ "$DELETED" -gt 0 ]; then
                 echo "[$(date)]   ✓ Deleted $DELETED old backup(s) from $DB"
                 DELETED_COUNT=$((DELETED_COUNT + DELETED))
@@ -140,6 +154,7 @@ if command -v rclone &> /dev/null; then
     GDRIVE_CLEANED=0
     
     for DB in $DATABASES; do
+        DB=$(echo "$DB" | xargs)
         [ -z "$DB" ] && continue
         RCLONE_DB_PATH="$RCLONE_PATH/$DB"
         
