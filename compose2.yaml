@@ -128,6 +128,7 @@ services:
       POSTGRES_USER: n8n_user
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_HOST: postgres
+      POSTGRES_DB: n8n_db
       PGPASSWORD: ${POSTGRES_PASSWORD}
       RCLONE_REMOTE: ${RCLONE_REMOTE:-gdrive}
       RCLONE_PATH: ${RCLONE_PATH:-postgres-backups}
