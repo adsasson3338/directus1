@@ -94,7 +94,7 @@ services:
         condition: service_healthy
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.nocodb.rule=Host(`nocodb.asasson.xyz`)"
+      - "traefik.http.routers.nocodb.rule=Host(`nocodb-dp.asasson.xyz`)"
       - "traefik.http.routers.nocodb.entrypoints=websecure"
       - "traefik.http.routers.nocodb.tls.certresolver=mytlschallenge"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
