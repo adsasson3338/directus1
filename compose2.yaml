@@ -153,8 +153,8 @@ services:
       - DATABASE_PATH=/root/.flowise
     volumes:
       - flowise_data:/root/.flowise
-    networks:
-      - app-network
+#    networks:
+#      - app-network
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.flowise.rule=Host(`chat.asasson.xyz`)"
@@ -169,3 +169,4 @@ volumes:
   postgres_data:
   nocodb_data:
   ollama_data:
+  flowise_data:
