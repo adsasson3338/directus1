@@ -142,6 +142,27 @@ services:
     entrypoint: /bin/sh
     command: -c "while true; do /backup-script.sh; sleep 86400; done"
 
+  flowise:
+    image: flowiseai/flowise:latest
+    container_name: flowise
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - DATABASE_PATH=/root/.flowise
+    volumes:
+      - flowise_data:/root/.flowise
+    networks:
+      - app-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.flowise.rule=Host(`chat.asasson.xyz`)"
+      - "traefik.http.routers.flowise.entrypoints=web,websecure"
+      - "traefik.http.routers.flowise.tls=true"
+      - "traefik.http.routers.flowise.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.flowise.loadbalancer.server.port=3000"
+
 volumes:
   n8n_data:
   traefik_data:
