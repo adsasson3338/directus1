@@ -85,6 +85,12 @@ services:
     environment:
       - NC_DB=pg://postgres:5432?u=n8n_user&p=${POSTGRES_PASSWORD}&d=nocodb_db
       - NC_AUTH_JWT_SECRET=${NC_AUTH_JWT_SECRET}
+      - NC_S3_BUCKET=nocodb
+      - NC_S3_KEY=minioadmin
+      - NC_S3_SECRET=${MINIO_PASSWORD}
+      - NC_S3_REGION=us-east-1
+      - NC_S3_API_URL=http://minio:9000
+      - NC_S3_URL=https://${MINIOSUBDOMAIN}.${DOMAIN_NAME}
     volumes:
       - nocodb_data:/usr/app/data
     depends_on:
@@ -95,9 +101,28 @@ services:
       - "traefik.http.routers.nocodb.entrypoints=websecure"
       - "traefik.http.routers.nocodb.tls.certresolver=letsencrypt"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080#"
+  minio:
+    image: minio/minio:latest
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.minio.rule=Host(`${MINIOSUBDOMAIN}.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.minio.entrypoints=websecure"
+      - "traefik.http.routers.minio.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.minio.loadbalancer.server.port=9001"
       
 volumes:
   n8n_data:
   traefik_data:
   postgres_data:
   nocodb_data:
+  minio_data:
