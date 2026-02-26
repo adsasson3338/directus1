@@ -87,6 +87,12 @@ services:
     environment:
       - NC_DB=pg://postgres:5432?u=n8n_user&p=${POSTGRES_PASSWORD}&d=nocodb_db
       - NC_AUTH_JWT_SECRET=${NC_AUTH_JWT_SECRET}
+      - NC_S3_BUCKET=nocodb
+      - NC_S3_KEY=minioadmin
+      - NC_S3_SECRET=${MINIO_PASSWORD}
+      - NC_S3_REGION=us-east-1
+      - NC_S3_API_URL=http://minio:9000
+      - NC_S3_URL=https://minio.asasson.xyz
     volumes:
       - nocodb_data:/usr/app/data
     depends_on:
@@ -98,26 +104,6 @@ services:
       - "traefik.http.routers.nocodb.entrypoints=websecure"
       - "traefik.http.routers.nocodb.tls.certresolver=mytlschallenge"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
-
-  # Ollama - Local LLM service
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    environment:
-      OLLAMA_HOST: 0.0.0.0:11434
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
-    # Uncomment for GPU support (NVIDIA)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
 
   # Automated Backup Service - Backs up ALL databases
   postgres-backup:
@@ -163,10 +149,29 @@ services:
       - "traefik.http.routers.flowise.tls.certresolver=mytlschallenge"
       - "traefik.http.services.flowise.loadbalancer.server.port=3000"
 
+minio:
+  image: minio/minio:latest
+  restart: always
+  ports:
+    - "9000:9000"
+    - "9001:9001"
+  environment:
+    - MINIO_ROOT_USER=minioadmin
+    - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+  volumes:
+    - minio_data:/data
+  command: server /data --console-address ":9001"
+  labels:
+    - "traefik.enable=true"
+    - "traefik.http.routers.minio.rule=Host(`minio.asasson.xyz`)"
+    - "traefik.http.routers.minio.entrypoints=websecure"
+    - "traefik.http.routers.minio.tls.certresolver=mytlschallenge"
+    - "traefik.http.services.minio.loadbalancer.server.port=9001"
+
 volumes:
   n8n_data:
   traefik_data:
   postgres_data:
   nocodb_data:
-  ollama_data:
   flowise_data:
+  minio_data:
