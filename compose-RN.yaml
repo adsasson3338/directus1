@@ -90,7 +90,7 @@ services:
       - NC_S3_SECRET=${MINIO_PASSWORD}
       - NC_S3_REGION=us-east-1
       - NC_S3_API_URL=http://minio:9000
-      - NC_S3_URL=https://{MINIOSUBDOMAIN}.${DOMAIN_NAME}
+      - NC_S3_URL=https://${MINIOSUBDOMAIN}.${DOMAIN_NAME}
     volumes:
       - nocodb_data:/usr/app/data
     depends_on:
@@ -116,7 +116,7 @@ services:
     command: server /data --console-address ":9001"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.minio.rule=Host(`{MINIOSUBDOMAIN}.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.minio.rule=Host(`${MINIOSUBDOMAIN}.${DOMAIN_NAME}`)"
       - "traefik.http.routers.minio.entrypoints=websecure"
       - "traefik.http.routers.minio.tls.certresolver=mytlschallenge"
       - "traefik.http.services.minio.loadbalancer.server.port=9001"
