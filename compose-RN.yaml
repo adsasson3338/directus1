@@ -126,6 +126,4 @@ volumes:
   traefik_data:
   postgres_data:
   nocodb_data:
-
-
-
+  minio_data:
