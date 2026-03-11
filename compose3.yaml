@@ -112,7 +112,7 @@ services:
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
 
   postgres-backup:
-    image: postgres:16-alpine
+    image: postgres:latest
     container_name: postgres-backup
     restart: unless-stopped
     environment:
