@@ -22,9 +22,6 @@ services:
     volumes:
       - traefik_data:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - proxy
-      - internal
 
   n8n:
     image: docker.n8n.io/n8nio/n8n:1.87.2
@@ -72,9 +69,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    networks:
-      - proxy
-      - internal
 
   postgres:
     image: postgres:16
@@ -91,8 +85,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - internal
 
   nocodb:
     image: nocodb/nocodb:0.263.4
@@ -120,9 +112,6 @@ services:
       - "traefik.http.routers.nocodb.entrypoints=websecure"
       - "traefik.http.routers.nocodb.tls.certresolver=mytlschallenge"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
-    networks:
-      - proxy
-      - internal
 
   postgres-backup:
     image: postgres:16-alpine
@@ -145,8 +134,6 @@ services:
         condition: service_healthy
     entrypoint: /bin/sh
     command: -c "while true; do /backup-script.sh; sleep 86400; done"
-    networks:
-      - internal
 
   flowise:
     image: flowiseai/flowise:2.2.7
@@ -168,9 +155,6 @@ services:
       - "traefik.http.routers.flowise.tls=true"
       - "traefik.http.routers.flowise.tls.certresolver=mytlschallenge"
       - "traefik.http.services.flowise.loadbalancer.server.port=3000"
-    networks:
-      - proxy
-      - internal
 
   minio:
     image: minio/minio:RELEASE.2025-02-28T09-55-16Z
@@ -189,18 +173,6 @@ services:
       - "traefik.http.routers.minio.entrypoints=websecure"
       - "traefik.http.routers.minio.tls.certresolver=mytlschallenge"
       - "traefik.http.services.minio.loadbalancer.server.port=9001"
-    networks:
-      - proxy
-      - internal
-
-networks:
-  proxy:
-    # Traefik-facing network - only services that need external access
-    driver: bridge
-  internal:
-    # Backend network - DB, backups, inter-service comms
-    driver: bridge
-    internal: true
 
 volumes:
   n8n_data:
