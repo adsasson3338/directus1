@@ -116,7 +116,7 @@ services:
         condition: service_started
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.nocodb.rule=Host(`nocodb-dp.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.nocodb.rule=Host(`${NDBSUBDOMAIN}.${DOMAIN_NAME}`)"
       - "traefik.http.routers.nocodb.entrypoints=websecure"
       - "traefik.http.routers.nocodb.tls.certresolver=mytlschallenge"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
