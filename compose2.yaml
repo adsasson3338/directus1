@@ -56,6 +56,9 @@ services:
       - DB_POSTGRESDB_DATABASE=n8n_db
       - DB_POSTGRESDB_USER=n8n_user
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336        # 14 days
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=10000
     volumes:
       - n8n_data:/home/node/.n8n
       - ./local-files:/files
