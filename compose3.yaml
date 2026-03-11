@@ -3,7 +3,6 @@ services:
     image: "traefik:v3.3"
     restart: always
     command:
-      # Disable insecure dashboard API - access via secure router below if needed
       - "--api.dashboard=true"
       - "--api.insecure=false"
       - "--providers.docker=true"
@@ -18,7 +17,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # Port 8080 intentionally NOT exposed - dashboard disabled
     volumes:
       - traefik_data:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -59,7 +57,6 @@ services:
       - DB_POSTGRESDB_DATABASE=n8n_db
       - DB_POSTGRESDB_USER=n8n_user
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
-      # Execution pruning - prevents unbounded DB growth
       - EXECUTIONS_DATA_PRUNE=true
       - EXECUTIONS_DATA_MAX_AGE=336
       - EXECUTIONS_DATA_PRUNE_MAX_COUNT=10000
@@ -89,7 +86,8 @@ services:
   nocodb:
     image: nocodb/nocodb:0.263.4
     restart: always
-    # Port 8080 removed - traffic goes through Traefik only
+    ports:
+      - "8080:8080"
     environment:
       - NC_DB=pg://postgres:5432?u=n8n_user&p=${POSTGRES_PASSWORD}&d=nocodb_db
       - NC_AUTH_JWT_SECRET=${NC_AUTH_JWT_SECRET}
@@ -98,7 +96,7 @@ services:
       - NC_S3_SECRET=${MINIO_PASSWORD}
       - NC_S3_REGION=us-east-1
       - NC_S3_API_URL=http://minio:9000
-      - NC_S3_URL=https://minio.${DOMAIN_NAME}
+      - NC_S3_URL=https://minio.asasson.xyz
     volumes:
       - nocodb_data:/usr/app/data
     depends_on:
@@ -108,7 +106,7 @@ services:
         condition: service_started
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.nocodb.rule=Host(`${NDBSUBDOMAIN}.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.nocodb.rule=Host(`nocodb-dp.asasson.xyz`)"
       - "traefik.http.routers.nocodb.entrypoints=websecure"
       - "traefik.http.routers.nocodb.tls.certresolver=mytlschallenge"
       - "traefik.http.services.nocodb.loadbalancer.server.port=8080"
@@ -139,7 +137,8 @@ services:
     image: flowiseai/flowise:2.2.7
     container_name: flowise
     restart: unless-stopped
-    # Port 3000 removed - traffic goes through Traefik only
+    ports:
+      - "3000:3000"
     environment:
       - PORT=3000
       - DATABASE_PATH=/root/.flowise
@@ -150,7 +149,7 @@ services:
         condition: service_healthy
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.flowise.rule=Host(`chat.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.flowise.rule=Host(`chat.asasson.xyz`)"
       - "traefik.http.routers.flowise.entrypoints=web,websecure"
       - "traefik.http.routers.flowise.tls=true"
       - "traefik.http.routers.flowise.tls.certresolver=mytlschallenge"
@@ -159,8 +158,9 @@ services:
   minio:
     image: minio/minio:RELEASE.2025-02-28T09-55-16Z
     restart: always
-    # Port 9000 (S3 API) removed from host binding - internal access only
-    # Port 9001 (console) removed - traffic goes through Traefik only
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     environment:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
@@ -169,7 +169,7 @@ services:
     command: server /data --console-address ":9001"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.minio.rule=Host(`minio.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.minio.rule=Host(`minio.asasson.xyz`)"
       - "traefik.http.routers.minio.entrypoints=websecure"
       - "traefik.http.routers.minio.tls.certresolver=mytlschallenge"
       - "traefik.http.services.minio.loadbalancer.server.port=9001"
