@@ -221,14 +221,13 @@ services:
       - "traefik.http.services.minio.loadbalancer.server.port=9001"
 
   pptx-service:
-    image: python:3.12-slim
+    build: ./pptx-service
     container_name: pptx-service
     volumes:
       - ./pptx-service:/app
       - ./templates:/templates
       - ./output:/output
     working_dir: /app
-    command: sh -c "pip install flask python-pptx && python app.py"
     restart: unless-stopped
 
 volumes:
