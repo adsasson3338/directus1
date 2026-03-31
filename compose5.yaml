@@ -147,6 +147,24 @@ services:
       - "traefik.http.routers.metabase.tls.certresolver=mytlschallenge"
       - "traefik.http.services.metabase.loadbalancer.server.port=3000"
 
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - postgres
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`${GRAFANA_SUBDOMAIN}.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
 volumes:
   n8n_data:
   traefik_data:
@@ -154,3 +172,4 @@ volumes:
   nocodb_data:
   minio_data:
   metabase_data:
+  grafana_data:
