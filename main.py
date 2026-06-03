@@ -74,14 +74,29 @@ def find_date_axis(rows) -> dict | None:
         gaps = [cols[i+1] - cols[i] for i in range(len(cols)-1)]
         interleaved = len(set(gaps)) == 1 and gaps[0] == 2
 
+    # Detect year boundary — date range strings spanning December and January
+    # e.g. "12/21-12/27" and "1/4-1/10" in same sheet means two calendar years
+    year_boundary_detected = False
+    if best["format"] in ("date_range_string", "mixed"):
+        months = set()
+        for s in best["samples"]:
+            # Extract first month from date range string like "12/21-12/27" or "1/4-1/10"
+            m = re.match(r'^(\d{1,2})/', s.strip())
+            if m:
+                months.add(int(m.group(1)))
+        # If both December (12) and January (1) appear, year boundary exists
+        if 12 in months and 1 in months:
+            year_boundary_detected = True
+
     return {
-        "row":                  best["row"],
-        "col_count":            best["count"],
-        "cols":                 cols,
-        "sample_values":        best["samples"],
-        "format":               best["format"],
-        "year_present":         year_present,
+        "row":                    best["row"],
+        "col_count":              best["count"],
+        "cols":                   cols,
+        "sample_values":          best["samples"],
+        "format":                 best["format"],
+        "year_present":           year_present,
         "interleaved_empty_cols": interleaved,
+        "year_boundary_detected": year_boundary_detected,
     }
 
 
