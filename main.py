@@ -249,7 +249,7 @@ def collect_all_vocabulary(rows, date_cols: list, sku_col: int | None, data_star
     return {
         "header_strings":       sorted(header_strings),
         "column_label_strings": sorted(column_label_strings),
-        "inline_strings":       sorted(inline_strings),
+        "inline_strings":       sorted(inline_strings, 10),
     }
 
 
