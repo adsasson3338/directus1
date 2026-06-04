@@ -522,6 +522,135 @@ async def discover(files: List[UploadFile] = File(...)):
     return JSONResponse(content={"status": "ok", "files": results})
 
 
+
+# ─────────────────────────────────────────────
+# SKU EXTRACTION ENDPOINT
+# ─────────────────────────────────────────────
+
+def extract_all_skus_from_sheet(ws, sheet_name: str) -> dict:
+    """
+    Extract all unique SKU prospect values from every candidate column.
+    Returns full dataset — not a sample. Used for retailer SKU reconciliation.
+    """
+    rows = list(ws.iter_rows(values_only=True))
+
+    date_axis = find_date_axis(rows)
+    if not date_axis:
+        return {"sheet_name": sheet_name, "columns": []}
+
+    date_cols  = date_axis["cols"]
+    data_start = find_data_start_row(rows, date_axis["row"], date_cols)
+    left_boundary = min(date_cols)
+
+    columns = []
+
+    for col_idx in range(left_boundary):
+        # All non-null values in this column from data_start onward
+        all_values = []
+        for row in rows[data_start:]:
+            if col_idx < len(row) and row[col_idx] is not None:
+                all_values.append(row[col_idx])
+
+        if not all_values:
+            continue
+
+        # Pre-data strings for label identification
+        pre_data_strings = [
+            {"row": row_idx, "value": rows[row_idx][col_idx]}
+            for row_idx in range(data_start)
+            if col_idx < len(rows[row_idx])
+            and isinstance(rows[row_idx][col_idx], str)
+            and rows[row_idx][col_idx].strip()
+        ]
+
+        # Unique values
+        seen = set()
+        unique_values = []
+        for v in all_values:
+            key = str(v).strip()
+            if key not in seen:
+                seen.add(key)
+                unique_values.append(v)
+
+        # Run embedded SKU extraction on all string values
+        embedded_extractions = []
+        seen_raw = set()
+        for val in all_values:
+            if not isinstance(val, str):
+                continue
+            s = val.strip()
+            if s in seen_raw:
+                continue
+            seen_raw.add(s)
+            for pattern_name, pattern_re in EMBEDDED_PATTERNS:
+                m = pattern_re.match(s)
+                if m:
+                    # description_space_* patterns have description in group(1), SKU in group(2)
+                    # all other patterns have SKU in group(1), description in group(2)
+                    if pattern_name.startswith("description_space"):
+                        sku, desc = m.group(2).strip(), m.group(1).strip()
+                    else:
+                        sku, desc = m.group(1).strip(), m.group(2).strip()
+                    embedded_extractions.append({
+                        "raw":         s,
+                        "sku":         sku,
+                        "description": desc,
+                        "pattern":     pattern_name,
+                    })
+                    break  # first matching pattern wins
+
+        col_entry = {
+            "col":               col_idx,
+            "pre_data_strings":  pre_data_strings,
+            "unique_values":     [str(v) for v in unique_values],
+            "total_rows":        len(all_values),
+        }
+
+        if embedded_extractions:
+            col_entry["embedded_extractions"] = embedded_extractions
+
+        columns.append(col_entry)
+
+    return {"sheet_name": sheet_name, "columns": columns}
+
+
+@app.post("/extract_skus")
+async def extract_skus(files: List[UploadFile] = File(...)):
+    """
+    Extract all unique SKU prospect values from every candidate column.
+    Full dataset — not sampled. Used for building retailer_sku_map via Postgres reconciliation.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file required")
+
+    results = []
+
+    for upload in files:
+        if not upload.filename.lower().endswith((".xlsx", ".xls")):
+            raise HTTPException(status_code=400,
+                                detail=f"'{upload.filename}' is not an Excel file")
+
+        data = await upload.read()
+
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception as e:
+            raise HTTPException(status_code=400,
+                                detail=f"Cannot open {upload.filename}: {e}")
+
+        sheets = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            sheets.append(extract_all_skus_from_sheet(ws, sheet_name))
+
+        results.append({
+            "filename": upload.filename,
+            "file_hash": file_hash(data),
+            "sheets": sheets,
+        })
+
+    return JSONResponse(content={"status": "ok", "files": results})
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
