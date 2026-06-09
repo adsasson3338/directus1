@@ -674,27 +674,50 @@ async def extract_skus(files: List[UploadFile] = File(...)):
 def extract_qualify_signals_from_rows(rows: list, sheet_name: str, filename: str) -> dict:
     """
     Extract disqualification signals from pre-loaded rows.
-    Core logic used by both sequential and parallel qualify flows.
-    Samples across up to 50 rows for a reliable type distribution.
+    Uses the date axis to locate the data grid, then samples crosshair
+    intersections only — not all numeric values in the sheet.
     """
-    integer_count     = 0
-    float_above_count = 0
+    integer_count      = 0
+    float_above_count  = 0
     float_0_to_1_count = 0
-    crosshair_sample  = []
+    crosshair_sample   = []
 
-    for row in rows[:50]:
-        nums = [v for v in row if isinstance(v, (int, float)) and not isinstance(v, bool)]
-        if len(nums) < 3:
-            continue
-        if not crosshair_sample:
-            crosshair_sample = nums[:8]
-        for v in nums[:8]:
-            if isinstance(v, int):
-                integer_count += 1
-            elif isinstance(v, float) and v > 1:
-                float_above_count += 1
-            elif isinstance(v, float) and 0 < v <= 1:
-                float_0_to_1_count += 1
+    date_axis = find_date_axis(rows)
+
+    if date_axis:
+        date_cols  = date_axis["cols"][:8]
+        data_start = find_data_start_row(rows, date_axis["row"], date_axis["cols"])
+
+        # Sample across up to 50 data rows at date column intersections
+        for row in rows[data_start:data_start + 50]:
+            vals = [row[dc] for dc in date_cols if dc < len(row) and row[dc] is not None]
+            nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if not nums:
+                continue
+            if not crosshair_sample:
+                crosshair_sample = nums[:8]
+            for v in nums:
+                if isinstance(v, int):
+                    integer_count += 1
+                elif isinstance(v, float) and v > 1:
+                    float_above_count += 1
+                elif isinstance(v, float) and 0 < v <= 1:
+                    float_0_to_1_count += 1
+    else:
+        # No date axis — fall back to broad scan
+        for row in rows[:50]:
+            nums = [v for v in row if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if len(nums) < 3:
+                continue
+            if not crosshair_sample:
+                crosshair_sample = nums[:8]
+            for v in nums[:8]:
+                if isinstance(v, int):
+                    integer_count += 1
+                elif isinstance(v, float) and v > 1:
+                    float_above_count += 1
+                elif isinstance(v, float) and 0 < v <= 1:
+                    float_0_to_1_count += 1
 
     total = integer_count + float_above_count + float_0_to_1_count
 
