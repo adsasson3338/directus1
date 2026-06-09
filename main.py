@@ -698,15 +698,15 @@ def extract_qualify_signals_from_rows(rows: list, sheet_name: str, filename: str
                     continue
                 if isinstance(v, int):
                     int_c += 1
-                    if not crosshair_sample:
+                    if len(crosshair_sample) < 40:
                         crosshair_sample.append(v)
                 elif isinstance(v, float) and v > 1:
                     float_a += 1
-                    if not crosshair_sample:
+                    if len(crosshair_sample) < 40:
                         crosshair_sample.append(v)
                 elif isinstance(v, float) and 0 < v <= 1:
                     float_p += 1
-                    if not crosshair_sample:
+                    if len(crosshair_sample) < 40:
                         crosshair_sample.append(v)
 
         total = int_c + float_a + float_p
@@ -721,6 +721,14 @@ def extract_qualify_signals_from_rows(rows: list, sheet_name: str, filename: str
         else:
             dominant_type = "mixed"
     else:
+        # No date axis — collect a broad raw sample for the AI
+        for row in rows[:50]:
+            for v in row:
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if len(crosshair_sample) < 40:
+                        crosshair_sample.append(v)
+            if len(crosshair_sample) >= 40:
+                break
         dominant_type = None
 
     column_labels = set()
