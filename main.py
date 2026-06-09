@@ -842,8 +842,31 @@ async def qualify(files: List[UploadFile] = File(...)):
             rows = list(ws.iter_rows(values_only=True))
             signals = extract_qualify_signals_from_rows(rows, sheet_name, upload.filename)
 
+            # Deterministic disqualification — no AI needed
+            if signals["dominant_type"] == "float_above_1":
+                session["results"].append({
+                    "session_id": session_id,
+                    "sheet_name": sheet_name,
+                    "signals":    signals,
+                    "verdict":    {"disqualified": True, "reason": "Crosshair values are decimals above 1 — dollar revenue"},
+                    "error":      None,
+                })
+                session["done"] += 1
+                continue
+
+            if signals["dominant_type"] == "float_0_to_1":
+                session["results"].append({
+                    "session_id": session_id,
+                    "sheet_name": sheet_name,
+                    "signals":    signals,
+                    "verdict":    {"disqualified": True, "reason": "Crosshair values are between 0 and 1 — percentage metrics"},
+                    "error":      None,
+                })
+                session["done"] += 1
+                continue
+
+            # Ambiguous — send to AI
             job_id = str(uuid.uuid4())
-            # Store job keyed by job_id, linked to session
             _qualify_jobs[job_id] = {
                 "session_id": session_id,
                 "sheet_name": sheet_name,
