@@ -688,49 +688,40 @@ def extract_qualify_signals_from_rows(rows: list, sheet_name: str, filename: str
         date_cols  = date_axis["cols"][:8]
         data_start = find_data_start_row(rows, date_axis["row"], date_axis["cols"])
 
-        # Sample across up to 50 data rows at date column intersections
+        int_c = float_a = float_p = 0
         for row in rows[data_start:data_start + 50]:
-            vals = [row[dc] for dc in date_cols if dc < len(row) and row[dc] is not None]
-            nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
-            if not nums:
-                continue
-            if not crosshair_sample:
-                crosshair_sample = nums[:8]
-            for v in nums:
+            for dc in date_cols:
+                if dc >= len(row) or row[dc] is None:
+                    continue
+                v = row[dc]
+                if isinstance(v, bool):
+                    continue
                 if isinstance(v, int):
-                    integer_count += 1
+                    int_c += 1
+                    if not crosshair_sample:
+                        crosshair_sample.append(v)
                 elif isinstance(v, float) and v > 1:
-                    float_above_count += 1
+                    float_a += 1
+                    if not crosshair_sample:
+                        crosshair_sample.append(v)
                 elif isinstance(v, float) and 0 < v <= 1:
-                    float_0_to_1_count += 1
+                    float_p += 1
+                    if not crosshair_sample:
+                        crosshair_sample.append(v)
+
+        total = int_c + float_a + float_p
+        if total == 0:
+            dominant_type = None
+        elif float_a / total > 0.7:
+            dominant_type = "float_above_1"
+        elif float_p / total > 0.7:
+            dominant_type = "float_0_to_1"
+        elif int_c / total > 0.7:
+            dominant_type = "integer"
+        else:
+            dominant_type = "mixed"
     else:
-        # No date axis — fall back to broad scan
-        for row in rows[:50]:
-            nums = [v for v in row if isinstance(v, (int, float)) and not isinstance(v, bool)]
-            if len(nums) < 3:
-                continue
-            if not crosshair_sample:
-                crosshair_sample = nums[:8]
-            for v in nums[:8]:
-                if isinstance(v, int):
-                    integer_count += 1
-                elif isinstance(v, float) and v > 1:
-                    float_above_count += 1
-                elif isinstance(v, float) and 0 < v <= 1:
-                    float_0_to_1_count += 1
-
-    total = integer_count + float_above_count + float_0_to_1_count
-
-    if total == 0:
         dominant_type = None
-    elif float_above_count / total > 0.7:
-        dominant_type = "float_above_1"
-    elif float_0_to_1_count / total > 0.7:
-        dominant_type = "float_0_to_1"
-    elif integer_count / total > 0.7:
-        dominant_type = "integer"
-    else:
-        dominant_type = "mixed"
 
     column_labels = set()
     for row in rows[:6]:
