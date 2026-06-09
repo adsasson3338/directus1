@@ -799,70 +799,29 @@ Respond with JSON only:
 }}"""
 
 
-async def qualify_sheet(sheet_name: str, ws, filename: str) -> dict:
-    """
-    Process a single sheet — extract signals, fire to n8n, await verdict.
-    Runs concurrently with other sheets.
-    """
-    signals = extract_qualify_signals(ws, sheet_name, filename)
-
-    job_id = str(uuid.uuid4())
-    event  = asyncio.Event()
-    _qualify_jobs[job_id] = {"event": event, "result": None}
-
-    # POST to n8n webhook
-    payload = json.dumps({"job_id": job_id, "signals": signals}).encode()
-    try:
-        req = urllib.request.Request(
-            N8N_QUALIFY_WEBHOOK,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        _qualify_jobs.pop(job_id, None)
-        return {
-            "sheet_name": sheet_name,
-            "signals":    signals,
-            "verdict":    None,
-            "error":      f"Failed to reach n8n webhook: {e}",
-        }
-
-    # Wait for n8n to call back — timeout 60s
-    try:
-        await asyncio.wait_for(event.wait(), timeout=60.0)
-        verdict = _qualify_jobs[job_id]["result"]
-    except asyncio.TimeoutError:
-        verdict = None
-        return {
-            "sheet_name": sheet_name,
-            "signals":    signals,
-            "verdict":    None,
-            "error":      "Timeout waiting for AI response",
-        }
-    finally:
-        _qualify_jobs.pop(job_id, None)
-
-    return {
-        "sheet_name": sheet_name,
-        "signals":    signals,
-        "verdict":    verdict,
-    }
-
-
 @app.post("/qualify")
 async def qualify(files: List[UploadFile] = File(...)):
     """
     For each sheet in the uploaded file, extract disqualification signals
-    and ask the AI via n8n webhook — all sheets processed in parallel.
+    and fire to n8n webhook. Returns a session_id immediately.
+    Caller polls /qualify/status/{session_id} for results.
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
 
-    results = []
+    session_id = str(uuid.uuid4())
+    session = {
+        "status":   "pending",
+        "filename": None,
+        "total":    0,
+        "done":     0,
+        "results":  [],
+    }
+    _qualify_jobs[session_id] = session
 
     for upload in files:
         if not upload.filename.lower().endswith((".xlsx", ".xls")):
+            _qualify_jobs.pop(session_id, None)
             raise HTTPException(status_code=400,
                                 detail=f"'{upload.filename}' is not an Excel file")
 
@@ -871,19 +830,27 @@ async def qualify(files: List[UploadFile] = File(...)):
         try:
             wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         except Exception as e:
+            _qualify_jobs.pop(session_id, None)
             raise HTTPException(status_code=400,
                                 detail=f"Cannot open {upload.filename}: {e}")
 
-        # Load all sheets first — read all rows before async operations
-        sheets = [(name, list(wb[name].iter_rows(values_only=True))) for name in wb.sheetnames]
+        session["filename"] = upload.filename
+        session["total"]    = len(wb.sheetnames)
 
-        # Fire all sheets to n8n concurrently
-        tasks = []
-        for sheet_name, rows in sheets:
+        for sheet_name in wb.sheetnames:
+            ws   = wb[sheet_name]
+            rows = list(ws.iter_rows(values_only=True))
             signals = extract_qualify_signals_from_rows(rows, sheet_name, upload.filename)
-            job_id  = str(uuid.uuid4())
-            event   = asyncio.Event()
-            _qualify_jobs[job_id] = {"event": event, "result": None, "sheet_name": sheet_name, "signals": signals}
+
+            job_id = str(uuid.uuid4())
+            # Store job keyed by job_id, linked to session
+            _qualify_jobs[job_id] = {
+                "session_id": session_id,
+                "sheet_name": sheet_name,
+                "signals":    signals,
+                "verdict":    None,
+                "error":      None,
+            }
 
             payload = json.dumps({"job_id": job_id, "signals": signals}).encode()
             try:
@@ -893,63 +860,63 @@ async def qualify(files: List[UploadFile] = File(...)):
                     headers={"Content-Type": "application/json"},
                 )
                 urllib.request.urlopen(req, timeout=5)
-                tasks.append(job_id)
             except Exception as e:
-                _qualify_jobs.pop(job_id, None)
-                tasks.append({"sheet_name": sheet_name, "signals": signals, "verdict": None, "error": str(e)})
+                _qualify_jobs[job_id]["error"] = f"Failed to reach n8n: {e}"
+                session["done"]   += 1
+                session["results"].append(_qualify_jobs.pop(job_id))
 
-        # Wait for all jobs concurrently
-        sheet_results = []
-        wait_tasks = []
-        error_results = []
+    # Check if all jobs were already error-failed synchronously
+    if session["done"] >= session["total"]:
+        session["status"] = "complete"
 
-        for item in tasks:
-            if isinstance(item, dict):
-                error_results.append(item)
-            else:
-                wait_tasks.append(item)
+    return JSONResponse(content={
+        "status":     "accepted",
+        "session_id": session_id,
+        "total_sheets": session["total"],
+        "poll_url":   f"/qualify/status/{session_id}",
+    })
 
-        async def wait_for_job(jid):
-            try:
-                await asyncio.wait_for(_qualify_jobs[jid]["event"].wait(), timeout=60.0)
-                result = {
-                    "sheet_name": _qualify_jobs[jid]["sheet_name"],
-                    "signals":    _qualify_jobs[jid]["signals"],
-                    "verdict":    _qualify_jobs[jid]["result"],
-                }
-            except asyncio.TimeoutError:
-                result = {
-                    "sheet_name": _qualify_jobs[jid]["sheet_name"],
-                    "signals":    _qualify_jobs[jid]["signals"],
-                    "verdict":    None,
-                    "error":      "Timeout waiting for AI response",
-                }
-            finally:
-                _qualify_jobs.pop(jid, None)
-            return result
 
-        completed = await asyncio.gather(*[wait_for_job(jid) for jid in wait_tasks])
-        sheet_results = error_results + list(completed)
+@app.get("/qualify/status/{session_id}")
+async def qualify_status(session_id: str):
+    """
+    Poll for qualify results. Returns partial results as they arrive.
+    status: pending | complete
+    """
+    if session_id not in _qualify_jobs:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
-        results.append({
-            "filename":      upload.filename,
-            "sheet_results": sheet_results,
-        })
+    session = _qualify_jobs[session_id]
 
-    return JSONResponse(content={"status": "ok", "files": results})
+    return JSONResponse(content={
+        "session_id": session_id,
+        "status":     session["status"],
+        "filename":   session["filename"],
+        "total":      session["total"],
+        "done":       session["done"],
+        "results":    session["results"],
+    })
 
 
 @app.post("/response/{job_id}")
 async def qualify_response(job_id: str, request_body: dict):
     """
     n8n posts the AI verdict back here keyed by job_id.
-    Unblocks the waiting /qualify request.
+    Updates the parent session with the result.
     """
     if job_id not in _qualify_jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found or already completed")
 
-    _qualify_jobs[job_id]["result"] = request_body
-    _qualify_jobs[job_id]["event"].set()
+    job        = _qualify_jobs.pop(job_id)
+    session_id = job["session_id"]
+    job["verdict"] = request_body
+
+    if session_id in _qualify_jobs:
+        session = _qualify_jobs[session_id]
+        session["results"].append(job)
+        session["done"] += 1
+        if session["done"] >= session["total"]:
+            session["status"] = "complete"
 
     return JSONResponse(content={"status": "ok", "job_id": job_id})
 
