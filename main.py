@@ -1,656 +1,135 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from typing import List
-import openpyxl
-import hashlib
-import io
-import re
-from datetime import datetime
-
-app = FastAPI(title="Sheet Discovery Service", version="2.0.0")
-
-# ─────────────────────────────────────────────
-# CELL CLASSIFICATION — pure structural
-# ─────────────────────────────────────────────
-
-DATE_RANGE_RE  = re.compile(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$")
-FISCAL_WEEK_RE = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$", re.IGNORECASE)
-WK_NUMBER_RE   = re.compile(r"^wk\s*\d+$", re.IGNORECASE)
-YEAR_RE        = re.compile(r"\b(20\d{2})\b")
-
-def classify_cell(val) -> str:
-    if val is None:                return "empty"
-    if isinstance(val, bool):      return "bool"
-    if isinstance(val, datetime):  return "datetime"
-    if isinstance(val, int):       return "integer"
-    if isinstance(val, float):
-        return "float_0_to_1" if 0 <= val <= 1 else "float_above_1"
-    if isinstance(val, str):
-        s = val.strip()
-        if DATE_RANGE_RE.match(s):  return "date_range_string"
-        if FISCAL_WEEK_RE.match(s): return "fiscal_week_label"
-        if WK_NUMBER_RE.match(s):   return "week_number_label"
-        return "string"
-    return "unknown"
-
-def is_date_like(val) -> bool:
-    return classify_cell(val) in (
-        "datetime", "date_range_string",
-        "fiscal_week_label", "week_number_label"
-    )
-
-
-# ─────────────────────────────────────────────
-# GRID STRUCTURE DETECTION
-# ─────────────────────────────────────────────
-
-def find_date_axis(rows) -> dict | None:
-    best = {"row": None, "count": 0, "cols": [], "samples": [], "format": None}
-
-    for row_idx, row in enumerate(rows[:15]):
-        date_cols = [(ci, v) for ci, v in enumerate(row) if is_date_like(v)]
-        if len(date_cols) > best["count"]:
-            formats = set(classify_cell(v) for _, v in date_cols)
-            best = {
-                "row":     row_idx,
-                "count":   len(date_cols),
-                "cols":    [ci for ci, _ in date_cols],
-                "samples": [str(v) for _, v in date_cols[:8]],
-                "format":  list(formats)[0] if len(formats) == 1 else "mixed",
-            }
-
-    if best["count"] < 2:
-        return None
-
-    cols = best["cols"]
-    year_present = (
-        best["format"] == "datetime" or
-        any(YEAR_RE.search(s) for s in best["samples"])
-    )
-
-    # Detect interleaved empty columns
-    interleaved = False
-    if len(cols) >= 3:
-        gaps = [cols[i+1] - cols[i] for i in range(len(cols)-1)]
-        interleaved = len(set(gaps)) == 1 and gaps[0] == 2
-
-    # Detect year boundary — date range strings spanning December and January
-    # e.g. "12/21-12/27" and "1/4-1/10" in same sheet means two calendar years
-    year_boundary_detected = False
-    if best["format"] in ("date_range_string", "mixed"):
-        months = set()
-        for s in best["samples"]:
-            # Extract first month from date range string like "12/21-12/27" or "1/4-1/10"
-            m = re.match(r'^(\d{1,2})/', s.strip())
-            if m:
-                months.add(int(m.group(1)))
-        # If both December (12) and January (1) appear, year boundary exists
-        if 12 in months and 1 in months:
-            year_boundary_detected = True
-
-    return {
-        "row":                    best["row"],
-        "col_count":              best["count"],
-        "cols":                   cols,
-        "sample_values":          best["samples"],
-        "format":                 best["format"],
-        "year_present":           year_present,
-        "interleaved_empty_cols": interleaved,
-        "year_boundary_detected": year_boundary_detected,
-    }
-
-
-def find_data_start_row(rows, date_axis_row: int, date_cols: list) -> int:
-    """First row after the header block that has numeric values at date cols."""
-    for row_idx in range(date_axis_row + 1, min(date_axis_row + 10, len(rows))):
-        row = rows[row_idx]
-        vals = [row[dc] for dc in date_cols if dc < len(row) and row[dc] is not None]
-        numeric = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
-        if numeric:
-            return row_idx
-    return date_axis_row + 1
-
-
-def find_sku_candidates(rows, date_axis_row: int, date_cols: list) -> list:
-    """
-    Report all columns left of the date axis as candidates.
-    No scoring, no decisions — Python describes, AI decides.
-    Each candidate includes: col index, label, dominant type,
-    fill rate, and sample values.
-    """
-    if not date_cols:
-        return []
-
-    left_boundary = min(date_cols)
-    data_start = find_data_start_row(rows, date_axis_row, date_cols)
-    data_rows = [rows[r] for r in range(data_start, min(data_start + 50, len(rows)))]
-    total_data_rows = len(data_rows)
-
-    candidates = []
-
-    for col_idx in range(left_boundary):
-        col_vals = [
-            row[col_idx]
-            for row in data_rows
-            if col_idx < len(row) and row[col_idx] is not None
-        ]
-
-        if not col_vals:
-            continue
-
-        # Type distribution
-        types = [classify_cell(v) for v in col_vals]
-        type_counts = {}
-        for t in types:
-            type_counts[t] = type_counts.get(t, 0) + 1
-        dominant = max(type_counts, key=type_counts.get)
-
-        # Fill rate
-        fill_rate = round(len(col_vals) / total_data_rows, 2) if total_data_rows > 0 else 0
-
-        # All strings above data start — AI decides which is the column label
-        pre_data_strings = [
-            {"row": row_idx, "value": rows[row_idx][col_idx]}
-            for row_idx in range(data_start)
-            if col_idx < len(rows[row_idx])
-            and isinstance(rows[row_idx][col_idx], str)
-            and rows[row_idx][col_idx].strip()
-        ]
-
-        # Sample values — first 5 non-null from data rows
-        sample = [str(v) for v in col_vals[:5]]
-
-        candidates.append({
-            "col":              col_idx,
-            "pre_data_strings": pre_data_strings,
-            "dominant_type":    dominant,
-            "type_distribution": type_counts,
-            "fill_rate":        fill_rate,
-            "sample_values":    sample,
-        })
-
-    return candidates
-
-
-
-# ─────────────────────────────────────────────
-# CROSSHAIR SAMPLING — raw, no verdicts
-# ─────────────────────────────────────────────
-
-def sample_crosshair(rows, date_cols: list, sku_col: int, data_start_row: int) -> dict:
-    """
-    Sample values at true crosshair intersections.
-    Spread sample across whole sheet, not just top rows.
-    Returns raw values and row-level type distribution — no verdict.
-    """
-    total_rows = len(rows)
-
-    # Build a spread of row indices across the whole sheet
-    sample_indices = []
-    step = max(1, (total_rows - data_start_row) // 20)
-    for i in range(data_start_row, total_rows, step):
-        sample_indices.append(i)
-        if len(sample_indices) >= 40:
-            break
-
-    raw_values = []
-    row_type_counts = {
-        "integer": 0,
-        "float_0_to_1": 0,
-        "float_above_1": 0,
-        "empty": 0,
-        "string": 0,
-    }
-
-    for row_idx in sample_indices:
-        row = rows[row_idx]
-        if sku_col >= len(row) or row[sku_col] is None:
-            continue
-
-        row_vals = []
-        for dc in date_cols[:8]:
-            if dc >= len(row):
-                continue
-            val = row[dc]
-            ct = classify_cell(val)
-            if ct in row_type_counts:
-                row_type_counts[ct] += 1
-            if val is not None:
-                row_vals.append(val)
-
-        numeric = [v for v in row_vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
-        if numeric:
-            raw_values.extend(numeric)
-
-    return {
-        "sample_values":        raw_values[:20],
-        "row_type_distribution": row_type_counts,
-    }
-
-
-# ─────────────────────────────────────────────
-# VOCABULARY COLLECTION — all strings, no filtering
-# ─────────────────────────────────────────────
-
-def collect_all_vocabulary(rows, date_cols: list, sku_col: int | None, data_start_row: int) -> dict:
-    """
-    Collect all string values from the sheet.
-    No filtering, no decisions — everything goes to the AI.
-    Organised by where in the sheet it came from.
-    """
-    header_strings = set()
-    column_label_strings = set()
-    inline_strings = set()
-
-    left_boundary = min(date_cols) if date_cols else 999
-
-    for row_idx, row in enumerate(rows):
-        for col_idx, val in enumerate(row):
-            if not isinstance(val, str) or not val.strip():
-                continue
-            s = val.strip()
-
-            if row_idx < data_start_row:
-                # Header area
-                if col_idx < left_boundary:
-                    column_label_strings.add(s)
-                else:
-                    header_strings.add(s)
-            else:
-                # Data area — inline strings (section headers, totals, footnotes, metrics)
-                if col_idx < left_boundary:
-                    inline_strings.add(s)
-
-    def sample_strings(s: set, n: int = 10) -> list:
-        items = sorted(s)
-        if len(items) <= n:
-            return items
-        step = len(items) / n
-        return [items[int(i * step)] for i in range(n)]
-
-    return {
-        "header_strings":       sorted(header_strings),
-        "column_label_strings": sorted(column_label_strings),
-        "inline_strings":       sample_strings(inline_strings, 10),
-    }
-
-
-
-# ─────────────────────────────────────────────
-# EMBEDDED SKU DETECTION
-# ─────────────────────────────────────────────
-
-EMBEDDED_PATTERNS = [
-    # 285768 - LEVEL UP HEADPHONE
-    ("integer_dash_description",
-     re.compile(r'^(\d{4,10})\s*[-\u2013]\s*(.{3,})$')),
-
-    # MZX1010-BLK ALTEC LANS CLIP OPEN — alphanumeric SKU with dash, then description
-    ("alphanumeric_space_description",
-     re.compile(r'^([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s+(.{3,})$', re.IGNORECASE)),
-
-    # LEVEL UP HEADPHONE   LU731-WG — description then SKU with dash (double space separator)
-    ("description_space_alphanumeric",
-     re.compile(r'^(.{3,})\s{2,}([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s*$', re.IGNORECASE)),
-
-    # Level Up Headphones LUP052 — description then no-dash alphanumeric SKU (single space, end of string)
-    ("description_space_nodash_sku",
-     re.compile(r'^(.{5,})\s+([A-Z]{2,}\d{3,})\s*$', re.IGNORECASE)),
-]
-
-
-def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
-    """
-    Check columns left of the date axis for cells where SKU and description
-    are fused into one string. Returns all candidate columns with match counts.
-    No thresholds — AI decides if embedded SKU exists.
-    """
-    if not date_cols:
-        return []
-
-    left_boundary = min(date_cols)
-    embedded_candidates = []
-
-    for col_idx in range(left_boundary):
-        col_vals = [
-            str(rows[r][col_idx]).strip()
-            for r in range(data_start_row, min(data_start_row + 30, len(rows)))
-            if col_idx < len(rows[r])
-            and rows[r][col_idx] is not None
-            and isinstance(rows[r][col_idx], str)
-        ]
-
-        if len(col_vals) < 3:
-            continue
-
-        # Try all patterns, collect all matches — no threshold, AI decides
-        col_matches = []
-        seen = set()
-        for pattern_name, pattern_re in EMBEDDED_PATTERNS:
-            for val in col_vals:
-                if val not in seen:
-                    m = pattern_re.match(val)
-                    if m:
-                        seen.add(val)
-                        col_matches.append({
-                            "raw":         val,
-                            "sku":         m.group(1).strip(),
-                            "description": m.group(2).strip(),
-                            "pattern":     pattern_name,
-                        })
-
-        if col_matches:
-            embedded_candidates.append({
-                "col":               col_idx,
-                "total_values":      len(col_vals),
-                "matched_values":    len(col_matches),
-                "sample_extractions": col_matches[:4],
-            })
-
-    return embedded_candidates
-
-
-# ─────────────────────────────────────────────
-# YEAR ANCHORS
-# ─────────────────────────────────────────────
-
-def find_year_anchors(filename: str, rows: list) -> list:
-    anchors = []
-    for m in YEAR_RE.finditer(filename):
-        anchors.append({"source": "filename", "value": m.group(1)})
-    for row_idx, row in enumerate(rows[:5]):
-        for col_idx, val in enumerate(row):
-            if isinstance(val, datetime):
-                anchors.append({"source": "cell", "row": row_idx, "col": col_idx,
-                                 "value": str(val.date())})
-            elif isinstance(val, str):
-                for m in YEAR_RE.finditer(val):
-                    anchors.append({"source": "cell", "row": row_idx, "col": col_idx,
-                                     "value": m.group(1)})
-    return anchors[:6]
-
-
-# ─────────────────────────────────────────────
-# DATA ROW COUNT
-# ─────────────────────────────────────────────
-
-def count_data_rows(rows, date_cols: list, sku_col: int, data_start_row: int) -> dict:
-    count = 0
-    for row_idx in range(data_start_row, len(rows)):
-        row = rows[row_idx]
-        if sku_col >= len(row) or row[sku_col] is None:
-            continue
-        date_vals = [row[dc] for dc in date_cols if dc < len(row) and row[dc] is not None]
-        if date_vals:
-            count += 1
-    return {"count": count, "start_row": data_start_row}
-
-
-# ─────────────────────────────────────────────
-# PER SHEET ANALYSIS
-# ─────────────────────────────────────────────
-
-def analyze_sheet(ws, sheet_name: str, filename: str) -> dict:
-    rows = list(ws.iter_rows(values_only=True))
-
-    date_axis = find_date_axis(rows)
-
-    if not date_axis:
-        # No date axis found — still collect vocabulary for AI
-        all_strings = sorted(set(
-            str(v).strip() for row in rows[:30]
-            for v in row if isinstance(v, str) and v.strip()
-        ))
-        return {
-            "sheet_name":     sheet_name,
-            "filename":       filename,
-            "date_axis":      None,
-            "sku_candidates": [],
-            "embedded_sku":   None,
-            "crosshair":      None,
-            "vocabulary":     {"header_strings": all_strings,
-                               "column_label_strings": [],
-                               "inline_strings": []},
-            "year_anchors":   find_year_anchors(filename, rows),
-            "data_rows":      {"count": 0, "start_row": None},
-            "data_start_row": None,
-            "row_count":      len(rows),
-            "col_count":      len(rows[0]) if rows else 0,
+{
+  "name": "Qualify Sheet",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qualify-sheet",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-240, 0],
+      "id": "webhook-qualify",
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\"status\": \"received\", \"job_id\": $json.job_id}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-20, -120],
+      "id": "respond-webhook",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst job_id = body.job_id;\nconst s = body.signals;\n\nconst prompt = `You are the gatekeeper of a retail sales data ingestion pipeline. A sheet has arrived and you must determine if it should be disqualified.\n\nA sheet should be disqualified if it does NOT contain unit sales data. Unit sales data has integer values at the intersection of product identifiers and date columns.\n\nDisqualify if any of the following are true:\n- Crosshair values are decimals above 1 — dollar revenue\n- Crosshair values are between 0 and 1 — percentage metrics\n- Column labels contain $$$ or $$ — dollar sheet\n- Sheet name contains CFP, Forecast, FCST, Projection, Order\n- Vocabulary contains forecast or projection language such as: Total DC Order Projection, Projected Store Orders, Collaborative FC, OOS % LY, Instock Goal, Projected Orders\n\nEVIDENCE:\nSheet name: ${s.sheet_name}\nFilename: ${s.filename}\nCrosshair sample values: ${JSON.stringify(s.crosshair_sample)}\nDominant crosshair type: ${s.dominant_type}\nColumn labels: ${JSON.stringify(s.column_labels)}\nInline strings: ${JSON.stringify(s.inline_strings)}\n\nBase all decisions on the evidence above. Do not guess.\nRespond with JSON only — no prose, no markdown:\n{\"disqualified\": true or false, \"reason\": \"one sentence explanation\"}`;\n\nreturn [{ json: { job_id, prompt } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-20, 60],
+      "id": "build-prompt",
+      "name": "Build Prompt"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [220, 60],
+      "id": "llm-chain",
+      "name": "LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": "z-ai/glm-4.5-air",
+        "options": {
+          "maxTokens": 300
         }
-
-    date_cols      = date_axis["cols"]
-    data_start     = find_data_start_row(rows, date_axis["row"], date_cols)
-    sku_candidates = find_sku_candidates(rows, date_axis["row"], date_cols)
-    embedded_sku   = detect_embedded_sku(rows, date_cols, data_start)
-
-    # Use first integer-dominant candidate as anchor for crosshair sampling
-    # This is only for internal sampling — AI decides the real SKU col
-    anchor_col = next(
-        (c["col"] for c in sku_candidates if c["dominant_type"] == "integer"),
-        sku_candidates[0]["col"] if sku_candidates else 0
-    )
-
-    crosshair    = sample_crosshair(rows, date_cols, anchor_col, data_start)
-    vocabulary   = collect_all_vocabulary(rows, date_cols, anchor_col, data_start)
-    year_anchors = find_year_anchors(filename, rows)
-    data_rows    = count_data_rows(rows, date_cols, anchor_col, data_start)
-
-    return {
-        "sheet_name":     sheet_name,
-        "filename":       filename,
-        "row_count":      len(rows),
-        "col_count":      len(rows[0]) if rows else 0,
-        "date_axis":      date_axis,
-        "sku_candidates": sku_candidates,
-        "embedded_sku":   embedded_sku,
-        "data_start_row": data_start,
-        "crosshair":      crosshair,
-        "vocabulary":     vocabulary,
-        "year_anchors":   year_anchors,
-        "data_rows":      data_rows,
-    }
-
-
-# ─────────────────────────────────────────────
-# CROSS SHEET ANALYSIS
-# ─────────────────────────────────────────────
-
-def cross_sheet_analysis(sheets: list) -> list | None:
-    # Only compare sheets that have a date axis and crosshair data
-    viable = [s for s in sheets if s["date_axis"] and s["crosshair"]]
-    if len(viable) < 2:
-        return None
-
-    results = []
-    for i in range(len(viable)):
-        for j in range(i + 1, len(viable)):
-            a, b = viable[i], viable[j]
-            a_dates = set(a["date_axis"]["sample_values"])
-            b_dates = set(b["date_axis"]["sample_values"])
-            date_overlap = bool(a_dates & b_dates)
-
-            results.append({
-                "sheets":       [a["sheet_name"], b["sheet_name"]],
-                "date_overlap": date_overlap,
-                "a_row_types":  a["crosshair"]["row_type_distribution"],
-                "b_row_types":  b["crosshair"]["row_type_distribution"],
-            })
-
-    return results if results else None
-
-
-# ─────────────────────────────────────────────
-# ENDPOINT
-# ─────────────────────────────────────────────
-
-def file_hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-@app.post("/discover")
-async def discover(files: List[UploadFile] = File(...)):
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one file required")
-
-    results = []
-
-    for upload in files:
-        if not upload.filename.lower().endswith((".xlsx", ".xls")):
-            raise HTTPException(status_code=400,
-                                detail=f"'{upload.filename}' is not an Excel file")
-
-        data = await upload.read()
-
-        try:
-            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        except Exception as e:
-            raise HTTPException(status_code=400,
-                                detail=f"Cannot open {upload.filename}: {e}")
-
-        sheets = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            sheets.append(analyze_sheet(ws, sheet_name, upload.filename))
-
-        results.append({
-            "filename":             upload.filename,
-            "file_hash":            file_hash(data),
-            "sheet_count":          len(sheets),
-            "sheets":               sheets,
-            "cross_sheet_analysis": cross_sheet_analysis(sheets),
-        })
-
-    return JSONResponse(content={"status": "ok", "files": results})
-
-
-
-# ─────────────────────────────────────────────
-# SKU EXTRACTION ENDPOINT
-# ─────────────────────────────────────────────
-
-def extract_all_skus_from_sheet(ws, sheet_name: str) -> dict:
-    """
-    Extract all unique SKU prospect values from every candidate column.
-    Returns full dataset — not a sample. Used for retailer SKU reconciliation.
-    """
-    rows = list(ws.iter_rows(values_only=True))
-
-    date_axis = find_date_axis(rows)
-    if not date_axis:
-        return {"sheet_name": sheet_name, "columns": []}
-
-    date_cols  = date_axis["cols"]
-    data_start = find_data_start_row(rows, date_axis["row"], date_cols)
-    left_boundary = min(date_cols)
-
-    columns = []
-
-    for col_idx in range(left_boundary):
-        # All non-null values in this column from data_start onward
-        all_values = []
-        for row in rows[data_start:]:
-            if col_idx < len(row) and row[col_idx] is not None:
-                all_values.append(row[col_idx])
-
-        if not all_values:
-            continue
-
-        # Pre-data strings for label identification
-        pre_data_strings = [
-            {"row": row_idx, "value": rows[row_idx][col_idx]}
-            for row_idx in range(data_start)
-            if col_idx < len(rows[row_idx])
-            and isinstance(rows[row_idx][col_idx], str)
-            and rows[row_idx][col_idx].strip()
-        ]
-
-        # Unique values
-        seen = set()
-        unique_values = []
-        for v in all_values:
-            key = str(v).strip()
-            if key not in seen:
-                seen.add(key)
-                unique_values.append(v)
-
-        # Run embedded SKU extraction on all string values
-        embedded_extractions = []
-        seen_raw = set()
-        for val in all_values:
-            if not isinstance(val, str):
-                continue
-            s = val.strip()
-            if s in seen_raw:
-                continue
-            seen_raw.add(s)
-            for pattern_name, pattern_re in EMBEDDED_PATTERNS:
-                m = pattern_re.match(s)
-                if m:
-                    # description_space_* patterns have description in group(1), SKU in group(2)
-                    # all other patterns have SKU in group(1), description in group(2)
-                    if pattern_name.startswith("description_space"):
-                        sku, desc = m.group(2).strip(), m.group(1).strip()
-                    else:
-                        sku, desc = m.group(1).strip(), m.group(2).strip()
-                    embedded_extractions.append({
-                        "raw":         s,
-                        "sku":         sku,
-                        "description": desc,
-                        "pattern":     pattern_name,
-                    })
-                    break  # first matching pattern wins
-
-        col_entry = {
-            "col":               col_idx,
-            "pre_data_strings":  pre_data_strings,
-            "unique_values":     [str(v) for v in unique_values],
-            "total_rows":        len(all_values),
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [300, 240],
+      "id": "openrouter-model",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openRouterApi": {
+          "id": "A2TyYgieAAJY0zWe",
+          "name": "OpenRouter sakar"
         }
-
-        if embedded_extractions:
-            col_entry["embedded_extractions"] = embedded_extractions
-
-        columns.append(col_entry)
-
-    return {"sheet_name": sheet_name, "columns": columns}
-
-
-@app.post("/extract_skus")
-async def extract_skus(files: List[UploadFile] = File(...)):
-    """
-    Extract all unique SKU prospect values from every candidate column.
-    Full dataset — not sampled. Used for building retailer_sku_map via Postgres reconciliation.
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one file required")
-
-    results = []
-
-    for upload in files:
-        if not upload.filename.lower().endswith((".xlsx", ".xls")):
-            raise HTTPException(status_code=400,
-                                detail=f"'{upload.filename}' is not an Excel file")
-
-        data = await upload.read()
-
-        try:
-            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        except Exception as e:
-            raise HTTPException(status_code=400,
-                                detail=f"Cannot open {upload.filename}: {e}")
-
-        sheets = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            sheets.append(extract_all_skus_from_sheet(ws, sheet_name))
-
-        results.append({
-            "filename": upload.filename,
-            "file_hash": file_hash(data),
-            "sheets": sheets,
-        })
-
-    return JSONResponse(content={"status": "ok", "files": results})
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const job_id = $('Build Prompt').first().json.job_id;\nconst raw = $input.first().json.text || '';\n\n// Strip markdown fences if present\nconst clean = raw.replace(/^```json?\\n?/, '').replace(/\\n?```$/, '').trim();\n\nlet verdict;\ntry {\n  verdict = JSON.parse(clean);\n} catch(e) {\n  verdict = { disqualified: null, reason: 'Failed to parse AI response: ' + raw };\n}\n\nreturn [{ json: { job_id, verdict } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 60],
+      "id": "parse-response",
+      "name": "Parse Response"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://discovery-parser:8000/response/{{ $json.job_id }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.verdict) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [700, 60],
+      "id": "post-response",
+      "name": "POST to Python"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          { "node": "Respond to Webhook", "type": "main", "index": 0 },
+          { "node": "Build Prompt", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [{ "node": "LLM Chain", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [{ "node": "LLM Chain", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "LLM Chain": {
+      "main": [
+        [{ "node": "Parse Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Response": {
+      "main": [
+        [{ "node": "POST to Python", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3b8e8ec4fc4043451bd31b5c2637cc70f884729057388b776dda6217241a5572"
+  },
+  "tags": []
+}
