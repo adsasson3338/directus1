@@ -5,9 +5,24 @@ import openpyxl
 import hashlib
 import io
 import re
+import uuid
+import asyncio
+import urllib.request
+import json
+import os
 from datetime import datetime
 
 app = FastAPI(title="Sheet Discovery Service", version="2.0.0")
+
+# ─────────────────────────────────────────────
+# JOB STORE — for Python/n8n webhook collaboration
+# ─────────────────────────────────────────────
+_qualify_jobs: dict = {}
+
+N8N_QUALIFY_WEBHOOK = os.environ.get(
+    "N8N_QUALIFY_WEBHOOK",
+    "http://n8n:5678/webhook/qualify-sheet"
+)
 
 # ─────────────────────────────────────────────
 # CELL CLASSIFICATION — pure structural
@@ -656,11 +671,53 @@ async def extract_skus(files: List[UploadFile] = File(...)):
 # QUALIFY ENDPOINT — AI disqualification test
 # ─────────────────────────────────────────────
 
+def extract_qualify_signals_from_rows(rows: list, sheet_name: str, filename: str) -> dict:
+    """
+    Extract disqualification signals from pre-loaded rows.
+    Core logic used by both sequential and parallel qualify flows.
+    """
+    crosshair_sample = []
+    dominant_type = None
+    for row in rows[:20]:
+        nums = [v for v in row if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if len(nums) >= 3:
+            crosshair_sample = nums[:8]
+            has_float = any(isinstance(v, float) and v > 1 for v in nums)
+            has_pct   = any(isinstance(v, float) and 0 < v <= 1 for v in nums)
+            has_int   = any(isinstance(v, int) for v in nums)
+            if has_float:   dominant_type = "float_above_1"
+            elif has_pct:   dominant_type = "float_0_to_1"
+            elif has_int:   dominant_type = "integer"
+            break
+
+    column_labels = set()
+    for row in rows[:6]:
+        for val in row:
+            if isinstance(val, str) and val.strip() and len(val.strip()) < 60:
+                column_labels.add(val.strip())
+
+    inline_strings = set()
+    for row in rows[6:20]:
+        for val in row:
+            if isinstance(val, str) and val.strip() and len(val.strip()) < 80:
+                inline_strings.add(val.strip())
+
+    return {
+        "sheet_name":       sheet_name,
+        "filename":         filename,
+        "dominant_type":    dominant_type,
+        "crosshair_sample": crosshair_sample,
+        "column_labels":    sorted(column_labels, key=len)[:10],
+        "inline_strings":   sorted(inline_strings, key=len)[:10],
+    }
+
+
 def extract_disqualification_signals(ws, sheet_name: str, filename: str) -> dict:
-    """
-    Extract only the signals needed to determine if a sheet should be disqualified.
-    Lightweight — no full analysis. Just the evidence for the AI question.
-    """
+    """Wrapper — loads rows from worksheet then delegates to core function."""
+    rows = list(ws.iter_rows(values_only=True))
+    return extract_qualify_signals_from_rows(rows, sheet_name, filename)
+
+def _UNUSED_old_extract(ws, sheet_name, filename):
     rows = list(ws.iter_rows(values_only=True))
 
     # Crosshair — sample values from top-left data area
@@ -742,21 +799,65 @@ Respond with JSON only:
 }}"""
 
 
+async def qualify_sheet(sheet_name: str, ws, filename: str) -> dict:
+    """
+    Process a single sheet — extract signals, fire to n8n, await verdict.
+    Runs concurrently with other sheets.
+    """
+    signals = extract_qualify_signals(ws, sheet_name, filename)
+
+    job_id = str(uuid.uuid4())
+    event  = asyncio.Event()
+    _qualify_jobs[job_id] = {"event": event, "result": None}
+
+    # POST to n8n webhook
+    payload = json.dumps({"job_id": job_id, "signals": signals}).encode()
+    try:
+        req = urllib.request.Request(
+            N8N_QUALIFY_WEBHOOK,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        _qualify_jobs.pop(job_id, None)
+        return {
+            "sheet_name": sheet_name,
+            "signals":    signals,
+            "verdict":    None,
+            "error":      f"Failed to reach n8n webhook: {e}",
+        }
+
+    # Wait for n8n to call back — timeout 60s
+    try:
+        await asyncio.wait_for(event.wait(), timeout=60.0)
+        verdict = _qualify_jobs[job_id]["result"]
+    except asyncio.TimeoutError:
+        verdict = None
+        return {
+            "sheet_name": sheet_name,
+            "signals":    signals,
+            "verdict":    None,
+            "error":      "Timeout waiting for AI response",
+        }
+    finally:
+        _qualify_jobs.pop(job_id, None)
+
+    return {
+        "sheet_name": sheet_name,
+        "signals":    signals,
+        "verdict":    verdict,
+    }
+
+
 @app.post("/qualify")
 async def qualify(files: List[UploadFile] = File(...)):
     """
-    Test endpoint: extract disqualification signals from each sheet
-    and call AI to determine if the sheet should be disqualified.
-    Returns signals + AI verdict per sheet.
+    For each sheet in the uploaded file, extract disqualification signals
+    and ask the AI via n8n webhook — all sheets processed in parallel.
     """
-    import urllib.request
-    import json
-    import os
-
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
-
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
 
     results = []
 
@@ -773,57 +874,84 @@ async def qualify(files: List[UploadFile] = File(...)):
             raise HTTPException(status_code=400,
                                 detail=f"Cannot open {upload.filename}: {e}")
 
-        sheet_results = []
+        # Load all sheets first — read all rows before async operations
+        sheets = [(name, list(wb[name].iter_rows(values_only=True))) for name in wb.sheetnames]
 
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            signals = extract_disqualification_signals(ws, sheet_name, upload.filename)
-            prompt  = build_qualify_prompt(signals)
+        # Fire all sheets to n8n concurrently
+        tasks = []
+        for sheet_name, rows in sheets:
+            signals = extract_qualify_signals_from_rows(rows, sheet_name, upload.filename)
+            job_id  = str(uuid.uuid4())
+            event   = asyncio.Event()
+            _qualify_jobs[job_id] = {"event": event, "result": None, "sheet_name": sheet_name, "signals": signals}
 
-            # Call AI
-            ai_verdict = None
-            ai_error   = None
-
+            payload = json.dumps({"job_id": job_id, "signals": signals}).encode()
             try:
-                body = json.dumps({
-                    "model":      "z-ai/glm-4.5-air",
-                    "max_tokens": 200,
-                    "messages":   [{"role": "user", "content": prompt}]
-                }).encode()
-
                 req = urllib.request.Request(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    data=body,
-                    headers={
-                        "Content-Type":  "application/json",
-                        "Authorization": f"Bearer {openrouter_key}",
-                        "HTTP-Referer":  "https://asasson.xyz",
-                    }
+                    N8N_QUALIFY_WEBHOOK,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
                 )
-
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    response_data = json.loads(resp.read())
-
-                raw = response_data["choices"][0]["message"]["content"].strip()
-                raw = raw.replace("```json", "").replace("```", "").strip()
-                ai_verdict = json.loads(raw)
-
+                urllib.request.urlopen(req, timeout=5)
+                tasks.append(job_id)
             except Exception as e:
-                ai_error = str(e)
+                _qualify_jobs.pop(job_id, None)
+                tasks.append({"sheet_name": sheet_name, "signals": signals, "verdict": None, "error": str(e)})
 
-            sheet_results.append({
-                "sheet_name": sheet_name,
-                "signals":    signals,
-                "verdict":    ai_verdict,
-                "error":      ai_error,
-            })
+        # Wait for all jobs concurrently
+        sheet_results = []
+        wait_tasks = []
+        error_results = []
+
+        for item in tasks:
+            if isinstance(item, dict):
+                error_results.append(item)
+            else:
+                wait_tasks.append(item)
+
+        async def wait_for_job(jid):
+            try:
+                await asyncio.wait_for(_qualify_jobs[jid]["event"].wait(), timeout=60.0)
+                result = {
+                    "sheet_name": _qualify_jobs[jid]["sheet_name"],
+                    "signals":    _qualify_jobs[jid]["signals"],
+                    "verdict":    _qualify_jobs[jid]["result"],
+                }
+            except asyncio.TimeoutError:
+                result = {
+                    "sheet_name": _qualify_jobs[jid]["sheet_name"],
+                    "signals":    _qualify_jobs[jid]["signals"],
+                    "verdict":    None,
+                    "error":      "Timeout waiting for AI response",
+                }
+            finally:
+                _qualify_jobs.pop(jid, None)
+            return result
+
+        completed = await asyncio.gather(*[wait_for_job(jid) for jid in wait_tasks])
+        sheet_results = error_results + list(completed)
 
         results.append({
-            "filename":     upload.filename,
+            "filename":      upload.filename,
             "sheet_results": sheet_results,
         })
 
     return JSONResponse(content={"status": "ok", "files": results})
+
+
+@app.post("/response/{job_id}")
+async def qualify_response(job_id: str, request_body: dict):
+    """
+    n8n posts the AI verdict back here keyed by job_id.
+    Unblocks the waiting /qualify request.
+    """
+    if job_id not in _qualify_jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found or already completed")
+
+    _qualify_jobs[job_id]["result"] = request_body
+    _qualify_jobs[job_id]["event"].set()
+
+    return JSONResponse(content={"status": "ok", "job_id": job_id})
 
 @app.get("/health")
 def health():
