@@ -675,20 +675,39 @@ def extract_qualify_signals_from_rows(rows: list, sheet_name: str, filename: str
     """
     Extract disqualification signals from pre-loaded rows.
     Core logic used by both sequential and parallel qualify flows.
+    Samples across up to 50 rows for a reliable type distribution.
     """
-    crosshair_sample = []
-    dominant_type = None
-    for row in rows[:20]:
+    integer_count     = 0
+    float_above_count = 0
+    float_0_to_1_count = 0
+    crosshair_sample  = []
+
+    for row in rows[:50]:
         nums = [v for v in row if isinstance(v, (int, float)) and not isinstance(v, bool)]
-        if len(nums) >= 3:
+        if len(nums) < 3:
+            continue
+        if not crosshair_sample:
             crosshair_sample = nums[:8]
-            has_float = any(isinstance(v, float) and v > 1 for v in nums)
-            has_pct   = any(isinstance(v, float) and 0 < v <= 1 for v in nums)
-            has_int   = any(isinstance(v, int) for v in nums)
-            if has_float:   dominant_type = "float_above_1"
-            elif has_pct:   dominant_type = "float_0_to_1"
-            elif has_int:   dominant_type = "integer"
-            break
+        for v in nums[:8]:
+            if isinstance(v, int):
+                integer_count += 1
+            elif isinstance(v, float) and v > 1:
+                float_above_count += 1
+            elif isinstance(v, float) and 0 < v <= 1:
+                float_0_to_1_count += 1
+
+    total = integer_count + float_above_count + float_0_to_1_count
+
+    if total == 0:
+        dominant_type = None
+    elif float_above_count / total > 0.7:
+        dominant_type = "float_above_1"
+    elif float_0_to_1_count / total > 0.7:
+        dominant_type = "float_0_to_1"
+    elif integer_count / total > 0.7:
+        dominant_type = "integer"
+    else:
+        dominant_type = "mixed"
 
     column_labels = set()
     for row in rows[:6]:
@@ -842,13 +861,13 @@ async def qualify(files: List[UploadFile] = File(...)):
             rows = list(ws.iter_rows(values_only=True))
             signals = extract_qualify_signals_from_rows(rows, sheet_name, upload.filename)
 
-            # Deterministic disqualification — no AI needed
+            # Deterministic disqualification — pure float sheets, no AI needed
             if signals["dominant_type"] == "float_above_1":
                 session["results"].append({
                     "session_id": session_id,
                     "sheet_name": sheet_name,
                     "signals":    signals,
-                    "verdict":    {"disqualified": True, "reason": "Crosshair values are decimals above 1 — dollar revenue"},
+                    "verdict":    {"disqualified": True, "reason": "Crosshair values are predominantly decimals above 1 — dollar revenue"},
                     "error":      None,
                 })
                 session["done"] += 1
@@ -859,13 +878,13 @@ async def qualify(files: List[UploadFile] = File(...)):
                     "session_id": session_id,
                     "sheet_name": sheet_name,
                     "signals":    signals,
-                    "verdict":    {"disqualified": True, "reason": "Crosshair values are between 0 and 1 — percentage metrics"},
+                    "verdict":    {"disqualified": True, "reason": "Crosshair values are predominantly between 0 and 1 — percentage metrics"},
                     "error":      None,
                 })
                 session["done"] += 1
                 continue
 
-            # Ambiguous — send to AI
+            # integer, mixed, None, or unknown — send to AI for judgment
             job_id = str(uuid.uuid4())
             _qualify_jobs[job_id] = {
                 "session_id": session_id,
