@@ -505,17 +505,25 @@ Respond with JSON only:
 # DATE CONFIG PROMPT
 # ─────────────────────────────────────────────
 
-def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str) -> str:
+def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str,
+                       filename: str = "", cross_sheet_anchors: list = None) -> str:
+    cross_context = ""
+    if cross_sheet_anchors:
+        cross_context = f"\nYear anchors from other sheets in same file: {cross_sheet_anchors}"
+
     return f"""You are configuring the date settings for a retail sales sheet.
 
 Determine the year value and week convention from the evidence.
+The file was received as: {filename}
 
 Sheet: {sheet_name}
 Date axis format: {date_axis["format"]}
 Year present in dates: {date_axis["year_present"]}
 Year boundary detected: {date_axis.get("year_boundary_detected", False)}
 Sample date values: {date_axis["sample_values"]}
-Year anchors found: {year_anchors}
+Year anchors in this sheet: {year_anchors}{cross_context}
+
+Important: If dates span December and January, December dates belong to the EARLIER year and January dates belong to the LATER year. Use the file date and year anchors to determine which years those are.
 
 All dates will be normalized to week-ending Saturday.
 
@@ -744,8 +752,17 @@ async def stage_date_config(session_id: str):
             }
             continue
 
+        # Collect year anchors from other qualified sheets for cross-sheet context
+        cross_sheet_anchors = []
+        for other_sheet in session["qualified_sheets"]:
+            if other_sheet != sheet_name:
+                other_anchors = session["grid"].get(other_sheet, {}).get("year_anchors", [])
+                cross_sheet_anchors.extend(other_anchors)
+
         # Year missing or boundary — send to AI
-        prompt = build_date_prompt(date_axis, anchors, sheet_name)
+        prompt = build_date_prompt(date_axis, anchors, sheet_name,
+                                   filename=session["filename"],
+                                   cross_sheet_anchors=cross_sheet_anchors)
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
             "session_id": session_id,
@@ -959,4 +976,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.4"}
+    return {"status": "ok", "version": "3.0.0"}
