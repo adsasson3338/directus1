@@ -409,6 +409,70 @@ WHERE UPPER(inventory_sku) = ANY(ARRAY[{quoted}]::text[])
 # COLUMN CLASSIFY PROMPT
 # ─────────────────────────────────────────────
 
+def build_column_classify_prompt(sheet_name: str, sku_candidates: list,
+                                  embedded_sku: list, postgres_matches: list,
+                                  col_candidates: dict) -> str:
+    """
+    Build a single prompt to classify all columns in a sheet.
+    AI receives full context: columns, Postgres matches, embedded SKU detections.
+    """
+    matched_values = set()
+    for row in postgres_matches:
+        for field in ("inventory_sku", "base_variant", "base_model"):
+            v = row.get(field, "")
+            if v:
+                matched_values.add(v.upper())
+
+    cols_info = []
+    for col in sku_candidates:
+        col_idx = col["col"]
+        label = col.get("pre_data_strings", [{}])[-1].get("value", "") if col.get("pre_data_strings") else ""
+        samples = col.get("sample_values", [])
+        postgres_confirmed = any(str(v).upper() in matched_values for v in samples)
+
+        emb_matches = []
+        for emb in embedded_sku:
+            if emb["col"] == col_idx:
+                for ext in emb.get("extractions", []):
+                    sku = ext.get("sku", "")
+                    if sku.upper() in matched_values:
+                        emb_matches.append(sku)
+
+        cols_info.append({
+            "col":                  col_idx,
+            "label":                label,
+            "dominant_type":        col.get("dominant_type"),
+            "sample_values":        samples,
+            "postgres_matched":     postgres_confirmed,
+            "embedded_sku_matches": emb_matches,
+        })
+
+    return f"""You are classifying columns in a retail sales spreadsheet sheet named "{sheet_name}".
+
+For each column, classify it as one of:
+- retailer_sku: the retailer's product identifier (WIC#, DPCI, Item#, UPC etc)
+- supplier_sku: the supplier's internal SKU or style code
+- description: product name or description text (may contain embedded supplier SKU)
+- cost: unit cost or wholesale price
+- retail_price: retail selling price
+- inventory: stock quantities
+- other: anything else
+
+postgres_matched means the column's values were found in the supplier inventory database.
+embedded_sku_matches lists supplier SKUs extracted from a description column that matched the inventory database.
+
+COLUMNS:
+{json.dumps(cols_info, indent=2)}
+
+Respond with JSON only:
+{{
+  "columns": [
+    {{"col": 0, "classification": "type", "confidence": "high/medium/low", "reason": "one sentence", "has_embedded_supplier_sku": true/false}},
+    ...
+  ]
+}}"""
+
+
 def build_classify_prompt(col: dict, confirmed_cols: list) -> str:
     confirmed_context = ""
     if confirmed_cols:
@@ -895,4 +959,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.3"}
+    return {"status": "ok", "version": "3.0.4"}
