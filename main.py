@@ -538,7 +538,8 @@ Respond with JSON only:
 async def stage_qualify(session_id: str):
     """Stage 1 — qualify each sheet."""
     session = _sessions[session_id]
-    session["status"] = "qualifying"
+    session["stage"] = "qualifying"
+    session["status"] = "running"
     sheets = session["_sheets"]
     pending = 0
 
@@ -580,6 +581,7 @@ async def stage_qualify(session_id: str):
                 "source": "error",
             }
         else:
+            session["status"] = "awaiting_response"
             session["_pending_jobs"].add(job_id)
             pending += 1
 
@@ -600,6 +602,7 @@ async def advance_from_qualify(session_id: str):
     session["qualified_sheets"] = qualified
 
     if not qualified:
+        session["stage"] = "complete"
         session["status"] = "complete"
         session["result"] = {"status": "no_sales_data", "qualify_results": results}
         return
@@ -610,7 +613,8 @@ async def advance_from_qualify(session_id: str):
 async def stage_locate_grid(session_id: str):
     """Stage 2 — locate grid for each qualified sheet. Pure Python."""
     session = _sessions[session_id]
-    session["status"] = "locating"
+    session["stage"] = "locating"
+    session["status"] = "running"
     sheets = session["_sheets"]
 
     for sheet_name in session["qualified_sheets"]:
@@ -640,7 +644,8 @@ async def stage_locate_grid(session_id: str):
 async def stage_identify_columns(session_id: str):
     """Stage 3 — identify columns via Postgres then one AI call per sheet."""
     session = _sessions[session_id]
-    session["status"] = "identifying"
+    session["stage"] = "identifying"
+    session["status"] = "running"
 
     # Collect all unique values from every left-of-axis column, tagged with col index
     # No filtering — Python does not decide what is or isn't a SKU candidate
@@ -681,6 +686,7 @@ async def stage_identify_columns(session_id: str):
         session["postgres_results"] = {"matches": [], "matched_candidates": [], "error": err}
         await advance_from_postgres(session_id)
     else:
+        session["status"] = "awaiting_response"
         session["_pending_jobs"].add(job_id)
 
 
@@ -712,6 +718,7 @@ async def advance_from_postgres(session_id: str):
         if err:
             session["column_mapping"][sheet_name] = {"error": f"Webhook error: {err}"}
         else:
+            session["status"] = "awaiting_response"
             session["_pending_jobs"].add(job_id)
 
     if not session["_pending_jobs"]:
@@ -721,7 +728,8 @@ async def advance_from_postgres(session_id: str):
 async def stage_date_config(session_id: str):
     """Stage 4 — date config. Pure Python, AI only if year ambiguous."""
     session = _sessions[session_id]
-    session["status"] = "dating"
+    session["stage"] = "dating"
+    session["status"] = "running"
     pending = 0
 
     for sheet_name in session["qualified_sheets"]:
@@ -774,6 +782,7 @@ async def stage_date_config(session_id: str):
         if err:
             session["date_config"][sheet_name] = {"error": f"Webhook error: {err}"}
         else:
+            session["status"] = "awaiting_response"
             session["_pending_jobs"].add(job_id)
             pending += 1
 
@@ -800,6 +809,7 @@ async def stage_multisheet(session_id: str):
 async def stage_assemble(session_id: str):
     """Stage 6 — assemble final config."""
     session = _sessions[session_id]
+    session["stage"] = "complete"
     session["status"] = "complete"
 
     session["result"] = {
@@ -832,6 +842,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
 
     session = _sessions[session_id]
     session["_pending_jobs"].discard(job_id)
+    session["status"] = "running"
 
     # Store result by stage
     if stage == "qualify":
@@ -931,7 +942,8 @@ async def analyze(files: List[UploadFile] = File(...), background_tasks: Backgro
 
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
-        "status":          "accepted",
+        "stage":           "accepted",
+        "status":          "running",
         "filename":        upload.filename,
         "file_hash":       file_hash(data),
         "qualified_sheets": [],
@@ -968,7 +980,8 @@ async def analyze_status(session_id: str):
     # Don't expose internal state
     return JSONResponse(content={
         "session_id": session_id,
-        "status":     session["status"],
+        "stage":      session.get("stage", "unknown"),
+        "status":     session.get("status", "unknown"),
         "filename":   session["filename"],
         "result":     session["result"],
     })
