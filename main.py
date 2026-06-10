@@ -12,7 +12,52 @@ import json
 import os
 from datetime import datetime, date, timedelta
 
+import time
+
 app = FastAPI(title="Sheet Discovery Service", version="3.0.0")
+
+JOB_TIMEOUT_SECONDS     = 120  # 2 minutes per job
+SESSION_TIMEOUT_SECONDS = 600  # 10 minutes per session
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(cleanup_stale_jobs())
+
+async def cleanup_stale_jobs():
+    while True:
+        await asyncio.sleep(60)  # check every minute
+        now = time.time()
+
+        # Find stale jobs
+        stale_job_ids = [
+            jid for jid, j in list(_jobs.items())
+            if now - j.get("created_at", now) > JOB_TIMEOUT_SECONDS
+        ]
+
+        for jid in stale_job_ids:
+            job = _jobs.pop(jid, {})
+            sid = job.get("session_id")
+            if sid and sid in _sessions:
+                session = _sessions[sid]
+                session["_pending_jobs"].discard(jid)
+                session.setdefault("errors", []).append(
+                    f"Job {jid} (stage: {job.get('stage')}) timed out after {JOB_TIMEOUT_SECONDS}s"
+                )
+
+        # Find stale sessions
+        stale_session_ids = [
+            sid for sid, s in list(_sessions.items())
+            if now - s.get("created_at", now) > SESSION_TIMEOUT_SECONDS
+            and s.get("status") not in ("complete", "failed")
+        ]
+
+        for sid in stale_session_ids:
+            session = _sessions.get(sid, {})
+            session["status"] = "failed"
+            session["result"] = {
+                "error": "Session timed out",
+                "errors": session.get("errors", []),
+            }
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -205,7 +250,7 @@ def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
         if col_matches:
             embedded_candidates.append({
                 "col": col_idx, "total_values": len(col_vals),
-                "matched_values": len(col_matches), "sample_extractions": col_matches[:4],
+                "matched_values": len(col_matches), "extractions": col_matches,
             })
     return embedded_candidates
 
@@ -448,6 +493,7 @@ async def stage_qualify(session_id: str):
             "stage":      "qualify",
             "sheet_name": sheet_name,
             "signals":    signals,
+            "created_at": time.time(),
         }
         err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
         if err:
@@ -526,15 +572,19 @@ async def stage_identify_columns(session_id: str):
         for col in grid.get("sku_candidates", []):
             for v in col.get("sample_values", []):
                 s = str(v).strip()
-                # Skip floats, prices, percentages — not SKU candidates
+                if not s:
+                    continue
                 if "." in s or "%" in s:
                     continue
-                if s:
-                    all_candidates.add(s)
+                if " " in s:
+                    continue
+                if s.isdigit() and len(s) < 5:
+                    continue
+                all_candidates.add(s)
             for emb in grid.get("embedded_sku", []):
-                for ext in emb.get("sample_extractions", []):
+                for ext in emb.get("extractions", emb.get("sample_extractions", [])):
                     sku = ext.get("sku", "").strip()
-                    if sku:
+                    if sku and " " not in sku:
                         all_candidates.add(sku)
 
     candidates = sorted(all_candidates)
@@ -837,9 +887,11 @@ async def analyze(files: List[UploadFile] = File(...), background_tasks: Backgro
         "column_mapping":  {},
         "date_config":     {},
         "flags":           {},
+        "errors":          [],
         "result":          None,
         "_sheets":         sheets,
         "_pending_jobs":   set(),
+        "created_at":      time.time(),
     }
 
     background_tasks.add_task(stage_qualify, session_id)
@@ -870,4 +922,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.0.1"}
