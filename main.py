@@ -334,16 +334,25 @@ Respond with JSON only:
 def build_sku_lookup_sql(candidates: list) -> tuple[str, list]:
     """
     Build case-insensitive exact match query against inventory_view.
-    Returns (sql, params).
+    Values embedded inline — n8n Postgres node does not support $1 params.
+    Returns (sql, []) — empty params list.
     """
-    sql = """
-SELECT inventory_sku, base_model, base_variant, description, upc
+    # Safely quote each candidate for inline SQL
+    quoted = ", ".join(
+        "'" + str(c).replace("'", "''") + "'"
+        for c in candidates
+        if c and str(c).strip()
+    )
+    if not quoted:
+        quoted = "''"
+
+    sql = f"""SELECT inventory_sku, base_model, base_variant, description, upc
 FROM inventory_view
-WHERE UPPER(inventory_sku) = ANY(SELECT UPPER(unnest($1::text[])))
-   OR UPPER(base_variant)  = ANY(SELECT UPPER(unnest($1::text[])))
-   OR UPPER(base_model)    = ANY(SELECT UPPER(unnest($1::text[])))
-"""
-    return sql.strip(), [candidates]
+WHERE UPPER(inventory_sku) = ANY(ARRAY[{quoted}]::text[])
+   OR UPPER(base_variant)  = ANY(ARRAY[{quoted}]::text[])
+   OR UPPER(base_model)    = ANY(ARRAY[{quoted}]::text[])"""
+
+    return sql, []
 
 
 # ─────────────────────────────────────────────
