@@ -34,6 +34,7 @@ async def cleanup_stale_jobs():
             if now - j.get("created_at", now) > JOB_TIMEOUT_SECONDS
         ]
 
+        sessions_to_advance = set()
         for jid in stale_job_ids:
             job = _jobs.pop(jid, {})
             sid = job.get("session_id")
@@ -43,6 +44,24 @@ async def cleanup_stale_jobs():
                 session.setdefault("errors", []).append(
                     f"Job {jid} (stage: {job.get('stage')}) timed out after {JOB_TIMEOUT_SECONDS}s"
                 )
+                # If no more pending jobs, this session needs to advance
+                if not session["_pending_jobs"]:
+                    sessions_to_advance.add((sid, job.get("stage")))
+
+        # Advance sessions whose last pending job timed out
+        for sid, stage in sessions_to_advance:
+            if sid not in _sessions:
+                continue
+            session = _sessions[sid]
+            if stage == "qualify":
+                asyncio.create_task(advance_from_qualify(sid))
+            elif stage == "postgres_sku":
+                session["postgres_results"] = {"matches": [], "error": "timed out"}
+                asyncio.create_task(advance_from_postgres(sid))
+            elif stage == "classify_sheet":
+                asyncio.create_task(stage_date_config(sid))
+            elif stage == "date_config":
+                asyncio.create_task(stage_multisheet(sid))
 
         # Find stale sessions
         stale_session_ids = [
@@ -53,6 +72,7 @@ async def cleanup_stale_jobs():
 
         for sid in stale_session_ids:
             session = _sessions.get(sid, {})
+            session["stage"]  = "failed"
             session["status"] = "failed"
             session["result"] = {
                 "error": "Session timed out",
