@@ -601,7 +601,7 @@ async def stage_qualify(session_id: str):
                 "source": "error",
             }
         else:
-            session["status"] = "awaiting_response"
+            session["status"] = "awaiting_ai"
             session["_pending_jobs"].add(job_id)
             pending += 1
 
@@ -706,7 +706,7 @@ async def stage_identify_columns(session_id: str):
         session["postgres_results"] = {"matches": [], "matched_candidates": [], "error": err}
         await advance_from_postgres(session_id)
     else:
-        session["status"] = "awaiting_response"
+        session["status"] = "awaiting_postgres"
         session["_pending_jobs"].add(job_id)
 
 
@@ -738,7 +738,7 @@ async def advance_from_postgres(session_id: str):
         if err:
             session["column_mapping"][sheet_name] = {"error": f"Webhook error: {err}"}
         else:
-            session["status"] = "awaiting_response"
+            session["status"] = "awaiting_ai"
             session["_pending_jobs"].add(job_id)
 
     if not session["_pending_jobs"]:
@@ -802,7 +802,7 @@ async def stage_date_config(session_id: str):
         if err:
             session["date_config"][sheet_name] = {"error": f"Webhook error: {err}"}
         else:
-            session["status"] = "awaiting_response"
+            session["status"] = "awaiting_ai"
             session["_pending_jobs"].add(job_id)
             pending += 1
 
@@ -862,7 +862,9 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
 
     session = _sessions[session_id]
     session["_pending_jobs"].discard(job_id)
-    session["status"] = "running"
+    # Only set running if there are still pending jobs — otherwise stage handler sets the next status
+    if session["_pending_jobs"]:
+        session["status"] = "awaiting_ai"
 
     # Store result by stage
     if stage == "qualify":
@@ -1009,4 +1011,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.0.5"}
