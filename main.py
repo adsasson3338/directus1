@@ -243,9 +243,14 @@ def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
                     m = pattern_re.match(val)
                     if m:
                         seen.add(val)
+                        # description_space_* patterns have description in group(1), SKU in group(2)
+                        if pattern_name.startswith("description_space"):
+                            sku, desc = m.group(2).strip(), m.group(1).strip()
+                        else:
+                            sku, desc = m.group(1).strip(), m.group(2).strip()
                         col_matches.append({
-                            "raw": val, "sku": m.group(1).strip(),
-                            "description": m.group(2).strip(), "pattern": pattern_name,
+                            "raw": val, "sku": sku,
+                            "description": desc, "pattern": pattern_name,
                         })
         if col_matches:
             embedded_candidates.append({
@@ -561,45 +566,46 @@ async def stage_locate_grid(session_id: str):
 
 
 async def stage_identify_columns(session_id: str):
-    """Stage 3 — identify columns via Postgres then AI."""
+    """Stage 3 — identify columns via Postgres then one AI call per sheet."""
     session = _sessions[session_id]
     session["status"] = "identifying"
 
-    # Collect all string candidates across all qualified sheets
-    all_candidates = set()
+    # Collect all unique values from every left-of-axis column, tagged with col index
+    # No filtering — Python does not decide what is or isn't a SKU candidate
+    col_candidates = {}  # value -> set of col indices it appears in
+
     for sheet_name in session["qualified_sheets"]:
         grid = session["grid"].get(sheet_name, {})
+
         for col in grid.get("sku_candidates", []):
+            col_idx = col["col"]
             for v in col.get("sample_values", []):
                 s = str(v).strip()
-                if not s:
-                    continue
-                if "." in s or "%" in s:
-                    continue
-                if " " in s:
-                    continue
-                if s.isdigit() and len(s) < 5:
-                    continue
-                all_candidates.add(s)
-            for emb in grid.get("embedded_sku", []):
-                for ext in emb.get("extractions", emb.get("sample_extractions", [])):
-                    sku = ext.get("sku", "").strip()
-                    if sku and " " not in sku:
-                        all_candidates.add(sku)
+                if s:
+                    col_candidates.setdefault(s, set()).add(col_idx)
 
-    candidates = sorted(all_candidates)
-    sql, params = build_sku_lookup_sql(candidates)
+        for emb in grid.get("embedded_sku", []):
+            col_idx = emb["col"]
+            for ext in emb.get("extractions", []):
+                sku = ext.get("sku", "").strip()
+                if sku:
+                    col_candidates.setdefault(sku, set()).add(col_idx)
+
+    # Store col_candidates for use after Postgres responds
+    session["_col_candidates"] = {k: list(v) for k, v in col_candidates.items()}
+
+    candidates = sorted(col_candidates.keys())
+    sql, _ = build_sku_lookup_sql(candidates)
 
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {
         "session_id": session_id,
         "stage":      "postgres_sku",
-        "candidates": candidates,
+        "created_at": time.time(),
     }
 
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": params})
+    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
-        # Skip Postgres, send all columns to AI
         session["postgres_results"] = {"matches": [], "matched_candidates": [], "error": err}
         await advance_from_postgres(session_id)
     else:
@@ -607,63 +613,36 @@ async def stage_identify_columns(session_id: str):
 
 
 async def advance_from_postgres(session_id: str):
-    """After Postgres results — classify remaining columns via AI."""
-    session  = _sessions[session_id]
-    pg       = session.get("postgres_results", {})
-    matched  = set(v.upper() for v in pg.get("matched_candidates", []))
-    pending  = 0
+    """After Postgres results — one AI call per sheet to classify all columns."""
+    session = _sessions[session_id]
+    pg      = session.get("postgres_results", {})
 
     for sheet_name in session["qualified_sheets"]:
-        grid       = session["grid"].get(sheet_name, {})
-        candidates = grid.get("sku_candidates", [])
-        confirmed  = []
+        grid          = session["grid"].get(sheet_name, {})
+        sku_candidates = grid.get("sku_candidates", [])
+        embedded_sku   = grid.get("embedded_sku", [])
+        matches        = pg.get("matches", [])
 
-        for col in candidates:
-            samples_upper = [str(v).upper() for v in col.get("sample_values", [])]
-            label = col.get("pre_data_strings", [{}])[-1].get("value", "") if col.get("pre_data_strings") else ""
+        prompt = build_column_classify_prompt(
+            sheet_name, sku_candidates, embedded_sku, matches,
+            session.get("_col_candidates", {})
+        )
 
-            if any(s in matched for s in samples_upper):
-                confirmed.append({
-                    "col":            col["col"],
-                    "label":          label,
-                    "classification": "supplier_sku",
-                    "confidence":     "high",
-                    "reason":         "Matched in inventory_view",
-                    "source":         "postgres",
-                    "sample_values":  col.get("sample_values", []),
-                })
-            else:
-                col_info = {
-                    "col":           col["col"],
-                    "label":         label,
-                    "dominant_type": col.get("dominant_type", ""),
-                    "sample_values": col.get("sample_values", []),
-                }
-                prompt = build_classify_prompt(col_info, confirmed)
-                job_id = str(uuid.uuid4())
-                _jobs[job_id] = {
-                    "session_id":  session_id,
-                    "stage":       "classify_col",
-                    "sheet_name":  sheet_name,
-                    "col":         col["col"],
-                    "label":       label,
-                    "sample_values": col.get("sample_values", []),
-                }
-                err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
-                if err:
-                    confirmed.append({
-                        "col": col["col"], "label": label,
-                        "classification": None, "confidence": None,
-                        "reason": f"Webhook error: {err}", "source": "error",
-                        "sample_values": col.get("sample_values", []),
-                    })
-                else:
-                    session["_pending_jobs"].add(job_id)
-                    pending += 1
+        job_id = str(uuid.uuid4())
+        _jobs[job_id] = {
+            "session_id": session_id,
+            "stage":      "classify_sheet",
+            "sheet_name": sheet_name,
+            "created_at": time.time(),
+        }
 
-        session["column_mapping"][sheet_name] = confirmed
+        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+        if err:
+            session["column_mapping"][sheet_name] = {"error": f"Webhook error: {err}"}
+        else:
+            session["_pending_jobs"].add(job_id)
 
-    if pending == 0:
+    if not session["_pending_jobs"]:
         await stage_date_config(session_id)
 
 
@@ -798,7 +777,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         if not session["_pending_jobs"]:
             background_tasks.add_task(advance_from_postgres, session_id)
 
-    elif stage == "classify_col":
+    elif stage == "classify_sheet":
         sheet_name = job["sheet_name"]
         raw = request_body
         text = raw.get("text", "") or ""
@@ -807,17 +786,11 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             try:
                 result = json.loads(clean)
             except:
-                result = {"classification": None, "confidence": None, "reason": f"Parse error: {text[:100]}"}
+                result = {"error": f"Parse error: {text[:100]}"}
         else:
             result = raw
         result["source"] = "ai"
-        result["col"]    = job["col"]
-        result["label"]  = job["label"]
-        result["sample_values"] = job["sample_values"]
-
-        if sheet_name not in session["column_mapping"]:
-            session["column_mapping"][sheet_name] = []
-        session["column_mapping"][sheet_name].append(result)
+        session["column_mapping"][sheet_name] = result.get("columns", result)
 
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_date_config, session_id)
@@ -922,4 +895,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.1"}
+    return {"status": "ok", "version": "3.0.2"}
