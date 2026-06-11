@@ -14,7 +14,7 @@ from datetime import datetime, date, timedelta
 
 import time
 
-app = FastAPI(title="Sheet Discovery Service", version="3.0.0")
+app = FastAPI(title="Sheet Discovery Service", version="3.1.0")
 
 JOB_TIMEOUT_SECONDS     = 120  # 2 minutes per job
 SESSION_TIMEOUT_SECONDS = 600  # 10 minutes per session
@@ -59,9 +59,17 @@ async def cleanup_stale_jobs():
                 session["postgres_results"] = {"matches": [], "error": "timed out"}
                 asyncio.create_task(advance_from_postgres(sid))
             elif stage == "classify_sheet":
+                asyncio.create_task(stage_identify_retailer(sid))
+            elif stage == "identify_retailer":
+                session["retailer"] = None
+                session["flags"]["retailer_identification"] = "timed out"
                 asyncio.create_task(stage_date_config(sid))
             elif stage == "date_config":
                 asyncio.create_task(stage_multisheet(sid))
+            elif stage == "write_audit":
+                asyncio.create_task(stage_assemble(sid))
+            elif stage == "write_config":
+                asyncio.create_task(stage_assemble(sid))
 
         # Find stale sessions
         stale_session_ids = [
@@ -551,6 +559,74 @@ Respond with JSON only:
 {{"year_value": 2026, "year_inference_strategy": "how year was determined", "week_convention": "what convention the source uses", "year_boundary_note": "null or explanation if dates span two years"}}"""
 
 
+
+# ─────────────────────────────────────────────
+# RETAILER IDENTIFICATION SQL
+# ─────────────────────────────────────────────
+
+def build_retailer_identify_sql(retailer_sku_candidates: list) -> str:
+    """
+    Query retailer_sku_map to identify retailer from SKU candidates.
+    Returns retailer and match count — 3+ matches confirms identity.
+    """
+    quoted = ", ".join(
+        "'" + str(c).replace("'", "''") + "'"
+        for c in retailer_sku_candidates
+        if c and str(c).strip()
+    )
+    if not quoted:
+        quoted = "''"
+
+    return f"""
+SELECT retailer, COUNT(*) as matches
+FROM retailer_sku_map
+WHERE UPPER(retailer_sku) = ANY(ARRAY[{quoted}]::text[])
+  AND active = true
+GROUP BY retailer
+ORDER BY matches DESC
+LIMIT 1
+""".strip()
+
+
+def build_update_file_audit_sql(file_audit_id: str, discovery_result: dict,
+                                 retailer: str | None, status: str) -> str:
+    """
+    Build SQL to update file_audit row with discovery result and retailer.
+    """
+    result_json = json.dumps(discovery_result).replace("'", "''")
+    retailer_val = f"'{retailer}'" if retailer else "NULL"
+    return f"""
+UPDATE file_audit
+SET discovery_result = '{result_json}'::jsonb,
+    retailer         = {retailer_val},
+    status           = '{status}',
+    updated_at       = now()
+WHERE id = '{file_audit_id}'
+""".strip()
+
+
+def build_insert_retailer_config_sql(retailer: str, file_audit_id: str,
+                                      discovery_result: dict) -> str:
+    """
+    Insert a pending_review config row for a newly identified retailer.
+    """
+    def safe(v): return json.dumps(v).replace("'", "''")
+
+    return f"""
+INSERT INTO retailer_configs (
+    retailer, status, version, file_audit_id,
+    qualified_sheets, column_mapping, date_config, flags
+)
+VALUES (
+    '{retailer}', 'pending_review', 1, '{file_audit_id}',
+    '{safe(discovery_result.get("qualified_sheets", []))}'::jsonb,
+    '{safe(discovery_result.get("column_mapping", {}))}'::jsonb,
+    '{safe(discovery_result.get("date_config", {}))}'::jsonb,
+    '{safe(discovery_result.get("flags", {}))}'::jsonb
+)
+ON CONFLICT DO NOTHING
+""".strip()
+
 # ─────────────────────────────────────────────
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
@@ -742,8 +818,97 @@ async def advance_from_postgres(session_id: str):
             session["_pending_jobs"].add(job_id)
 
     if not session["_pending_jobs"]:
-        await stage_date_config(session_id)
+        await stage_identify_retailer(session_id)
 
+
+
+async def stage_identify_retailer(session_id: str):
+    """Stage 3b — identify retailer by querying retailer_sku_map."""
+    session = _sessions[session_id]
+    session["stage"] = "identifying_retailer"
+    session["status"] = "running"
+
+    # Collect retailer SKU column values across all qualified sheets
+    retailer_sku_candidates = set()
+    for sheet_name in session["qualified_sheets"]:
+        mapping = session["column_mapping"].get(sheet_name, [])
+        cols = mapping if isinstance(mapping, list) else mapping.get("columns", [])
+        grid = session["grid"].get(sheet_name, {})
+
+        for col_info in cols:
+            if col_info.get("classification") == "retailer_sku":
+                col_idx = col_info.get("col")
+                sku_candidates = grid.get("sku_candidates", [])
+                for c in sku_candidates:
+                    if c["col"] == col_idx:
+                        for v in c.get("sample_values", []):
+                            s = str(v).strip()
+                            if s:
+                                retailer_sku_candidates.add(s)
+
+    if not retailer_sku_candidates:
+        # No retailer SKU column found — skip, flag for review
+        session["retailer"] = None
+        session["flags"]["retailer_identification"] = "no_retailer_sku_column_found"
+        await stage_date_config(session_id)
+        return
+
+    sql = build_retailer_identify_sql(sorted(retailer_sku_candidates))
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "session_id": session_id,
+        "stage":      "identify_retailer",
+        "created_at": time.time(),
+    }
+
+    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    if err:
+        session["retailer"] = None
+        session["flags"]["retailer_identification"] = f"webhook_error: {err}"
+        await stage_date_config(session_id)
+    else:
+        session["status"] = "awaiting_postgres"
+        session["_pending_jobs"].add(job_id)
+
+
+async def stage_write_audit(session_id: str):
+    """Stage 6b — write discovery result back to file_audit and retailer_configs."""
+    session = _sessions[session_id]
+    session["stage"] = "writing"
+    session["status"] = "running"
+
+    file_audit_id = session.get("file_audit_id")
+    retailer      = session.get("retailer")
+    result        = session.get("result", {})
+
+    if not file_audit_id:
+        # No audit ID — skip DB writes, go straight to assemble
+        await stage_assemble(session_id)
+        return
+
+    # Determine status for file_audit
+    if retailer:
+        audit_status = "discovery_complete"
+    else:
+        audit_status = "pending_review"
+
+    sql = build_update_file_audit_sql(file_audit_id, result, retailer, audit_status)
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "session_id": session_id,
+        "stage":      "write_audit",
+        "created_at": time.time(),
+    }
+
+    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    if err:
+        session["errors"].append(f"Failed to write to file_audit: {err}")
+        await stage_assemble(session_id)
+    else:
+        session["status"] = "awaiting_postgres"
+        session["_pending_jobs"].add(job_id)
 
 async def stage_date_config(session_id: str):
     """Stage 4 — date config. Pure Python, AI only if year ambiguous."""
@@ -823,7 +988,7 @@ async def stage_multisheet(session_id: str):
             "Next stage should compare actual data to determine combine vs dedup."
         )
 
-    await stage_assemble(session_id)
+    await stage_write_audit(session_id)
 
 
 async def stage_assemble(session_id: str):
@@ -928,6 +1093,49 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_multisheet, session_id)
 
+    elif stage == "identify_retailer":
+        # Postgres returned retailer match results
+        rows = request_body.get("matches", [])
+        if rows and int(rows[0].get("matches", 0)) >= 3:
+            session["retailer"] = rows[0].get("retailer")
+            session["flags"]["retailer_identification"] = f"confirmed: {session['retailer']} ({rows[0].get('matches')} matches)"
+        else:
+            session["retailer"] = None
+            session["flags"]["retailer_identification"] = "unconfirmed — fewer than 3 matches"
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_date_config, session_id)
+
+    elif stage == "write_audit":
+        # Postgres confirmed the file_audit update
+        # If retailer identified and no active config, insert into retailer_configs
+        retailer      = session.get("retailer")
+        file_audit_id = session.get("file_audit_id")
+        result        = session.get("result", {})
+
+        if retailer and file_audit_id:
+            sql = build_insert_retailer_config_sql(retailer, file_audit_id, result)
+            job_id2 = str(uuid.uuid4())
+            _jobs[job_id2] = {
+                "session_id": session_id,
+                "stage":      "write_config",
+                "created_at": time.time(),
+            }
+            err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id2, {"sql": sql, "params": []})
+            if err:
+                session["errors"].append(f"Failed to write retailer_config: {err}")
+                background_tasks.add_task(stage_assemble, session_id)
+            else:
+                session["status"] = "awaiting_postgres"
+                session["_pending_jobs"].add(job_id2)
+        else:
+            background_tasks.add_task(stage_assemble, session_id)
+
+    elif stage == "write_config":
+        # Config row inserted — done
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_assemble, session_id)
+
     return JSONResponse(content={"status": "ok", "job_id": job_id})
 
 
@@ -940,11 +1148,15 @@ def file_hash(data: bytes) -> str:
 
 
 @app.post("/analyze")
-async def analyze(files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
+async def analyze(
+    files: List[UploadFile] = File(...),
+    file_audit_id: str = None,
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
 
-    upload = files[0]  # Process one file at a time
+    upload = files[0]
 
     if not upload.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail=f"'{upload.filename}' is not an Excel file")
@@ -956,7 +1168,6 @@ async def analyze(files: List[UploadFile] = File(...), background_tasks: Backgro
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot open {upload.filename}: {e}")
 
-    # Pre-load all sheet rows
     sheets = {}
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -964,22 +1175,24 @@ async def analyze(files: List[UploadFile] = File(...), background_tasks: Backgro
 
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
-        "stage":           "accepted",
-        "status":          "running",
-        "filename":        upload.filename,
-        "file_hash":       file_hash(data),
+        "stage":            "accepted",
+        "status":           "running",
+        "filename":         upload.filename,
+        "file_hash":        file_hash(data),
+        "file_audit_id":    file_audit_id,
+        "retailer":         None,
         "qualified_sheets": [],
-        "qualify_results": {},
-        "grid":            {},
+        "qualify_results":  {},
+        "grid":             {},
         "postgres_results": {},
-        "column_mapping":  {},
-        "date_config":     {},
-        "flags":           {},
-        "errors":          [],
-        "result":          None,
-        "_sheets":         sheets,
-        "_pending_jobs":   set(),
-        "created_at":      time.time(),
+        "column_mapping":   {},
+        "date_config":      {},
+        "flags":            {},
+        "errors":           [],
+        "result":           None,
+        "_sheets":          sheets,
+        "_pending_jobs":    set(),
+        "created_at":       time.time(),
     }
 
     background_tasks.add_task(stage_qualify, session_id)
@@ -1011,4 +1224,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.5"}
+    return {"status": "ok", "version": "3.1.0"}
