@@ -1225,4 +1225,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.1"}
