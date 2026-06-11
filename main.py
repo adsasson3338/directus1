@@ -999,14 +999,17 @@ async def stage_assemble(session_id: str):
     session["status"] = "complete"
 
     session["result"] = {
-        "filename":        session["filename"],
-        "file_hash":       session["file_hash"],
+        "filename":         session["filename"],
+        "file_hash":        session["file_hash"],
+        "retailer":         session.get("retailer"),
+        "file_audit_id":    session.get("file_audit_id"),
         "qualified_sheets": session["qualified_sheets"],
-        "qualify_results": session["qualify_results"],
-        "grid":            session["grid"],
-        "column_mapping":  session["column_mapping"],
-        "date_config":     session["date_config"],
-        "flags":           session["flags"],
+        "qualify_results":  session["qualify_results"],
+        "grid":             session["grid"],
+        "column_mapping":   session["column_mapping"],
+        "date_config":      session["date_config"],
+        "flags":            session["flags"],
+        "errors":           session.get("errors", []),
     }
 
 
@@ -1073,7 +1076,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         session["column_mapping"][sheet_name] = result.get("columns", result)
 
         if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_date_config, session_id)
+            background_tasks.add_task(stage_identify_retailer, session_id)
 
     elif stage == "date_config":
         sheet_name = job["sheet_name"]
@@ -1225,4 +1228,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.1"}
+    return {"status": "ok", "version": "3.1.2"}
