@@ -828,23 +828,24 @@ async def stage_identify_retailer(session_id: str):
     session["stage"] = "identifying_retailer"
     session["status"] = "running"
 
-    # Collect retailer SKU column values across all qualified sheets
+    # Collect ALL retailer SKU column values across all qualified sheets
+    # Use full sheet data, not just samples — own Postgres, no cost concern
     retailer_sku_candidates = set()
     for sheet_name in session["qualified_sheets"]:
         mapping = session["column_mapping"].get(sheet_name, [])
         cols = mapping if isinstance(mapping, list) else mapping.get("columns", [])
         grid = session["grid"].get(sheet_name, {})
+        rows = session["_sheets"].get(sheet_name, [])
+        data_start = grid.get("data_start_row", 0)
 
         for col_info in cols:
             if col_info.get("classification") == "retailer_sku":
                 col_idx = col_info.get("col")
-                sku_candidates = grid.get("sku_candidates", [])
-                for c in sku_candidates:
-                    if c["col"] == col_idx:
-                        for v in c.get("sample_values", []):
-                            s = str(v).strip()
-                            if s:
-                                retailer_sku_candidates.add(s)
+                for row in rows[data_start:]:
+                    if col_idx < len(row) and row[col_idx] is not None:
+                        v = str(row[col_idx]).strip()
+                        if v:
+                            retailer_sku_candidates.add(v)
 
     if not retailer_sku_candidates:
         # No retailer SKU column found — skip, flag for review
@@ -1224,4 +1225,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.0"}
+    return {"status": "ok", "version": "3.0.0"}
