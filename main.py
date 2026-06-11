@@ -61,6 +61,8 @@ async def cleanup_stale_jobs():
             elif stage == "classify_sheet":
                 asyncio.create_task(stage_identify_retailer(sid))
             elif stage == "identify_retailer":
+                asyncio.create_task(stage_identify_retailer_ai(sid))
+            elif stage == "identify_retailer_ai":
                 session["retailer"] = None
                 session["flags"]["retailer_identification"] = "timed out"
                 asyncio.create_task(stage_date_config(sid))
@@ -627,6 +629,25 @@ VALUES (
 ON CONFLICT DO NOTHING
 """.strip()
 
+
+def build_retailer_identify_prompt(filename: str, sheets: list, header_strings: list) -> str:
+    """
+    Build a prompt to identify retailer from file/sheet clues when Postgres has no match.
+    """
+    return f"""You are identifying which retailer sent a sales file to a supplier.
+
+Known retailers: Walgreens, Target, Staples, Walmart, CVS, Rite Aid, Best Buy, Amazon, Costco, BJ's, Sam's Club.
+
+CLUES:
+Filename: {filename}
+Sheet names: {sheets}
+Header strings found in sheets: {header_strings[:20]}
+
+Based on these clues, identify the retailer. If you cannot determine it with reasonable confidence, return null.
+
+Respond with JSON only:
+{{"retailer": "retailer name or null", "confidence": "high/medium/low", "reason": "one sentence"}}"""
+
 # ─────────────────────────────────────────────
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
@@ -848,10 +869,8 @@ async def stage_identify_retailer(session_id: str):
                             retailer_sku_candidates.add(v)
 
     if not retailer_sku_candidates:
-        # No retailer SKU column found — skip, flag for review
-        session["retailer"] = None
-        session["flags"]["retailer_identification"] = "no_retailer_sku_column_found"
-        await stage_date_config(session_id)
+        # No retailer SKU column — go straight to AI fallback
+        await stage_identify_retailer_ai(session_id)
         return
 
     sql = build_retailer_identify_sql(sorted(retailer_sku_candidates))
@@ -865,13 +884,49 @@ async def stage_identify_retailer(session_id: str):
 
     err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
-        session["retailer"] = None
-        session["flags"]["retailer_identification"] = f"webhook_error: {err}"
-        await stage_date_config(session_id)
+        await stage_identify_retailer_ai(session_id)
     else:
         session["status"] = "awaiting_postgres"
         session["_pending_jobs"].add(job_id)
 
+
+
+async def stage_identify_retailer_ai(session_id: str):
+    """Fallback — identify retailer via AI using filename/sheet/header clues."""
+    session = _sessions[session_id]
+    session["status"] = "running"
+
+    # Collect header strings from all qualified sheets
+    header_strings = []
+    for sheet_name in session["qualified_sheets"]:
+        grid = session["grid"].get(sheet_name, {})
+        for col in grid.get("sku_candidates", []):
+            for s in col.get("pre_data_strings", []):
+                v = s.get("value", "")
+                if v and v not in header_strings:
+                    header_strings.append(v)
+
+    prompt = build_retailer_identify_prompt(
+        session["filename"],
+        session["qualified_sheets"],
+        header_strings
+    )
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "session_id": session_id,
+        "stage":      "identify_retailer_ai",
+        "created_at": time.time(),
+    }
+
+    err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+    if err:
+        session["retailer"] = None
+        session["flags"]["retailer_identification"] = f"ai_webhook_error: {err}"
+        await stage_date_config(session_id)
+    else:
+        session["status"] = "awaiting_ai"
+        session["_pending_jobs"].add(job_id)
 
 async def stage_write_audit(session_id: str):
     """Stage 6b — write discovery result back to file_audit and retailer_configs."""
@@ -1103,10 +1158,30 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         if rows and int(rows[0].get("matches", 0)) >= 3:
             session["retailer"] = rows[0].get("retailer")
             session["flags"]["retailer_identification"] = f"confirmed: {session['retailer']} ({rows[0].get('matches')} matches)"
+            if not session["_pending_jobs"]:
+                background_tasks.add_task(stage_date_config, session_id)
         else:
-            session["retailer"] = None
-            session["flags"]["retailer_identification"] = "unconfirmed — fewer than 3 matches"
+            # Fewer than 3 matches — try AI fallback
+            background_tasks.add_task(stage_identify_retailer_ai, session_id)
 
+    elif stage == "identify_retailer_ai":
+        # AI returned retailer identification
+        raw = request_body
+        text = raw.get("text", "") or ""
+        if isinstance(text, str):
+            clean = text.replace("```json", "").replace("```", "").strip()
+            try:
+                result = json.loads(clean)
+            except:
+                result = {"retailer": None, "confidence": None, "reason": f"Parse error: {text[:100]}"}
+        else:
+            result = raw
+        session["retailer"] = result.get("retailer")
+        session["flags"]["retailer_identification"] = (
+            f"ai_confirmed: {session['retailer']} ({result.get('confidence', 'unknown')} confidence)"
+            if session["retailer"]
+            else f"ai_unconfirmed: {result.get('reason', 'unknown')}"
+        )
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_date_config, session_id)
 
@@ -1228,4 +1303,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.2"}
+    return {"status": "ok", "version": "3.1.3"}
