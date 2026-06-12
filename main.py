@@ -68,6 +68,8 @@ async def cleanup_stale_jobs():
                 asyncio.create_task(stage_date_config(sid))
             elif stage == "date_config":
                 asyncio.create_task(stage_multisheet(sid))
+            elif stage == "query_config":
+                asyncio.create_task(stage_finalize_audit(sid, file_set_size=1))
             elif stage == "write_audit":
                 asyncio.create_task(stage_assemble(sid))
             elif stage == "write_config":
@@ -648,6 +650,70 @@ Based on these clues, identify the retailer. If you cannot determine it with rea
 Respond with JSON only:
 {{"retailer": "retailer name or null", "confidence": "high/medium/low", "reason": "one sentence"}}"""
 
+
+def build_query_retailer_config_sql(retailer: str) -> str:
+    """Query active retailer config to get file_set_size."""
+    retailer_safe = retailer.replace("'", "''")
+    return f"""
+SELECT file_set_size, id
+FROM retailer_configs
+WHERE UPPER(retailer) = UPPER('{retailer_safe}')
+  AND status = 'active'
+LIMIT 1
+""".strip()
+
+
+def build_file_set_key(retailer: str, date_config: dict) -> str:
+    """
+    Build a file set key from retailer and week period.
+    Uses year_value and earliest date from date_config.
+    Format: retailer_YYYY-WNN
+    """
+    import datetime
+    retailer_clean = retailer.replace(" ", "_").upper()
+    year_value = None
+    for sheet_config in date_config.values():
+        y = sheet_config.get("year_value")
+        if y:
+            year_value = y
+            break
+    if not year_value:
+        year_value = datetime.date.today().year
+    # Use ISO week of current date as fallback
+    week_num = datetime.date.today().isocalendar()[1]
+    return f"{retailer_clean}_{year_value}-W{week_num:02d}"
+
+
+def build_count_pending_set_sql(retailer: str, file_set_key: str) -> str:
+    """Count files already in pending_set for this file set."""
+    retailer_safe = retailer.replace("'", "''")
+    key_safe = file_set_key.replace("'", "''")
+    return f"""
+SELECT COUNT(*) as pending_count
+FROM file_audit
+WHERE UPPER(retailer) = UPPER('{retailer_safe}')
+  AND file_set_key = '{key_safe}'
+  AND status IN ('pending_set', 'discovery_complete')
+""".strip()
+
+
+def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
+                                      retailer: str | None, status: str,
+                                      file_set_key: str | None) -> str:
+    """Update file_audit with discovery result, retailer, status and file_set_key."""
+    result_json = json.dumps(discovery_result).replace("'", "''")
+    retailer_val  = f"'{retailer}'" if retailer else "NULL"
+    key_val       = f"'{file_set_key}'" if file_set_key else "NULL"
+    return f"""
+UPDATE file_audit
+SET discovery_result = '{result_json}'::jsonb,
+    retailer         = {retailer_val},
+    status           = '{status}',
+    file_set_key     = {key_val},
+    updated_at       = now()
+WHERE id = '{file_audit_id}'
+""".strip()
+
 # ─────────────────────────────────────────────
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
@@ -929,35 +995,63 @@ async def stage_identify_retailer_ai(session_id: str):
         session["_pending_jobs"].add(job_id)
 
 async def stage_write_audit(session_id: str):
-    """Stage 6b — write discovery result back to file_audit and retailer_configs."""
+    """Stage 6b — query retailer config for file_set_size, then write to file_audit."""
     session = _sessions[session_id]
     session["stage"] = "writing"
     session["status"] = "running"
 
     file_audit_id = session.get("file_audit_id")
     retailer      = session.get("retailer")
-    result        = session.get("result", {})
 
     if not file_audit_id:
-        # No audit ID — skip DB writes, go straight to assemble
         await stage_assemble(session_id)
         return
 
-    # Determine status for file_audit
     if retailer:
-        audit_status = "discovery_complete"
+        # Query retailer config for file_set_size
+        sql = build_query_retailer_config_sql(retailer)
+        job_id = str(uuid.uuid4())
+        _jobs[job_id] = {
+            "session_id": session_id,
+            "stage":      "query_config",
+            "created_at": time.time(),
+        }
+        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        if err:
+            session["errors"].append(f"Failed to query retailer config: {err}")
+            await stage_finalize_audit(session_id, file_set_size=1)
+        else:
+            session["status"] = "awaiting_postgres"
+            session["_pending_jobs"].add(job_id)
     else:
+        # No retailer identified — write pending_review immediately
+        await stage_finalize_audit(session_id, file_set_size=1)
+
+
+async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
+    """Write final status to file_audit based on file_set_size."""
+    session       = _sessions[session_id]
+    file_audit_id = session.get("file_audit_id")
+    retailer      = session.get("retailer")
+    result        = session.get("result", {})
+
+    file_set_key = build_file_set_key(retailer, session.get("date_config", {})) if retailer else None
+
+    if not retailer:
         audit_status = "pending_review"
+    elif file_set_size and file_set_size > 1:
+        audit_status = "pending_set"
+    else:
+        audit_status = "discovery_complete"
 
-    sql = build_update_file_audit_sql(file_audit_id, result, retailer, audit_status)
-
+    sql = build_update_file_audit_full_sql(file_audit_id, result, retailer, audit_status, file_set_key)
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {
-        "session_id": session_id,
-        "stage":      "write_audit",
-        "created_at": time.time(),
+        "session_id":   session_id,
+        "stage":        "write_audit",
+        "file_set_size": file_set_size,
+        "created_at":   time.time(),
     }
-
     err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         session["errors"].append(f"Failed to write to file_audit: {err}")
@@ -1185,9 +1279,17 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_date_config, session_id)
 
+    elif stage == "query_config":
+        # Got retailer config — extract file_set_size and finalize audit
+        rows = request_body.get("matches", [])
+        file_set_size = 1
+        if rows and rows[0].get("file_set_size") is not None:
+            file_set_size = int(rows[0].get("file_set_size") or 1)
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_finalize_audit, session_id, file_set_size)
+
     elif stage == "write_audit":
         # Postgres confirmed the file_audit update
-        # If retailer identified and no active config, insert into retailer_configs
         retailer      = session.get("retailer")
         file_audit_id = session.get("file_audit_id")
         result        = session.get("result", {})
@@ -1211,7 +1313,6 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             background_tasks.add_task(stage_assemble, session_id)
 
     elif stage == "write_config":
-        # Config row inserted — done
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_assemble, session_id)
 
@@ -1303,4 +1404,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.3"}
+    return {"status": "ok", "version": "3.1.7"}
