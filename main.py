@@ -53,7 +53,9 @@ async def cleanup_stale_jobs():
             if sid not in _sessions:
                 continue
             session = _sessions[sid]
-            if stage == "qualify":
+            if stage == "lookup_audit":
+                asyncio.create_task(stage_qualify(sid))
+            elif stage == "qualify":
                 asyncio.create_task(advance_from_qualify(sid))
             elif stage == "postgres_sku":
                 session["postgres_results"] = {"matches": [], "error": "timed out"}
@@ -567,6 +569,18 @@ Respond with JSON only:
 # ─────────────────────────────────────────────
 # RETAILER IDENTIFICATION SQL
 # ─────────────────────────────────────────────
+
+
+def build_file_audit_lookup_sql(file_hash: str) -> str:
+    """Look up file_audit row by file_hash."""
+    return f"""
+SELECT id, status
+FROM file_audit
+WHERE file_hash = '{file_hash}'
+  AND status = 'received'
+ORDER BY received_at DESC
+LIMIT 1
+""".strip()
 
 def build_retailer_identify_sql(retailer_sku_candidates: list) -> str:
     """
@@ -1185,7 +1199,14 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         session["status"] = "awaiting_ai"
 
     # Store result by stage
-    if stage == "qualify":
+    if stage == "lookup_audit":
+        rows = request_body.get("matches", [])
+        if rows and rows[0].get("id"):
+            session["file_audit_id"] = rows[0]["id"]
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_qualify, session_id)
+
+    elif stage == "qualify":
         sheet_name = job["sheet_name"]
         raw = request_body
         # Parse AI response
@@ -1353,13 +1374,14 @@ async def analyze(
         ws = wb[sheet_name]
         sheets[sheet_name] = list(ws.iter_rows(values_only=True))
 
+    fhash = file_hash(data)
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
         "stage":            "accepted",
         "status":           "running",
         "filename":         upload.filename,
-        "file_hash":        file_hash(data),
-        "file_audit_id":    file_audit_id,
+        "file_hash":        fhash,
+        "file_audit_id":    file_audit_id,  # may be overridden by hash lookup
         "retailer":         None,
         "qualified_sheets": [],
         "qualify_results":  {},
@@ -1375,7 +1397,24 @@ async def analyze(
         "created_at":       time.time(),
     }
 
-    background_tasks.add_task(stage_qualify, session_id)
+    # If no file_audit_id provided, look it up by hash
+    if not file_audit_id:
+        sql = build_file_audit_lookup_sql(fhash)
+        job_id = str(uuid.uuid4())
+        _jobs[job_id] = {
+            "session_id": session_id,
+            "stage":      "lookup_audit",
+            "created_at": time.time(),
+        }
+        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        if err:
+            # Can't look up — proceed without audit ID
+            background_tasks.add_task(stage_qualify, session_id)
+        else:
+            _sessions[session_id]["status"] = "awaiting_postgres"
+            _sessions[session_id]["_pending_jobs"].add(job_id)
+    else:
+        background_tasks.add_task(stage_qualify, session_id)
 
     return JSONResponse(content={
         "status":     "accepted",
@@ -1404,4 +1443,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.7"}
+    return {"status": "ok", "version": "3.0.0"}
