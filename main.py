@@ -71,7 +71,7 @@ async def cleanup_stale_jobs():
             elif stage == "date_config":
                 asyncio.create_task(stage_multisheet(sid))
             elif stage == "query_config":
-                asyncio.create_task(stage_finalize_audit(sid, file_set_size=1))
+                asyncio.create_task(stage_finalize_audit(sid, file_set_size=None))
             elif stage == "write_audit":
                 asyncio.create_task(stage_assemble(sid))
             elif stage == "write_config":
@@ -1064,7 +1064,10 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
 
     if not retailer:
         audit_status = "pending_review"
-    elif file_set_size and file_set_size > 1:
+    elif file_set_size is None:
+        # No active config found — needs human review before ingestion
+        audit_status = "pending_review"
+    elif file_set_size > 1:
         audit_status = "pending_set"
     else:
         audit_status = "discovery_complete"
@@ -1313,10 +1316,12 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
 
     elif stage == "query_config":
         # Got retailer config — extract file_set_size and finalize audit
+        # None means no active config found — will trigger pending_review
         rows = request_body.get("matches", [])
-        file_set_size = 1
         if rows and rows[0].get("file_set_size") is not None:
             file_set_size = int(rows[0].get("file_set_size") or 1)
+        else:
+            file_set_size = None  # No active config
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_finalize_audit, session_id, file_set_size)
 
