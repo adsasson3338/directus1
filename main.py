@@ -1047,7 +1047,18 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
     session       = _sessions[session_id]
     file_audit_id = session.get("file_audit_id")
     retailer      = session.get("retailer")
-    result        = session.get("result", {})
+
+    # Build discovery_result from session — stage_assemble hasn't run yet
+    result = {
+        "filename":         session.get("filename"),
+        "file_hash":        session.get("file_hash"),
+        "retailer":         retailer,
+        "qualified_sheets": session.get("qualified_sheets", []),
+        "column_mapping":   session.get("column_mapping", {}),
+        "date_config":      session.get("date_config", {}),
+        "flags":            session.get("flags", {}),
+        "errors":           session.get("errors", []),
+    }
 
     file_set_key = build_file_set_key(retailer, session.get("date_config", {})) if retailer else None
 
@@ -1313,10 +1324,17 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         # Postgres confirmed the file_audit update
         retailer      = session.get("retailer")
         file_audit_id = session.get("file_audit_id")
-        result        = session.get("result", {})
+
+        # Build discovery_result from session data — stage_assemble hasn't run yet
+        discovery_result = {
+            "qualified_sheets": session.get("qualified_sheets", []),
+            "column_mapping":   session.get("column_mapping", {}),
+            "date_config":      session.get("date_config", {}),
+            "flags":            session.get("flags", {}),
+        }
 
         if retailer and file_audit_id:
-            sql = build_insert_retailer_config_sql(retailer, file_audit_id, result)
+            sql = build_insert_retailer_config_sql(retailer, file_audit_id, discovery_result)
             job_id2 = str(uuid.uuid4())
             _jobs[job_id2] = {
                 "session_id": session_id,
