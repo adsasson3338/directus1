@@ -53,7 +53,7 @@ async def cleanup_stale_jobs():
             if sid not in _sessions:
                 continue
             session = _sessions[sid]
-            if stage == "lookup_audit":
+            if stage == "dedup_check":
                 asyncio.create_task(stage_qualify(sid))
             elif stage == "qualify":
                 asyncio.create_task(advance_from_qualify(sid))
@@ -571,6 +571,17 @@ Respond with JSON only:
 # ─────────────────────────────────────────────
 
 
+
+def build_dedup_check_sql(file_hash: str) -> str:
+    """Check if this file has already been processed."""
+    return f"""
+SELECT id, status, filename
+FROM file_audit
+WHERE file_hash = '{file_hash}'
+  AND status NOT IN ('received', 'rejected')
+LIMIT 1
+""".strip()
+
 def build_file_audit_lookup_sql(file_hash: str) -> str:
     """Look up file_audit row by file_hash."""
     return f"""
@@ -713,17 +724,23 @@ WHERE UPPER(retailer) = UPPER('{retailer_safe}')
 
 def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       retailer: str | None, status: str,
-                                      file_set_key: str | None) -> str:
-    """Update file_audit with discovery result, retailer, status and file_set_key."""
-    result_json = json.dumps(discovery_result).replace("'", "''")
-    retailer_val  = f"'{retailer}'" if retailer else "NULL"
-    key_val       = f"'{file_set_key}'" if file_set_key else "NULL"
+                                      file_set_key: str | None,
+                                      file_hash: str | None = None,
+                                      filename: str | None = None) -> str:
+    """Update file_audit with discovery result, retailer, status, file_set_key, hash and filename."""
+    result_json  = json.dumps(discovery_result).replace("'", "''")
+    retailer_val = f"'{retailer}'" if retailer else "NULL"
+    key_val      = f"'{file_set_key}'" if file_set_key else "NULL"
+    hash_val     = f"'{file_hash}'" if file_hash else "NULL"
+    fname_val    = f"'{filename.replace(chr(39), chr(39)*2)}'" if filename else "NULL"
     return f"""
 UPDATE file_audit
 SET discovery_result = '{result_json}'::jsonb,
     retailer         = {retailer_val},
     status           = '{status}',
     file_set_key     = {key_val},
+    file_hash        = {hash_val},
+    filename         = {fname_val},
     updated_at       = now()
 WHERE id = '{file_audit_id}'
 """.strip()
@@ -1072,7 +1089,11 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
     else:
         audit_status = "discovery_complete"
 
-    sql = build_update_file_audit_full_sql(file_audit_id, result, retailer, audit_status, file_set_key)
+    sql = build_update_file_audit_full_sql(
+        file_audit_id, result, retailer, audit_status, file_set_key,
+        file_hash=session.get("file_hash"),
+        filename=session.get("filename"),
+    )
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {
         "session_id":   session_id,
@@ -1213,12 +1234,26 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         session["status"] = "awaiting_ai"
 
     # Store result by stage
-    if stage == "lookup_audit":
+    if stage == "dedup_check":
         rows = request_body.get("matches", [])
         if rows and rows[0].get("id"):
-            session["file_audit_id"] = rows[0]["id"]
-        if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_qualify, session_id)
+            # File already processed — skip
+            existing_id = rows[0].get("id")
+            existing_status = rows[0].get("status")
+            session["stage"]  = "complete"
+            session["status"] = "complete"
+            session["result"] = {
+                "skipped": True,
+                "reason": f"File already processed — existing row {existing_id} has status '{existing_status}'",
+                "file_hash": session["file_hash"],
+            }
+        else:
+            # No duplicate — set file_audit_id from job metadata if provided
+            file_audit_id_from_job = job.get("file_audit_id")
+            if file_audit_id_from_job:
+                session["file_audit_id"] = file_audit_id_from_job
+            if not session["_pending_jobs"]:
+                background_tasks.add_task(stage_qualify, session_id)
 
     elif stage == "qualify":
         sheet_name = job["sheet_name"]
@@ -1398,6 +1433,9 @@ async def analyze(
         sheets[sheet_name] = list(ws.iter_rows(values_only=True))
 
     fhash = file_hash(data)
+
+    # Dedup check — if file_audit_id provided, still check hash for duplicate processing
+    # Fire dedup check via Postgres webhook before starting pipeline
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
         "stage":            "accepted",
@@ -1420,24 +1458,22 @@ async def analyze(
         "created_at":       time.time(),
     }
 
-    # If no file_audit_id provided, look it up by hash
-    if not file_audit_id:
-        sql = build_file_audit_lookup_sql(fhash)
-        job_id = str(uuid.uuid4())
-        _jobs[job_id] = {
-            "session_id": session_id,
-            "stage":      "lookup_audit",
-            "created_at": time.time(),
-        }
-        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
-        if err:
-            # Can't look up — proceed without audit ID
-            background_tasks.add_task(stage_qualify, session_id)
-        else:
-            _sessions[session_id]["status"] = "awaiting_postgres"
-            _sessions[session_id]["_pending_jobs"].add(job_id)
-    else:
+    # Always run dedup check first — prevents reprocessing same file
+    dedup_sql = build_dedup_check_sql(fhash)
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "session_id":    session_id,
+        "stage":         "dedup_check",
+        "file_audit_id": file_audit_id,  # may be None
+        "created_at":    time.time(),
+    }
+    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": dedup_sql, "params": []})
+    if err:
+        # Can't check — proceed anyway
         background_tasks.add_task(stage_qualify, session_id)
+    else:
+        _sessions[session_id]["status"] = "awaiting_postgres"
+        _sessions[session_id]["_pending_jobs"].add(job_id)
 
     return JSONResponse(content={
         "status":     "accepted",
@@ -1466,4 +1502,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.9"}
+    return {"status": "ok", "version": "3.1.11"}
