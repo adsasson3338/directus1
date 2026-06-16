@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import List
 import openpyxl
@@ -1409,7 +1409,7 @@ def file_hash(data: bytes) -> str:
 @app.post("/analyze")
 async def analyze(
     files: List[UploadFile] = File(...),
-    file_audit_id: str = None,
+    file_audit_id: str = Form(None),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if not files:
@@ -1502,4 +1502,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.11"}
+    return {"status": "ok", "version": "3.1.12"}
