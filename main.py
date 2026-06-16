@@ -16,6 +16,10 @@ import time
 
 app = FastAPI(title="Sheet Discovery Service", version="3.1.0")
 
+# Include ingestion routes
+from ingestion import router as ingestion_router
+app.include_router(ingestion_router)
+
 JOB_TIMEOUT_SECONDS     = 120  # 2 minutes per job
 SESSION_TIMEOUT_SECONDS = 600  # 10 minutes per session
 
@@ -1502,4 +1506,4 @@ async def analyze_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.12"}
+    return {"status": "ok", "version": "3.1.13"}
