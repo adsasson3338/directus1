@@ -1,44 +1,28 @@
+"""
+ingestion.py — Ingestion pipeline: fetch audit rows, process files, write sales and inventory.
+"""
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import openpyxl
-import hashlib
 import io
 import re
 import uuid
 import asyncio
 import urllib.request
-import urllib.parse
 import json
-import os
 from datetime import datetime, date, timedelta
 import time
 
+from shared import (
+    _sessions, _jobs, fire_webhook,
+    normalize_to_saturday,
+    N8N_POSTGRES_WEBHOOK,
+    register_ingestion_timeout_handler,
+)
+
 router = APIRouter()
-
-INGESTION_TIMEOUT_SECONDS = 600
-
-N8N_POSTGRES_WEBHOOK = os.environ.get("N8N_POSTGRES_WEBHOOK", "http://n8n:5678/webhook/postgres")
-
-# ─────────────────────────────────────────────
-# SESSION STORE
-# ─────────────────────────────────────────────
-_sessions: dict = {}
-_jobs: dict     = {}
-
-# ─────────────────────────────────────────────
-# WEBHOOK HELPER
-# ─────────────────────────────────────────────
-
-def fire_webhook(url: str, job_id: str, payload: dict) -> str | None:
-    body = json.dumps({"job_id": job_id, **payload}).encode()
-    try:
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
-        return None
-    except Exception as e:
-        return str(e)
 
 # ─────────────────────────────────────────────
 # DATE HELPERS
@@ -49,10 +33,6 @@ MONTH_MAP = {
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
 }
 
-def normalize_to_saturday(d: date) -> date:
-    """Return the Saturday of the week containing d."""
-    days_to_saturday = (5 - d.weekday()) % 7
-    return d + timedelta(days=days_to_saturday)
 
 
 def parse_date_value(val, date_config: dict) -> Optional[date]:
@@ -398,6 +378,24 @@ def extract_sales_and_inventory(
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
 
+
+async def ingestion_timeout_handler(sid: str, stage: str):
+    """Handle timed-out ingestion jobs."""
+    if stage == "fetch_audit":
+        asyncio.create_task(stage_process_files(sid))
+    elif stage == "create_table":
+        asyncio.create_task(stage_write_sales(sid))
+    elif stage == "write_sales_batch":
+        asyncio.create_task(stage_write_inventory(sid))
+    elif stage == "write_inventory_batch":
+        asyncio.create_task(stage_write_inventory(sid))
+    elif stage == "finalize_audit":
+        asyncio.create_task(stage_complete(sid))
+
+
+register_ingestion_timeout_handler(ingestion_timeout_handler)
+
+
 class IngestRequest(BaseModel):
     file_audit_ids: List[str]
 
@@ -446,6 +444,7 @@ async def stage_fetch_audit_rows(session_id: str):
             "stage":      "fetch_audit",
             "audit_id":   audit_id,
             "created_at": time.time(),
+            "pipeline":  "ingestion",
         }
         err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
@@ -562,7 +561,8 @@ async def stage_create_table(session_id: str):
         "session_id": session_id,
         "stage":      "create_table",
         "created_at": time.time(),
-    }
+            "pipeline":  "ingestion",
+        }
     err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         session["errors"].append(f"Failed to create sales table: {err}")
@@ -598,6 +598,7 @@ async def stage_write_sales(session_id: str):
             "stage":      "write_sales_batch",
             "batch":      i,
             "created_at": time.time(),
+            "pipeline":  "ingestion",
         }
         err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
@@ -636,6 +637,7 @@ async def stage_write_inventory(session_id: str):
             "stage":      "write_inventory_batch",
             "batch":      i,
             "created_at": time.time(),
+            "pipeline":  "ingestion",
         }
         err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
@@ -661,6 +663,7 @@ async def stage_finalize(session_id: str):
             "session_id": session_id,
             "stage":      "finalize_audit",
             "created_at": time.time(),
+            "pipeline":  "ingestion",
         }
         err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
@@ -762,4 +765,4 @@ async def ingest_status(session_id: str):
 
 @router.get("/ingest/health")
 def health():
-    return {"status": "ok", "version": "1.0.1"}
+    return {"status": "ok", "version": "1.0.0"}
