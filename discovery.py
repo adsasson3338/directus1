@@ -1,4 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+"""
+discovery.py — Discovery pipeline: qualify, locate, identify, date, write audit.
+"""
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import List
 import openpyxl
@@ -6,123 +9,18 @@ import hashlib
 import io
 import re
 import uuid
-import asyncio
-import urllib.request
 import json
-import os
+import time
 from datetime import datetime, date, timedelta
 
-import time
+from shared import (
+    _sessions, _jobs, fire_webhook,
+    normalize_to_saturday,
+    N8N_AI_WEBHOOK, N8N_POSTGRES_WEBHOOK,
+    register_discovery_timeout_handler,
+)
 
-app = FastAPI(title="Sheet Discovery Service", version="3.1.0")
-
-# Include ingestion routes
-from ingestion import router as ingestion_router
-app.include_router(ingestion_router)
-
-JOB_TIMEOUT_SECONDS     = 120  # 2 minutes per job
-SESSION_TIMEOUT_SECONDS = 600  # 10 minutes per session
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(cleanup_stale_jobs())
-
-async def cleanup_stale_jobs():
-    while True:
-        await asyncio.sleep(60)  # check every minute
-        now = time.time()
-
-        # Find stale jobs
-        stale_job_ids = [
-            jid for jid, j in list(_jobs.items())
-            if now - j.get("created_at", now) > JOB_TIMEOUT_SECONDS
-        ]
-
-        sessions_to_advance = set()
-        for jid in stale_job_ids:
-            job = _jobs.pop(jid, {})
-            sid = job.get("session_id")
-            if sid and sid in _sessions:
-                session = _sessions[sid]
-                session["_pending_jobs"].discard(jid)
-                session.setdefault("errors", []).append(
-                    f"Job {jid} (stage: {job.get('stage')}) timed out after {JOB_TIMEOUT_SECONDS}s"
-                )
-                # If no more pending jobs, this session needs to advance
-                if not session["_pending_jobs"]:
-                    sessions_to_advance.add((sid, job.get("stage")))
-
-        # Advance sessions whose last pending job timed out
-        for sid, stage in sessions_to_advance:
-            if sid not in _sessions:
-                continue
-            session = _sessions[sid]
-            if stage == "dedup_check":
-                asyncio.create_task(stage_qualify(sid))
-            elif stage == "qualify":
-                asyncio.create_task(advance_from_qualify(sid))
-            elif stage == "postgres_sku":
-                session["postgres_results"] = {"matches": [], "error": "timed out"}
-                asyncio.create_task(advance_from_postgres(sid))
-            elif stage == "classify_sheet":
-                asyncio.create_task(stage_identify_retailer(sid))
-            elif stage == "identify_retailer":
-                asyncio.create_task(stage_identify_retailer_ai(sid))
-            elif stage == "identify_retailer_ai":
-                session["retailer"] = None
-                session["flags"]["retailer_identification"] = "timed out"
-                asyncio.create_task(stage_date_config(sid))
-            elif stage == "date_config":
-                asyncio.create_task(stage_multisheet(sid))
-            elif stage == "query_config":
-                asyncio.create_task(stage_finalize_audit(sid, file_set_size=None))
-            elif stage == "write_audit":
-                asyncio.create_task(stage_assemble(sid))
-            elif stage == "write_config":
-                asyncio.create_task(stage_assemble(sid))
-
-        # Find stale sessions
-        stale_session_ids = [
-            sid for sid, s in list(_sessions.items())
-            if now - s.get("created_at", now) > SESSION_TIMEOUT_SECONDS
-            and s.get("status") not in ("complete", "failed")
-        ]
-
-        for sid in stale_session_ids:
-            session = _sessions.get(sid, {})
-            session["stage"]  = "failed"
-            session["status"] = "failed"
-            session["result"] = {
-                "error": "Session timed out",
-                "errors": session.get("errors", []),
-            }
-
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-N8N_AI_WEBHOOK       = os.environ.get("N8N_AI_WEBHOOK",       "http://n8n:5678/webhook/ai")
-N8N_POSTGRES_WEBHOOK = os.environ.get("N8N_POSTGRES_WEBHOOK", "http://n8n:5678/webhook/postgres")
-
-# ─────────────────────────────────────────────
-# SESSION STORE
-# ─────────────────────────────────────────────
-_sessions: dict = {}  # session_id -> session
-_jobs: dict     = {}  # job_id -> {session_id, stage, key, ...}
-
-
-# ─────────────────────────────────────────────
-# WEBHOOK HELPER
-# ─────────────────────────────────────────────
-
-def fire_webhook(url: str, job_id: str, payload: dict) -> str | None:
-    body = json.dumps({"job_id": job_id, **payload}).encode()
-    try:
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
-        return None
-    except Exception as e:
-        return str(e)
-
+router = APIRouter()
 
 # ─────────────────────────────────────────────
 # CELL CLASSIFICATION
@@ -1215,11 +1113,46 @@ async def stage_assemble(session_id: str):
     }
 
 
+
+async def discovery_timeout_handler(sid: str, stage: str):
+    """Handle timed-out discovery jobs."""
+    session = _sessions[sid]
+    if stage == "dedup_check":
+        import asyncio
+        asyncio.create_task(stage_qualify(sid))
+    elif stage == "lookup_audit":
+        asyncio.create_task(stage_qualify(sid))
+    elif stage == "qualify":
+        asyncio.create_task(advance_from_qualify(sid))
+    elif stage == "postgres_sku":
+        session["postgres_results"] = {"matches": [], "error": "timed out"}
+        asyncio.create_task(advance_from_postgres(sid))
+    elif stage == "classify_sheet":
+        asyncio.create_task(stage_identify_retailer(sid))
+    elif stage == "identify_retailer":
+        asyncio.create_task(stage_identify_retailer_ai(sid))
+    elif stage == "identify_retailer_ai":
+        session["retailer"] = None
+        session["flags"]["retailer_identification"] = "timed out"
+        asyncio.create_task(stage_date_config(sid))
+    elif stage == "date_config":
+        asyncio.create_task(stage_multisheet(sid))
+    elif stage == "query_config":
+        asyncio.create_task(stage_finalize_audit(sid, file_set_size=None))
+    elif stage == "write_audit":
+        asyncio.create_task(stage_assemble(sid))
+    elif stage == "write_config":
+        asyncio.create_task(stage_assemble(sid))
+
+
+register_discovery_timeout_handler(discovery_timeout_handler)
+
+
+
 # ─────────────────────────────────────────────
-# RESPONSE ENDPOINT — shared callback
+# RESPONSE ENDPOINT
 # ─────────────────────────────────────────────
 
-@app.post("/response/{job_id}")
 async def webhook_response(job_id: str, request_body: dict, background_tasks: BackgroundTasks):
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found or already completed")
@@ -1402,6 +1335,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
     return JSONResponse(content={"status": "ok", "job_id": job_id})
 
 
+
 # ─────────────────────────────────────────────
 # ANALYZE ENDPOINT
 # ─────────────────────────────────────────────
@@ -1409,8 +1343,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-
-@app.post("/analyze")
+@router.post("/analyze")
 async def analyze(
     files: List[UploadFile] = File(...),
     file_audit_id: str = Form(None),
@@ -1487,7 +1420,7 @@ async def analyze(
     })
 
 
-@app.get("/analyze/status/{session_id}")
+# moved below
 async def analyze_status(session_id: str):
     if session_id not in _sessions:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
@@ -1504,6 +1437,21 @@ async def analyze_status(session_id: str):
     })
 
 
-@app.get("/health")
+
+@router.get("/analyze/status/{session_id}")
+async def analyze_status(session_id: str):
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    session = _sessions[session_id]
+    return JSONResponse(content={
+        "session_id": session_id,
+        "stage":      session.get("stage", "unknown"),
+        "status":     session.get("status", "unknown"),
+        "filename":   session["filename"],
+        "result":     session["result"],
+    })
+
+
+@router.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.13"}
+    return {"status": "ok", "version": "3.2.0"}
