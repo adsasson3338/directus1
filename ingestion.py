@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -15,7 +15,7 @@ import os
 from datetime import datetime, date, timedelta
 import time
 
-app = FastAPI(title="Ingestion Parser", version="1.0.0")
+router = APIRouter()
 
 INGESTION_TIMEOUT_SECONDS = 600
 
@@ -402,7 +402,7 @@ class IngestRequest(BaseModel):
     file_audit_ids: List[str]
 
 
-@app.post("/ingest")
+@router.post("/ingest")
 async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
     if not request.file_audit_ids:
         raise HTTPException(status_code=400, detail="At least one file_audit_id required")
@@ -691,7 +691,7 @@ async def stage_complete(session_id: str):
 # RESPONSE ENDPOINT
 # ─────────────────────────────────────────────
 
-@app.post("/ingest/response/{job_id}")
+@router.post("/ingest/response/{job_id}")
 async def ingest_response(job_id: str, request_body: dict, background_tasks: BackgroundTasks):
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
@@ -747,7 +747,7 @@ async def ingest_response(job_id: str, request_body: dict, background_tasks: Bac
 # STATUS ENDPOINT
 # ─────────────────────────────────────────────
 
-@app.get("/ingest/status/{session_id}")
+@router.get("/ingest/status/{session_id}")
 async def ingest_status(session_id: str):
     if session_id not in _sessions:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
@@ -760,6 +760,6 @@ async def ingest_status(session_id: str):
     })
 
 
-@app.get("/ingest/health")
+@router.get("/ingest/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "1.0.1"}
