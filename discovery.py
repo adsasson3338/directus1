@@ -89,8 +89,28 @@ def find_date_axis(rows) -> dict | None:
         if 12 in months and 1 in months:
             year_boundary_detected = True
 
+    # Filter out inventory/summary columns that have date headers but are not sales
+    # Check the row above the date axis for inventory-related labels
+    INVENTORY_LABELS = {
+        'inv', 'inventory', 'on order', 'onorder', 'dc inv', 'store inv',
+        'total inv', 'on hand', 'onhand', 'stock', 'qty on hand',
+        'remaining', 'order qty', 'open order'
+    }
+    if best["row"] > 0:
+        label_row = rows[best["row"] - 1]
+        filtered_cols = []
+        filtered_samples = []
+        for ci, sample in zip(cols, best["samples"]):
+            label = str(label_row[ci]).strip().lower() if ci < len(label_row) and label_row[ci] else ""
+            if any(inv in label for inv in INVENTORY_LABELS):
+                continue  # exclude inventory columns from date axis
+            filtered_cols.append(ci)
+            filtered_samples.append(sample)
+        cols          = filtered_cols
+        best["samples"] = filtered_samples
+
     return {
-        "row": best["row"], "col_count": best["count"], "cols": cols,
+        "row": best["row"], "col_count": len(cols), "cols": cols,
         "sample_values": best["samples"], "format": best["format"],
         "year_present": year_present, "interleaved_empty_cols": interleaved,
         "year_boundary_detected": year_boundary_detected,
@@ -647,6 +667,80 @@ SET discovery_result = '{result_json}'::jsonb,
 WHERE id = '{file_audit_id}'
 """.strip()
 
+
+def build_grid_layout_prompt(sheet_name: str, filename: str, rows: list) -> str:
+    """
+    Build a prompt for AI-driven grid layout analysis.
+    Send the first 20 rows as a compact representation.
+    AI identifies sales date columns, product identifier columns, inventory columns, data start row.
+    """
+    # Build compact row representation — show cell types and values
+    compact_rows = []
+    for row_idx, row in enumerate(rows[:20]):
+        cells = []
+        for col_idx, val in enumerate(row):
+            if val is None:
+                cells.append("_")
+            elif isinstance(val, bool):
+                cells.append(str(val))
+            elif isinstance(val, datetime):
+                cells.append(f"DATE({val.strftime('%m/%d/%y')})")
+            elif isinstance(val, int):
+                cells.append(f"INT({val})")
+            elif isinstance(val, float):
+                if 0 <= val <= 1:
+                    cells.append(f"PCT({val:.2f})")
+                else:
+                    cells.append(f"FLT({val:.1f})")
+            elif isinstance(val, str):
+                s = val.strip()
+                if len(s) > 20:
+                    s = s[:20] + "..."
+                cells.append(f'"{s}"')
+            else:
+                cells.append("?")
+        compact_rows.append(f"Row {row_idx}: [{', '.join(cells[:40])}]")
+
+    layout = "\n".join(compact_rows)
+
+    return f"""You are analyzing a retail sales spreadsheet to identify its grid structure.
+
+Sheet: {sheet_name}
+File: {filename}
+
+LAYOUT (first 20 rows, up to 40 columns):
+{layout}
+
+Your task:
+1. Find the DATE AXIS ROW — the row containing weekly date headers for sales data. These are evenly-spaced dates (7 days apart) representing week-ending dates.
+2. Find the SALES DATE COLUMNS — only columns that contain weekly unit sales data. Exclude inventory snapshots, totals, cumulative columns.
+3. Find the DATA START ROW — the first row containing actual product sales data (integers under the date columns).
+4. Find SKU CANDIDATE COLUMNS — columns to the LEFT of the date axis that could contain product identifiers (retailer SKU, supplier SKU, description etc).
+5. Find INVENTORY COLUMNS — columns containing on-hand inventory counts (if any). These may have date headers but contain stock quantities, not weekly sales.
+6. Find YEAR ANCHORS — any cells containing a 4-digit year (20XX).
+
+Important rules:
+- Sales date columns have VARYING integers across product rows (different products sell different amounts)
+- Inventory columns typically have large consistent integers (stock counts)
+- Look at the semantic labels in rows ABOVE the date axis for clues (Sales, INV, Inventory, On Order etc)
+- Cumulative YTD columns should NOT be included in sales date columns
+- Only include date columns that represent individual weekly periods
+
+Respond with JSON only:
+{{
+  "date_axis_row": 0,
+  "date_axis_format": "datetime|date_range_string|fiscal_week_label|mixed",
+  "year_present": true,
+  "year_boundary_detected": false,
+  "sales_date_cols": [1, 2, 3],
+  "inventory_cols": [{{"col": 32, "label": "Total Inv"}}],
+  "data_start_row": 1,
+  "sku_candidate_cols": [0],
+  "year_anchors": [{{"source": "cell", "row": 2, "col": 0, "value": "2026"}}],
+  "sample_date_values": ["Feb Wk 1", "Feb Wk 2"],
+  "notes": "any observations about unusual layout"
+}}"""
+
 # ─────────────────────────────────────────────
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
@@ -727,7 +821,7 @@ async def advance_from_qualify(session_id: str):
 
 
 async def stage_locate_grid(session_id: str):
-    """Stage 2 — locate grid for each qualified sheet. Pure Python."""
+    """Stage 2 — locate grid via AI layout analysis."""
     session = _sessions[session_id]
     session["stage"] = "locating"
     session["status"] = "running"
@@ -735,26 +829,24 @@ async def stage_locate_grid(session_id: str):
 
     for sheet_name in session["qualified_sheets"]:
         rows = sheets[sheet_name]
-        date_axis  = find_date_axis(rows)
-        if not date_axis:
-            session["grid"][sheet_name] = {"error": "No date axis found"}
-            continue
+        prompt = build_grid_layout_prompt(sheet_name, session["filename"], rows)
 
-        date_cols  = date_axis["cols"]
-        data_start = find_data_start_row(rows, date_axis["row"], date_cols)
-        candidates = find_sku_candidates(rows, date_axis["row"], date_cols)
-        embedded   = detect_embedded_sku(rows, date_cols, data_start)
-        anchors    = find_year_anchors(session["filename"], rows)
-
-        session["grid"][sheet_name] = {
-            "date_axis":      date_axis,
-            "data_start_row": data_start,
-            "sku_candidates": candidates,
-            "embedded_sku":   embedded,
-            "year_anchors":   anchors,
+        job_id = str(uuid.uuid4())
+        _jobs[job_id] = {
+            "session_id": session_id,
+            "stage":      "locate_grid",
+            "sheet_name": sheet_name,
+            "created_at": time.time(),
         }
+        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+        if err:
+            session["grid"][sheet_name] = {"error": f"Webhook error: {err}"}
+        else:
+            session["status"] = "awaiting_ai"
+            session["_pending_jobs"].add(job_id)
 
-    await stage_identify_columns(session_id)
+    if not session["_pending_jobs"]:
+        await stage_identify_columns(session_id)
 
 
 async def stage_identify_columns(session_id: str):
@@ -1120,8 +1212,74 @@ async def stage_assemble(session_id: str):
 async def discovery_timeout_handler(sid: str, stage: str):
     """Handle timed-out discovery jobs."""
     session = _sessions[sid]
-    if stage == "dedup_check":
-        import asyncio
+    if stage == "locate_grid":
+        sheet_name = job["sheet_name"]
+        raw  = request_body
+        text = raw.get("text", "") or ""
+        if isinstance(text, str):
+            clean = text.replace("```json", "").replace("```", "").strip()
+            try:
+                result = json.loads(clean)
+            except:
+                result = {"error": f"Parse error: {text[:100]}"}
+        else:
+            result = raw
+
+        if "error" not in result:
+            rows       = session["_sheets"].get(sheet_name, [])
+            date_axis_row = result.get("date_axis_row", 0)
+            sales_cols    = result.get("sales_date_cols", [])
+            data_start    = result.get("data_start_row", 1)
+            inv_cols      = result.get("inventory_cols", [])
+            year_anchors  = result.get("year_anchors", [])
+
+            # Add filename year anchor if not present
+            for m in YEAR_RE.finditer(session["filename"]):
+                year_anchors.insert(0, {"source": "filename", "value": m.group(1)})
+
+            # Build sku_candidates from cols left of date axis
+            left_boundary  = min(sales_cols) if sales_cols else 0
+            candidates     = find_sku_candidates(rows, date_axis_row, sales_cols)
+            embedded       = detect_embedded_sku(rows, sales_cols, data_start)
+
+            # Build date_axis dict compatible with rest of pipeline
+            sample_vals = []
+            if date_axis_row < len(rows):
+                header_row = rows[date_axis_row]
+                for ci in sales_cols[:8]:
+                    if ci < len(header_row) and header_row[ci] is not None:
+                        sample_vals.append(str(header_row[ci]))
+
+            year_present = result.get("year_present", False)
+            date_axis = {
+                "row":                   date_axis_row,
+                "col_count":             len(sales_cols),
+                "cols":                  sales_cols,
+                "sample_values":         sample_vals,
+                "format":                result.get("date_axis_format", "mixed"),
+                "year_present":          year_present,
+                "interleaved_empty_cols": False,
+                "year_boundary_detected": result.get("year_boundary_detected", False),
+            }
+
+            session["grid"][sheet_name] = {
+                "date_axis":      date_axis,
+                "data_start_row": data_start,
+                "sku_candidates": candidates,
+                "embedded_sku":   embedded,
+                "year_anchors":   year_anchors[:6],
+                "inventory_cols": inv_cols,
+                "notes":          result.get("notes", ""),
+            }
+        else:
+            session["grid"][sheet_name] = {"error": result.get("error")}
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_identify_columns, session_id)
+
+    elif stage == "locate_grid":
+        asyncio.create_task(stage_identify_columns(sid))
+    elif stage == "dedup_check":
         asyncio.create_task(stage_qualify(sid))
     elif stage == "lookup_audit":
         asyncio.create_task(stage_qualify(sid))
@@ -1184,7 +1342,72 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         session["status"] = "awaiting_ai"
 
     # Store result by stage
-    if stage == "dedup_check":
+    if stage == "locate_grid":
+        sheet_name = job["sheet_name"]
+        raw  = request_body
+        text = raw.get("text", "") or ""
+        if isinstance(text, str):
+            clean = text.replace("```json", "").replace("```", "").strip()
+            try:
+                result = json.loads(clean)
+            except:
+                result = {"error": f"Parse error: {text[:100]}"}
+        else:
+            result = raw
+
+        if "error" not in result:
+            rows       = session["_sheets"].get(sheet_name, [])
+            date_axis_row = result.get("date_axis_row", 0)
+            sales_cols    = result.get("sales_date_cols", [])
+            data_start    = result.get("data_start_row", 1)
+            inv_cols      = result.get("inventory_cols", [])
+            year_anchors  = result.get("year_anchors", [])
+
+            # Add filename year anchor if not present
+            for m in YEAR_RE.finditer(session["filename"]):
+                year_anchors.insert(0, {"source": "filename", "value": m.group(1)})
+
+            # Build sku_candidates from cols left of date axis
+            left_boundary  = min(sales_cols) if sales_cols else 0
+            candidates     = find_sku_candidates(rows, date_axis_row, sales_cols)
+            embedded       = detect_embedded_sku(rows, sales_cols, data_start)
+
+            # Build date_axis dict compatible with rest of pipeline
+            sample_vals = []
+            if date_axis_row < len(rows):
+                header_row = rows[date_axis_row]
+                for ci in sales_cols[:8]:
+                    if ci < len(header_row) and header_row[ci] is not None:
+                        sample_vals.append(str(header_row[ci]))
+
+            year_present = result.get("year_present", False)
+            date_axis = {
+                "row":                   date_axis_row,
+                "col_count":             len(sales_cols),
+                "cols":                  sales_cols,
+                "sample_values":         sample_vals,
+                "format":                result.get("date_axis_format", "mixed"),
+                "year_present":          year_present,
+                "interleaved_empty_cols": False,
+                "year_boundary_detected": result.get("year_boundary_detected", False),
+            }
+
+            session["grid"][sheet_name] = {
+                "date_axis":      date_axis,
+                "data_start_row": data_start,
+                "sku_candidates": candidates,
+                "embedded_sku":   embedded,
+                "year_anchors":   year_anchors[:6],
+                "inventory_cols": inv_cols,
+                "notes":          result.get("notes", ""),
+            }
+        else:
+            session["grid"][sheet_name] = {"error": result.get("error")}
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_identify_columns, session_id)
+
+    elif stage == "dedup_check":
         rows = request_body.get("matches", [])
         if rows and rows[0].get("id"):
             # File already processed — skip
