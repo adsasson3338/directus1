@@ -378,7 +378,7 @@ def extract_sales_and_inventory(
 
 async def ingestion_timeout_handler(sid: str, stage: str):
     """Handle timed-out ingestion jobs."""
-    if stage in ("fetch_audit", "fetch_file_url"):
+    if stage in ("fetch_audit", "fetch_file_binary"):
         asyncio.create_task(stage_process_files(sid))
     elif stage == "create_table":
         asyncio.create_task(stage_write_sales(sid))
@@ -451,21 +451,21 @@ async def stage_fetch_audit_rows(session_id: str):
             session["status"] = "awaiting_postgres"
             session["_pending_jobs"].add(job_id)
 
-        # Fetch fresh signed URL from NocoDB via fetch-file webhook
-        url_job_id = str(uuid.uuid4())
-        _jobs[url_job_id] = {
+        # Fetch file binary via S3 webhook — posts back to /file/{job_id}
+        file_job_id = str(uuid.uuid4())
+        _jobs[file_job_id] = {
             "session_id": session_id,
-            "stage":      "fetch_file_url",
+            "stage":      "fetch_file_binary",
             "audit_id":   audit_id,
             "created_at": time.time(),
             "pipeline":   "ingestion",
         }
-        err = fire_webhook(N8N_FETCH_FILE_WEBHOOK, url_job_id, {"file_audit_id": audit_id})
+        err = fire_webhook(N8N_FETCH_FILE_WEBHOOK, file_job_id, {"file_audit_id": audit_id})
         if err:
-            session["errors"].append(f"Failed to fetch file URL for {audit_id}: {err}")
+            session["errors"].append(f"Failed to fetch file binary for {audit_id}: {err}")
         else:
             session["status"] = "awaiting_postgres"
-            session["_pending_jobs"].add(url_job_id)
+            session["_pending_jobs"].add(file_job_id)
 
     if not session["_pending_jobs"]:
         session["stage"]  = "failed"
@@ -502,24 +502,18 @@ async def stage_process_files(session_id: str):
     all_unresolved = set()
     as_of_dates   = []
 
-    signed_urls = session.get("_signed_urls", {})
+    file_bytes = session.get("_file_bytes", {})
 
     for audit_id, audit_row in audit_rows.items():
         discovery_result = audit_row.get("discovery_result")
-        signed_url       = signed_urls.get(audit_id)
+        data             = file_bytes.get(audit_id)
 
         if not discovery_result:
             session["errors"].append(f"Missing discovery_result for {audit_id}")
             continue
 
-        if not signed_url:
-            session["errors"].append(f"No signed URL available for {audit_id}")
-            continue
-
-        # Download file using fresh signed URL
-        data = download_from_url(signed_url)
         if not data:
-            session["errors"].append(f"Failed to download file for {audit_id}")
+            session["errors"].append(f"No file data available for {audit_id}")
             continue
 
         try:
@@ -744,25 +738,10 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
         expected = len(session["file_audit_ids"])
         if (not session["_pending_jobs"]
                 and len(session.get("_audit_rows", {})) >= expected
-                and len(session.get("_signed_urls", {})) >= expected):
+                and len(session.get("_file_bytes", {})) >= expected):
             background_tasks.add_task(stage_process_files, session_id)
 
-    elif stage == "fetch_file_url":
-        # Got fresh signed URL from NocoDB via fetch-file webhook
-        audit_id   = job["audit_id"]
-        signed_url = request_body.get("signed_url")
-        filename   = request_body.get("filename")
-        if signed_url:
-            session.setdefault("_signed_urls", {})[audit_id] = signed_url
-        if filename:
-            session.setdefault("_filenames", {})[audit_id] = filename
-
-        # Only proceed when no pending jobs AND both audit rows and signed URLs are ready
-        expected = len(session["file_audit_ids"])
-        if (not session["_pending_jobs"]
-                and len(session.get("_audit_rows", {})) >= expected
-                and len(session.get("_signed_urls", {})) >= expected):
-            background_tasks.add_task(stage_process_files, session_id)
+    # fetch_file_binary is handled by /file/{job_id} endpoint directly
 
     elif stage == "create_table":
         if not session["_pending_jobs"]:
@@ -786,6 +765,38 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
 # ─────────────────────────────────────────────
 # STATUS ENDPOINT
 # ─────────────────────────────────────────────
+
+
+
+@router.post("/file/{job_id}")
+async def file_upload_response(job_id: str, file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
+    """Receive binary file from n8n S3 webhook and store in session."""
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    job        = _jobs.pop(job_id)
+    session_id = job["session_id"]
+    audit_id   = job["audit_id"]
+
+    if session_id not in _sessions:
+        return JSONResponse(content={"status": "ok", "note": "session already closed"})
+
+    session = _sessions[session_id]
+    session["_pending_jobs"].discard(job_id)
+
+    # Store file bytes in session
+    data = await file.read()
+    session.setdefault("_file_bytes", {})[audit_id] = data
+    session.setdefault("_filenames", {})[audit_id] = file.filename
+
+    # Check if ready to process
+    expected = len(session["file_audit_ids"])
+    if (not session["_pending_jobs"]
+            and len(session.get("_audit_rows", {})) >= expected
+            and len(session.get("_file_bytes", {})) >= expected):
+        background_tasks.add_task(stage_process_files, session_id)
+
+    return JSONResponse(content={"status": "ok", "job_id": job_id})
 
 @router.get("/ingest/status/{session_id}")
 async def ingest_status(session_id: str):
