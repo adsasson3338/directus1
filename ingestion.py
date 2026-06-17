@@ -134,6 +134,22 @@ WHERE UPPER(retailer) = UPPER('{retailer_safe}')
 """.strip()
 
 
+
+def build_lookup_supplier_skus_sql(retailer: str, retailer_skus: list) -> str:
+    """Look up supplier SKUs from retailer_sku_map for a list of retailer SKUs."""
+    retailer_safe = retailer.replace("'", "''")
+    quoted = ", ".join("'" + str(s).replace("'", "''") + "'" for s in retailer_skus if s)
+    if not quoted:
+        quoted = "''"
+    return f"""
+SELECT retailer_sku, supplier_sku, base_model, base_variant
+FROM retailer_sku_map
+WHERE UPPER(retailer) = UPPER('{retailer_safe}')
+  AND UPPER(retailer_sku) = ANY(ARRAY[{quoted}]::text[])
+  AND active = true
+  AND supplier_sku IS NOT NULL
+""".strip()
+
 def build_create_sales_table_sql(retailer: str) -> str:
     table = retailer.lower().replace(" ", "_") + "_weekly_sales"
     return f"""
@@ -380,6 +396,8 @@ async def ingestion_timeout_handler(sid: str, stage: str):
     """Handle timed-out ingestion jobs."""
     if stage in ("fetch_audit", "fetch_file_binary"):
         asyncio.create_task(stage_process_files(sid))
+    elif stage == "sku_map_lookup":
+        asyncio.create_task(stage_create_table(sid))
     elif stage == "create_table":
         asyncio.create_task(stage_write_sales(sid))
     elif stage == "write_sales_batch":
@@ -559,8 +577,47 @@ async def stage_process_files(session_id: str):
     session["unresolved_skus"] = sorted(all_unresolved)
     session["as_of_date"]      = max(as_of_dates) if as_of_dates else str(date.today())
 
-    await stage_create_table(session_id)
+    await stage_lookup_supplier_skus(session_id)
 
+
+
+async def stage_lookup_supplier_skus(session_id: str):
+    """Look up supplier SKUs from retailer_sku_map for all retailer SKUs."""
+    session  = _sessions[session_id]
+    retailer = session["retailer"]
+    session["stage"]  = "looking_up_skus"
+    session["status"] = "running"
+
+    sales_rows = session.get("sales_rows", [])
+    if not sales_rows:
+        await stage_create_table(session_id)
+        return
+
+    # Collect unique retailer SKUs that don't have supplier SKU yet
+    retailer_skus = list({
+        row["retailer_sku"] for row in sales_rows
+        if not row.get("supplier_sku")
+    })
+
+    if not retailer_skus:
+        await stage_create_table(session_id)
+        return
+
+    sql = build_lookup_supplier_skus_sql(retailer, retailer_skus)
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "session_id": session_id,
+        "stage":      "sku_map_lookup",
+        "created_at": time.time(),
+        "pipeline":   "ingestion",
+    }
+    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    if err:
+        session["errors"].append(f"Failed to look up supplier SKUs: {err}")
+        await stage_create_table(session_id)
+    else:
+        session["status"] = "awaiting_postgres"
+        session["_pending_jobs"].add(job_id)
 
 async def stage_create_table(session_id: str):
     """Ensure retailer sales table exists."""
@@ -742,6 +799,26 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
             background_tasks.add_task(stage_process_files, session_id)
 
     # fetch_file_binary is handled by /file/{job_id} endpoint directly
+
+    elif stage == "sku_map_lookup":
+        # Got supplier SKU mappings — apply to sales rows
+        rows = request_body.get("matches", [])
+        sku_map = {r["retailer_sku"]: r for r in rows if r.get("supplier_sku")}
+        sales_rows = session.get("sales_rows", [])
+        for row in sales_rows:
+            if not row.get("supplier_sku") and row["retailer_sku"] in sku_map:
+                mapped = sku_map[row["retailer_sku"]]
+                row["supplier_sku"] = mapped.get("supplier_sku")
+        session["sales_rows"] = sales_rows
+
+        # Rebuild unresolved list
+        session["unresolved_skus"] = sorted({
+            row["retailer_sku"] for row in sales_rows
+            if not row.get("supplier_sku")
+        })
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_create_table, session_id)
 
     elif stage == "create_table":
         if not session["_pending_jobs"]:
