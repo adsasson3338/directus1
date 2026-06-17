@@ -1153,11 +1153,22 @@ register_discovery_timeout_handler(discovery_timeout_handler)
 # RESPONSE ENDPOINT
 # ─────────────────────────────────────────────
 
+@router.post("/response/{job_id}")
 async def webhook_response(job_id: str, request_body: dict, background_tasks: BackgroundTasks):
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found or already completed")
 
-    job        = _jobs.pop(job_id)
+    job        = _jobs[job_id]  # peek first — don't pop yet
+    pipeline   = job.get("pipeline", "discovery")
+
+    # Route ingestion jobs to ingestion handler
+    if pipeline == "ingestion":
+        from ingestion import ingest_response
+        _jobs.pop(job_id)  # now pop
+        return await ingest_response(job_id, job, request_body, background_tasks)
+
+    # Discovery job — handle here
+    _jobs.pop(job_id)
     session_id = job["session_id"]
     stage      = job["stage"]
 
@@ -1166,7 +1177,6 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
 
     session = _sessions[session_id]
     session["_pending_jobs"].discard(job_id)
-    # Only set running if there are still pending jobs — otherwise stage handler sets the next status
     if session["_pending_jobs"]:
         session["status"] = "awaiting_ai"
 
