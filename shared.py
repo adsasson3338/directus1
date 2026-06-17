@@ -13,8 +13,9 @@ from datetime import date, timedelta
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-N8N_AI_WEBHOOK       = os.environ.get("N8N_AI_WEBHOOK",       "http://n8n:5678/webhook/ai")
-N8N_POSTGRES_WEBHOOK = os.environ.get("N8N_POSTGRES_WEBHOOK", "http://n8n:5678/webhook/postgres")
+N8N_AI_WEBHOOK           = os.environ.get("N8N_AI_WEBHOOK",           "http://n8n:5678/webhook/ai")
+N8N_POSTGRES_WEBHOOK     = os.environ.get("N8N_POSTGRES_WEBHOOK",     "http://n8n:5678/webhook/postgres")
+N8N_FETCH_FILE_WEBHOOK   = os.environ.get("N8N_FETCH_FILE_WEBHOOK",   "http://n8n:5678/webhook/fetch-file")
 
 JOB_TIMEOUT_SECONDS     = 120
 SESSION_TIMEOUT_SECONDS = 600
