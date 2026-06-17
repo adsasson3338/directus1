@@ -19,6 +19,7 @@ from shared import (
     _sessions, _jobs, fire_webhook,
     normalize_to_saturday,
     N8N_POSTGRES_WEBHOOK,
+    N8N_FETCH_FILE_WEBHOOK,
     register_ingestion_timeout_handler,
 )
 
@@ -212,15 +213,9 @@ WHERE id = '{file_audit_id}'
 # CORE INGESTION LOGIC
 # ─────────────────────────────────────────────
 
-def download_file(minio_path_json: str) -> Optional[bytes]:
-    """Download file from MinIO using signed URL from minio_path JSON."""
+def download_from_url(url: str) -> Optional[bytes]:
+    """Download file from a URL."""
     try:
-        attachments = json.loads(minio_path_json) if isinstance(minio_path_json, str) else minio_path_json
-        if not attachments:
-            return None
-        url = attachments[0].get("signedUrl") or attachments[0].get("url")
-        if not url:
-            return None
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read()
@@ -381,7 +376,7 @@ def extract_sales_and_inventory(
 
 async def ingestion_timeout_handler(sid: str, stage: str):
     """Handle timed-out ingestion jobs."""
-    if stage == "fetch_audit":
+    if stage in ("fetch_audit", "fetch_file_url"):
         asyncio.create_task(stage_process_files(sid))
     elif stage == "create_table":
         asyncio.create_task(stage_write_sales(sid))
@@ -431,12 +426,13 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
 
 
 async def stage_fetch_audit_rows(session_id: str):
-    """Fetch all file_audit rows for the given IDs."""
+    """Fetch all file_audit rows and fresh signed URLs for the given IDs."""
     session = _sessions[session_id]
     session["stage"]  = "fetching"
     session["status"] = "running"
 
     for audit_id in session["file_audit_ids"]:
+        # Fetch audit row from Postgres
         sql = build_fetch_audit_row_sql(audit_id)
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
@@ -444,7 +440,7 @@ async def stage_fetch_audit_rows(session_id: str):
             "stage":      "fetch_audit",
             "audit_id":   audit_id,
             "created_at": time.time(),
-            "pipeline":  "ingestion",
+            "pipeline":   "ingestion",
         }
         err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
@@ -452,6 +448,22 @@ async def stage_fetch_audit_rows(session_id: str):
         else:
             session["status"] = "awaiting_postgres"
             session["_pending_jobs"].add(job_id)
+
+        # Fetch fresh signed URL from NocoDB via fetch-file webhook
+        url_job_id = str(uuid.uuid4())
+        _jobs[url_job_id] = {
+            "session_id": session_id,
+            "stage":      "fetch_file_url",
+            "audit_id":   audit_id,
+            "created_at": time.time(),
+            "pipeline":   "ingestion",
+        }
+        err = fire_webhook(N8N_FETCH_FILE_WEBHOOK, url_job_id, {"file_audit_id": audit_id})
+        if err:
+            session["errors"].append(f"Failed to fetch file URL for {audit_id}: {err}")
+        else:
+            session["status"] = "awaiting_postgres"
+            session["_pending_jobs"].add(url_job_id)
 
     if not session["_pending_jobs"]:
         session["stage"]  = "failed"
@@ -488,16 +500,22 @@ async def stage_process_files(session_id: str):
     all_unresolved = set()
     as_of_dates   = []
 
-    for audit_id, audit_row in audit_rows.items():
-        minio_path       = audit_row.get("minio_path")
-        discovery_result = audit_row.get("discovery_result")
+    signed_urls = session.get("_signed_urls", {})
 
-        if not minio_path or not discovery_result:
-            session["errors"].append(f"Missing minio_path or discovery_result for {audit_id}")
+    for audit_id, audit_row in audit_rows.items():
+        discovery_result = audit_row.get("discovery_result")
+        signed_url       = signed_urls.get(audit_id)
+
+        if not discovery_result:
+            session["errors"].append(f"Missing discovery_result for {audit_id}")
             continue
 
-        # Download file
-        data = download_file(minio_path)
+        if not signed_url:
+            session["errors"].append(f"No signed URL available for {audit_id}")
+            continue
+
+        # Download file using fresh signed URL
+        data = download_from_url(signed_url)
         if not data:
             session["errors"].append(f"Failed to download file for {audit_id}")
             continue
@@ -719,6 +737,19 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
                     dr = {}
             row["discovery_result"] = dr
             session["_audit_rows"][audit_id] = row
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_process_files, session_id)
+
+    elif stage == "fetch_file_url":
+        # Got fresh signed URL from NocoDB via fetch-file webhook
+        audit_id   = job["audit_id"]
+        signed_url = request_body.get("signed_url")
+        filename   = request_body.get("filename")
+        if signed_url:
+            session.setdefault("_signed_urls", {})[audit_id] = signed_url
+        if filename:
+            session.setdefault("_filenames", {})[audit_id] = filename
 
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_process_files, session_id)
