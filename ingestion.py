@@ -738,7 +738,11 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
             row["discovery_result"] = dr
             session["_audit_rows"][audit_id] = row
 
-        if not session["_pending_jobs"]:
+        # Only proceed when no pending jobs AND both audit rows and signed URLs are ready
+        expected = len(session["file_audit_ids"])
+        if (not session["_pending_jobs"]
+                and len(session.get("_audit_rows", {})) >= expected
+                and len(session.get("_signed_urls", {})) >= expected):
             background_tasks.add_task(stage_process_files, session_id)
 
     elif stage == "fetch_file_url":
@@ -751,7 +755,11 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
         if filename:
             session.setdefault("_filenames", {})[audit_id] = filename
 
-        if not session["_pending_jobs"]:
+        # Only proceed when no pending jobs AND both audit rows and signed URLs are ready
+        expected = len(session["file_audit_ids"])
+        if (not session["_pending_jobs"]
+                and len(session.get("_audit_rows", {})) >= expected
+                and len(session.get("_signed_urls", {})) >= expected):
             background_tasks.add_task(stage_process_files, session_id)
 
     elif stage == "create_table":
