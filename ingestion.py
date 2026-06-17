@@ -1,7 +1,7 @@
 """
 ingestion.py — Ingestion pipeline: fetch audit rows, process files, write sales and inventory.
 """
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
