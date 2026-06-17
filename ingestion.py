@@ -216,7 +216,9 @@ WHERE id = '{file_audit_id}'
 def download_from_url(url: str) -> Optional[bytes]:
     """Download file from a URL."""
     try:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read()
     except Exception as e:
