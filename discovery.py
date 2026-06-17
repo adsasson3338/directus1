@@ -1242,6 +1242,42 @@ async def discovery_timeout_handler(sid: str, stage: str):
             candidates     = find_sku_candidates(rows, date_axis_row, sales_cols)
             embedded       = detect_embedded_sku(rows, sales_cols, data_start)
 
+            # Also add inventory columns as candidates so classifier sees them
+            for inv_col in inv_cols:
+                col_idx = inv_col.get("col")
+                if col_idx is None:
+                    continue
+                col_vals = [
+                    rows[r][col_idx] for r in range(data_start, min(data_start + 50, len(rows)))
+                    if col_idx < len(rows[r]) and rows[r][col_idx] is not None
+                ]
+                if not col_vals:
+                    continue
+                types = [classify_cell(v) for v in col_vals]
+                type_counts = {}
+                for t in types:
+                    type_counts[t] = type_counts.get(t, 0) + 1
+                dominant = max(type_counts, key=type_counts.get)
+                fill_rate = round(len(col_vals) / min(50, len(rows) - data_start), 2)
+
+                # Get label from date axis row and row above
+                pre_strings = []
+                for label_row_idx in [date_axis_row - 1, date_axis_row]:
+                    if 0 <= label_row_idx < len(rows):
+                        lv = rows[label_row_idx][col_idx] if col_idx < len(rows[label_row_idx]) else None
+                        if lv and str(lv).strip():
+                            pre_strings.append({"row": label_row_idx, "value": str(lv).strip()})
+
+                candidates.append({
+                    "col":              col_idx,
+                    "pre_data_strings": pre_strings,
+                    "dominant_type":    dominant,
+                    "type_distribution": type_counts,
+                    "fill_rate":        fill_rate,
+                    "sample_values":    [str(v) for v in col_vals[:5]],
+                    "is_inventory_col": True,
+                })
+
             # Build date_axis dict compatible with rest of pipeline
             sample_vals = []
             if date_axis_row < len(rows):
@@ -1371,6 +1407,42 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             left_boundary  = min(sales_cols) if sales_cols else 0
             candidates     = find_sku_candidates(rows, date_axis_row, sales_cols)
             embedded       = detect_embedded_sku(rows, sales_cols, data_start)
+
+            # Also add inventory columns as candidates so classifier sees them
+            for inv_col in inv_cols:
+                col_idx = inv_col.get("col")
+                if col_idx is None:
+                    continue
+                col_vals = [
+                    rows[r][col_idx] for r in range(data_start, min(data_start + 50, len(rows)))
+                    if col_idx < len(rows[r]) and rows[r][col_idx] is not None
+                ]
+                if not col_vals:
+                    continue
+                types = [classify_cell(v) for v in col_vals]
+                type_counts = {}
+                for t in types:
+                    type_counts[t] = type_counts.get(t, 0) + 1
+                dominant = max(type_counts, key=type_counts.get)
+                fill_rate = round(len(col_vals) / min(50, len(rows) - data_start), 2)
+
+                # Get label from date axis row and row above
+                pre_strings = []
+                for label_row_idx in [date_axis_row - 1, date_axis_row]:
+                    if 0 <= label_row_idx < len(rows):
+                        lv = rows[label_row_idx][col_idx] if col_idx < len(rows[label_row_idx]) else None
+                        if lv and str(lv).strip():
+                            pre_strings.append({"row": label_row_idx, "value": str(lv).strip()})
+
+                candidates.append({
+                    "col":              col_idx,
+                    "pre_data_strings": pre_strings,
+                    "dominant_type":    dominant,
+                    "type_distribution": type_counts,
+                    "fill_rate":        fill_rate,
+                    "sample_values":    [str(v) for v in col_vals[:5]],
+                    "is_inventory_col": True,
+                })
 
             # Build date_axis dict compatible with rest of pipeline
             sample_vals = []
