@@ -694,12 +694,8 @@ async def stage_complete(session_id: str):
 # RESPONSE ENDPOINT
 # ─────────────────────────────────────────────
 
-@router.post("/ingest/response/{job_id}")
-async def ingest_response(job_id: str, request_body: dict, background_tasks: BackgroundTasks):
-    if job_id not in _jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
-    job        = _jobs.pop(job_id)
+async def ingest_response(job_id: str, job: dict, request_body: dict, background_tasks: BackgroundTasks):
+    """Called by unified /response/{job_id} endpoint in discovery.py when pipeline == ingestion."""
     session_id = job["session_id"]
     stage      = job["stage"]
 
