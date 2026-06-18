@@ -897,13 +897,15 @@ Classify each column as one of:
 - other: anything else (subtotals, categories, percentages, stale inventory, etc)
 
 Key reasoning rules:
-- sales_date columns have weekly date ranges or fiscal week labels as headers and varying integer data
+- sales_date columns have weekly date ranges or fiscal week labels as headers and integer data
+- A column is sales_date based on its HEADER (weekly date), not whether it currently has data — YTD files pre-populate future weeks with empty columns that are still sales_date columns
 - inventory columns typically appear AFTER sales columns and represent point-in-time stock counts
 - If multiple inventory columns exist for the same date, only the AGGREGATE total should be classified as inventory — breakdowns (DC, Store) are other
 - open_order columns represent pending purchase orders
 - Borders signal section boundaries — use them to group related columns
-- pct_zero helps distinguish active sales columns from empty/placeholder columns
+- A column labeled "Year to Date" or "YTD" with cumulative totals is other, not sales_date
 - Stale inventory (prior weeks) should be other, not inventory
+- Header labels like "Remaining Inventory" and "Total Open Orders Qty" always classify as inventory and open_order respectively, even if currently empty
 
 IMPORTANT — GROUP SIMILAR COLUMNS:
 If multiple consecutive columns share the same classification and pattern (e.g., 52 weekly sales date columns all with date range headers and integer data), classify them as a group using "cols" instead of "col". This reduces response size significantly.
