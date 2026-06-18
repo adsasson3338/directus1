@@ -310,16 +310,22 @@ def extract_qualify_signals(rows: list, sheet_name: str, filename: str) -> dict:
 
 
 def build_qualify_prompt(signals: dict) -> str:
-    return f"""You are the gatekeeper of a retail sales data ingestion pipeline. A sheet has arrived and you must determine if it should be disqualified.
+    return f"""You are the gatekeeper of a retail sales data ingestion pipeline. A sheet has arrived and you must determine if it should be qualified as a weekly unit sales sheet.
 
-A sheet should be disqualified if it does NOT contain unit sales data. Unit sales data has integer values at the intersection of product identifiers and date columns.
+To QUALIFY, a sheet must positively confirm ALL of the following:
+1. Has weekly date headers (date ranges, fiscal weeks, or datetime values spaced 7 days apart)
+2. Has product identifier rows (SKUs, item numbers, UPCs, or product descriptions)
+3. Has integer values at the intersection of product rows and date columns
 
-Disqualify if any of the following are true:
+Disqualify if ANY of the following are true:
+- No weekly date axis detected
+- No product identifiers detected
 - Crosshair values are decimals above 1 — dollar revenue
 - Crosshair values are between 0 and 1 — percentage metrics
 - Column labels contain $$$ or $$ — dollar sheet
 - Sheet name contains CFP, Forecast, FCST, Projection, Order
 - Vocabulary contains forecast or projection language
+- Sheet appears to be a lookup table, mapping table, or reference sheet
 
 EVIDENCE:
 Sheet name: {signals["sheet_name"]}
@@ -880,6 +886,8 @@ Each column has:
 - sample_non_zero: up to 5 non-zero sample values
 - pct_zero: fraction of data rows that are zero or null
 - postgres_matched: true if any sample values were found in the supplier inventory database
+- embedded_sku_extractions: supplier SKUs extracted from this column's text values (if any)
+- embedded_postgres_matched: true if any embedded SKUs matched the supplier inventory database
 
 Classify each column as one of:
 - sales_date: a weekly sales period column (unit sales data)
@@ -1021,6 +1029,22 @@ async def stage_locate_grid(session_id: str):
             continue
         ws     = wb_full[sheet_name]
         schema = extract_column_schema(ws, sheet_name)
+
+        # Run embedded SKU detection and store in schema
+        rows       = session["_sheets"].get(sheet_name, [])
+        data_start = schema["data_start_row"] - 1  # 0-based
+        # Build sales col candidates from schema — any col with date-like headers
+        all_col_indices = [c["col"] - 1 for c in schema["columns"]]  # 0-based
+        embedded = detect_embedded_sku(rows, all_col_indices, data_start)
+        schema["embedded_sku"] = embedded
+
+        # Annotate schema columns with embedded SKU info
+        embedded_by_col = {e["col"]: e for e in embedded}
+        for col in schema["columns"]:
+            col_0 = col["col"] - 1
+            if col_0 in embedded_by_col:
+                col["embedded_sku_extractions"] = embedded_by_col[col_0]["extractions"]
+
         session["_schemas"][sheet_name] = schema
 
     await stage_postgres_sku_lookup(session_id)
@@ -1118,29 +1142,21 @@ async def stage_postgres_sku_lookup(session_id: str):
     session["stage"]  = "identifying"
     session["status"] = "running"
 
-    # Collect all candidate values from non-sales_date column samples
+    # Collect all candidate values from column samples + embedded SKU extractions
     col_candidates = {}
     for sheet_name in session["qualified_sheets"]:
         schema = session.get("_schemas", {}).get(sheet_name, {})
         for col in schema.get("columns", []):
+            # Sample values
             for val in col.get("sample_non_zero", []):
                 s = str(val).strip()
                 if s:
                     col_candidates.setdefault(s, set()).add(col["col"])
-
-        # Also check embedded SKUs from detect_embedded_sku
-        rows = session["_sheets"].get(sheet_name, [])
-        schema_data = session.get("_schemas", {}).get(sheet_name, {})
-        data_start  = schema_data.get("data_start_row", 1) - 1
-        # Use all string-dominant columns as candidates
-        for col in schema_data.get("columns", []):
-            if "string" in col.get("data_types", []):
-                col_idx = col["col"] - 1  # 0-based
-                for r in range(data_start, min(data_start + 30, len(rows))):
-                    if col_idx < len(rows[r]) and isinstance(rows[r][col_idx], str):
-                        v = rows[r][col_idx].strip()
-                        if v:
-                            col_candidates.setdefault(v, set()).add(col["col"])
+            # Embedded SKU extractions — these are the most likely supplier SKU candidates
+            for ext in col.get("embedded_sku_extractions", []):
+                sku = ext.get("sku", "").strip()
+                if sku:
+                    col_candidates.setdefault(sku, set()).add(col["col"])
 
     session["_col_candidates"] = {k: list(v) for k, v in col_candidates.items()}
 
@@ -1182,13 +1198,22 @@ async def stage_schema_classify(session_id: str):
             session["grid"][sheet_name] = {"error": "No schema available"}
             continue
 
-        # Annotate columns with postgres_matched
+        # Annotate columns with postgres_matched and embedded_postgres_matched
         for col in schema.get("columns", []):
             postgres_confirmed = any(
                 str(v).upper() in matched_values
                 for v in col.get("sample_non_zero", [])
             )
             col["postgres_matched"] = postgres_confirmed
+
+            # Check if embedded SKUs matched Postgres
+            embedded_matched = any(
+                ext.get("sku", "").upper() in matched_values
+                for ext in col.get("embedded_sku_extractions", [])
+            )
+            col["embedded_postgres_matched"] = embedded_matched
+            if embedded_matched:
+                col["has_embedded_supplier_sku"] = True
 
         prompt = build_schema_classify_prompt(schema, session["filename"])
         job_id = str(uuid.uuid4())
@@ -1637,8 +1662,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                         "sample_values":    [str(v) for v in col_vals[:5]],
                     })
 
-            # Detect embedded SKUs in description columns
-            embedded = detect_embedded_sku(rows, sales_cols, data_start - 1)
+            # Use embedded SKUs already detected during schema extraction
+            embedded = schema.get("embedded_sku", [])
 
             session["grid"][sheet_name] = {
                 "date_axis":      date_axis,
@@ -1649,13 +1674,19 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             }
 
             # Column mapping — convert 1-based cols to 0-based, store all non-sales-date
+            # Merge AI result with schema-detected embedded SKU info
+            schema_col_map = {c["col"]: c for c in schema.get("columns", [])}
             session["column_mapping"][sheet_name] = [
                 {
                     "col":                  c["col"] - 1,
                     "classification":       c["classification"],
                     "confidence":           c.get("confidence", "high"),
                     "reason":               c.get("reason", ""),
-                    "has_embedded_supplier_sku": c.get("has_embedded_supplier_sku", False),
+                    "has_embedded_supplier_sku": (
+                        c.get("has_embedded_supplier_sku", False) or
+                        schema_col_map.get(c["col"], {}).get("has_embedded_supplier_sku", False) or
+                        schema_col_map.get(c["col"], {}).get("embedded_postgres_matched", False)
+                    ),
                 }
                 for c in col_results
                 if c.get("classification") != "sales_date"
