@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from typing import List
 import asyncio
 import openpyxl
+import base64
 import hashlib
 import io
 import re
@@ -577,10 +578,13 @@ def build_insert_retailer_config_sql(retailer: str, file_audit_id: str,
     """
     Insert a pending_review config row for a newly identified retailer.
     """
-    qs = json_safe(discovery_result.get("qualified_sheets", []))
-    cm = json_safe(discovery_result.get("column_mapping", {}))
-    dc = json_safe(discovery_result.get("date_config", {}))
-    fl = json_safe(discovery_result.get("flags", {}))
+    def b64(v):
+        return base64.b64encode(json.dumps(v, ensure_ascii=False).encode()).decode()
+
+    qs = b64(discovery_result.get("qualified_sheets", []))
+    cm = b64(discovery_result.get("column_mapping", {}))
+    dc = b64(discovery_result.get("date_config", {}))
+    fl = b64(discovery_result.get("flags", {}))
 
     return f"""
 INSERT INTO retailer_configs (
@@ -589,10 +593,10 @@ INSERT INTO retailer_configs (
 )
 VALUES (
     '{retailer}', 'pending_review', 1, '{file_audit_id}',
-    '{qs}'::jsonb,
-    '{cm}'::jsonb,
-    '{dc}'::jsonb,
-    '{fl}'::jsonb
+    convert_from(decode('{qs}', 'base64'), 'UTF8')::jsonb,
+    convert_from(decode('{cm}', 'base64'), 'UTF8')::jsonb,
+    convert_from(decode('{dc}', 'base64'), 'UTF8')::jsonb,
+    convert_from(decode('{fl}', 'base64'), 'UTF8')::jsonb
 )
 ON CONFLICT DO NOTHING
 """.strip()
@@ -668,15 +672,15 @@ def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       file_set_key: str | None,
                                       file_hash: str | None = None,
                                       filename: str | None = None) -> str:
-    """Update file_audit with discovery result, retailer, status, file_set_key, hash and filename."""
-    result_json  = json_safe(discovery_result)
+    """Update file_audit with discovery result using base64 to avoid SQL quoting issues."""
+    result_b64   = base64.b64encode(json.dumps(discovery_result, ensure_ascii=False).encode()).decode()
     retailer_val = f"'{sql_escape(retailer)}'" if retailer else "NULL"
     key_val      = f"'{sql_escape(file_set_key)}'" if file_set_key else "NULL"
     hash_val     = f"'{file_hash}'" if file_hash else "NULL"
     fname_val    = f"'{sql_escape(filename)}'" if filename else "NULL"
     return f"""
 UPDATE file_audit
-SET discovery_result = '{result_json}'::jsonb,
+SET discovery_result = convert_from(decode('{result_b64}', 'base64'), 'UTF8')::jsonb,
     retailer         = {retailer_val},
     status           = '{status}',
     file_set_key     = {key_val},
