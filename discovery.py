@@ -310,22 +310,16 @@ def extract_qualify_signals(rows: list, sheet_name: str, filename: str) -> dict:
 
 
 def build_qualify_prompt(signals: dict) -> str:
-    return f"""You are the gatekeeper of a retail sales data ingestion pipeline. A sheet has arrived and you must determine if it should be qualified as a weekly unit sales sheet.
+    return f"""You are the gatekeeper of a retail sales data ingestion pipeline. A sheet has arrived and you must determine if it should be disqualified.
 
-To QUALIFY, a sheet must positively confirm ALL of the following:
-1. Has weekly date headers (date ranges, fiscal weeks, or datetime values spaced 7 days apart)
-2. Has product identifier rows (SKUs, item numbers, UPCs, or product descriptions)
-3. Has integer values at the intersection of product rows and date columns
+A sheet should be disqualified if it does NOT contain unit sales data. Unit sales data has integer values at the intersection of product identifiers and date columns.
 
-Disqualify if ANY of the following are true:
-- No weekly date axis detected
-- No product identifiers detected
+Disqualify if any of the following are true:
 - Crosshair values are decimals above 1 — dollar revenue
 - Crosshair values are between 0 and 1 — percentage metrics
 - Column labels contain $$$ or $$ — dollar sheet
 - Sheet name contains CFP, Forecast, FCST, Projection, Order
 - Vocabulary contains forecast or projection language
-- Sheet appears to be a lookup table, mapping table, or reference sheet
 
 EVIDENCE:
 Sheet name: {signals["sheet_name"]}
@@ -1695,8 +1689,32 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             session["grid"][sheet_name]           = {"error": result.get("error")}
             session["column_mapping"][sheet_name] = []
 
+        # Post-schema validation — retroactively disqualify if no sales_date columns found
+        sales_date_count = sum(
+            1 for c in col_results
+            if c.get("classification") == "sales_date"
+        )
+        if sales_date_count == 0:
+            session["qualified_sheets"] = [
+                s for s in session["qualified_sheets"] if s != sheet_name
+            ]
+            session["qualify_results"][sheet_name] = {
+                "disqualified": True,
+                "reason": "No weekly sales date columns identified after full layout analysis",
+                "source": "post_schema",
+            }
+            # Remove from grid and column_mapping
+            session["grid"].pop(sheet_name, None)
+            session["column_mapping"].pop(sheet_name, None)
+
         if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_identify_retailer, session_id)
+            # Check if any qualified sheets remain
+            if not session["qualified_sheets"]:
+                session["stage"]  = "complete"
+                session["status"] = "complete"
+                session["result"] = {"status": "no_sales_data", "qualify_results": session["qualify_results"]}
+            else:
+                background_tasks.add_task(stage_identify_retailer, session_id)
 
     elif stage == "dedup_check":
         rows = request_body.get("matches", [])
