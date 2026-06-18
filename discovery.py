@@ -4,6 +4,7 @@ discovery.py — Discovery pipeline: qualify, locate, identify, date, write audi
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import List
+import asyncio
 import openpyxl
 import hashlib
 import io
@@ -863,6 +864,7 @@ def build_schema_classify_prompt(schema: dict, filename: str) -> str:
     """
     Pass 1+2 combined — send the assembled column schema to AI for classification.
     AI sees full header stacks, borders, data stats and classifies each column.
+    Columns with identical patterns can be grouped to reduce token usage.
     """
     cols_json = json.dumps(schema["columns"], indent=2)
     return f"""You are analyzing a retail sales spreadsheet to classify its columns.
@@ -903,6 +905,9 @@ Key reasoning rules:
 - pct_zero helps distinguish active sales columns from empty/placeholder columns
 - Stale inventory (prior weeks) should be other, not inventory
 
+IMPORTANT — GROUP SIMILAR COLUMNS:
+If multiple consecutive columns share the same classification and pattern (e.g., 52 weekly sales date columns all with date range headers and integer data), classify them as a group using "cols" instead of "col". This reduces response size significantly.
+
 Also identify:
 - data_start_row: the row where product data begins
 - date_axis_row: the row containing the sales date headers
@@ -918,8 +923,9 @@ Respond with JSON only:
   "year_present": true,
   "year_boundary": false,
   "columns": [
-    {{"col": 1, "classification": "description", "confidence": "high", "reason": "one sentence", "has_embedded_supplier_sku": false}},
-    ...
+    {{"col": 1, "classification": "retailer_sku", "confidence": "high", "reason": "one sentence", "has_embedded_supplier_sku": false}},
+    {{"cols": [9, 10, 11, 12, 13, 59], "classification": "sales_date", "confidence": "high", "reason": "weekly date range headers with integer sales data", "has_embedded_supplier_sku": false}},
+    {{"col": 60, "classification": "inventory", "confidence": "high", "reason": "one sentence", "has_embedded_supplier_sku": false}}
   ]
 }}"""
 
@@ -1594,7 +1600,15 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             result = raw
 
         if "error" not in result:
-            col_results   = result.get("columns", [])
+            # Expand grouped columns (cols: [...]) into individual entries
+            raw_cols = result.get("columns", [])
+            col_results = []
+            for c in raw_cols:
+                if "cols" in c:
+                    for col_num in c["cols"]:
+                        col_results.append({**c, "col": col_num})
+                else:
+                    col_results.append(c)
             data_start    = result.get("data_start_row", schema["data_start_row"])
             date_axis_row = result.get("date_axis_row", data_start - 1)
             year_boundary  = result.get("year_boundary", False)
