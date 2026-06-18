@@ -1569,8 +1569,10 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             col_results   = result.get("columns", [])
             data_start    = result.get("data_start_row", schema["data_start_row"])
             date_axis_row = result.get("date_axis_row", data_start - 1)
-            year_present  = result.get("year_present", False)
-            year_boundary = result.get("year_boundary", False)
+            year_boundary  = result.get("year_boundary", False)
+            # year_present only valid for datetime format — date_range_string and fiscal_week_label never embed year
+            raw_format    = result.get("date_axis_format", "mixed")
+            year_present  = raw_format == "datetime"
 
             # Build sales_date_cols from columns classified as sales_date
             sales_cols = [
