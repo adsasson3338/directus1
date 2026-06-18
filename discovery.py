@@ -934,13 +934,31 @@ Respond with JSON only:
 }}"""
 
 
+def detect_date_axis_row(schema: dict) -> int:
+    """Detect the row containing the most date-like values. Returns 1-based row number."""
+    row_date_counts = {}
+    for col in schema.get("columns", []):
+        for h in col.get("header_stack", []):
+            row = h["row"] + 1  # 1-based
+            val = str(h.get("value", "")).strip()
+            if (re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", val) or
+                re.match(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$", val) or
+                re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$", val, re.IGNORECASE) or
+                re.match(r"^wk\s*\d+$", val, re.IGNORECASE)):
+                row_date_counts[row] = row_date_counts.get(row, 0) + 1
+    if not row_date_counts:
+        return 1
+    return max(row_date_counts, key=row_date_counts.get)
+
+
 def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     """
     Python enumerates sales date columns using the pattern identified by AI.
     Scans columns from first_sales_col, collecting those that match the date pattern.
     Stops when section label changes or date pattern breaks.
     """
-    date_axis_row    = date_schema.get("date_axis_row", 1)        # 1-based
+    # Detect date_axis_row from schema directly — more reliable than AI
+    date_axis_row    = detect_date_axis_row(schema)        # 1-based
     section_label_row = date_schema.get("section_label_row")      # 1-based or None
     sales_label      = (date_schema.get("sales_section_label") or "").strip().upper()
     stop_labels      = [s.strip().upper() for s in date_schema.get("stop_labels", [])]
@@ -1964,10 +1982,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             session["column_mapping"][sheet_name] = []
 
         # Post-schema validation — retroactively disqualify if no sales_date columns found
-        sales_date_count = sum(
-            1 for c in col_results
-            if c.get("classification") == "sales_date"
-        )
+        sales_date_count = len(sales_cols)  # sales_cols from Pass 1
         if sales_date_count == 0:
             session["qualified_sheets"] = [
                 s for s in session["qualified_sheets"] if s != sheet_name
