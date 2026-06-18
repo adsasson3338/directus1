@@ -1619,6 +1619,28 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                         col_results.append({**c, "col": col_num})
                 else:
                     col_results.append(c)
+
+            # Fill in any missing columns — Python checks schema for unclassified date-like cols
+            classified_cols = {c["col"] for c in col_results}
+            for col in schema.get("columns", []):
+                col_1based = col["col"]
+                if col_1based in classified_cols:
+                    continue
+                # Check if header stack contains a date-like value
+                has_date_header = any(
+                    re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}$', h.get("value", "")) or
+                    re.match(r'^\d{1,2}/\d{1,2}-\d{1,2}/\d{1,2}$', h.get("value", "")) or
+                    re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$', h.get("value", ""), re.IGNORECASE)
+                    for h in col.get("header_stack", [])
+                )
+                if has_date_header:
+                    col_results.append({
+                        "col":                  col_1based,
+                        "classification":       "sales_date",
+                        "confidence":           "high",
+                        "reason":               "date header detected by Python fallback",
+                        "has_embedded_supplier_sku": False,
+                    })
             data_start    = result.get("data_start_row", schema["data_start_row"])
             date_axis_row = result.get("date_axis_row", data_start - 1)
             year_boundary  = result.get("year_boundary", False)
