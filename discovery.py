@@ -868,74 +868,209 @@ def extract_column_schema(ws, sheet_name: str) -> dict:
     }
 
 
-def build_schema_classify_prompt(schema: dict, filename: str) -> str:
+def build_date_schema_prompt(schema: dict, filename: str) -> str:
     """
-    Pass 1+2 combined — send the assembled column schema to AI for classification.
-    AI sees full header stacks, borders, data stats and classifies each column.
-    Columns with identical patterns can be grouped to reduce token usage.
+    Pass 1 — AI identifies the sales date column pattern.
+    Python then enumerates all matching columns mechanically.
     """
-    cols_json = json.dumps(schema["columns"], indent=2)
-    return f"""You are analyzing a retail sales spreadsheet to classify its columns.
+    header_rows = schema.get("header_rows", [])
+
+    # Build compact header grid showing all columns
+    header_grid = []
+    for row_num in header_rows:
+        row_cells = []
+        for col in schema.get("columns", []):
+            val = ""
+            for h in col.get("header_stack", []):
+                if h["row"] == row_num - 1:  # convert to 0-based
+                    val = h["value"][:15]
+                    break
+            if val:
+                row_cells.append(f"c{col['col']}={repr(val)}")
+        if row_cells:
+            header_grid.append(f"Row {row_num}: {', '.join(row_cells[:50])}")
+
+    grid_text = "\n".join(header_grid)
+
+    return f"""You are analyzing the header structure of a retail sales spreadsheet to identify the sales date column pattern.
 
 File: {filename}
 Sheet: {schema["sheet_name"]}
-Data starts at row: {schema["data_start_row"]}
-Header rows: {schema["header_rows"]}
-Merged cell ranges: {schema["merged_ranges"]}
+
+HEADER ROWS (compact — showing only non-empty cells):
+{grid_text}
+
+Your task: Identify the pattern that defines weekly sales date columns.
+
+Sales date columns are a consecutive block with:
+- Weekly date values in one row (e.g. "01/03/26", "12/21-12/27", "Feb Wk 1")
+- Possibly a section label in the row above (e.g. "Sales", "UNITS") — or nothing above them
+- The block ENDS when the section label changes (e.g. "INV", "Total", "On Order") or a non-date value appears
+
+Identify:
+1. date_axis_row: row number (1-based) containing the actual date values
+2. section_label_row: row number (1-based) containing section labels like "Sales" above date cols (null if none)
+3. sales_section_label: the text that appears above sales columns (e.g. "Sales", null if no label)
+4. stop_labels: list of labels that signal the END of the sales block (e.g. ["INV", "Total", "On Order"])
+5. first_sales_col: column number (1-based) of the FIRST sales date column
+6. date_format: pattern description e.g. "MM/DD/YY", "MM/DD-MM/DD", "Mon Wk N"
+7. data_start_row: first row (1-based) with actual product data
+8. year_present: true only if year is embedded in the date values themselves
+9. year_boundary: true if dates span December and January
+
+Respond with JSON only:
+{{
+  "date_axis_row": 5,
+  "section_label_row": 4,
+  "sales_section_label": "Sales",
+  "stop_labels": ["INV", "TOTAL", "On Order"],
+  "first_sales_col": 6,
+  "date_format": "MM/DD-MM/DD",
+  "data_start_row": 7,
+  "year_present": false,
+  "year_boundary": true
+}}"""
+
+
+def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
+    """
+    Python enumerates sales date columns using the pattern identified by AI.
+    Scans columns from first_sales_col, collecting those that match the date pattern.
+    Stops when section label changes or date pattern breaks.
+    """
+    date_axis_row    = date_schema.get("date_axis_row", 1)        # 1-based
+    section_label_row = date_schema.get("section_label_row")      # 1-based or None
+    sales_label      = (date_schema.get("sales_section_label") or "").strip().upper()
+    stop_labels      = [s.strip().upper() for s in date_schema.get("stop_labels", [])]
+    first_sales_col  = date_schema.get("first_sales_col", 1)      # 1-based
+    date_format      = date_schema.get("date_format", "")
+
+    # Build col -> header values map
+    col_headers = {}
+    for col in schema.get("columns", []):
+        col_num = col["col"]
+        headers = {h["row"] + 1: h["value"] for h in col.get("header_stack", [])}  # 1-based
+        col_headers[col_num] = headers
+
+    # Date matching patterns
+    DATE_PATTERNS = [
+        re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}$'),           # MM/DD/YY or MM/DD/YYYY
+        re.compile(r'^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$'), # MM/DD-MM/DD
+        re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$', re.IGNORECASE),
+        re.compile(r'^wk\s*\d+$', re.IGNORECASE),
+    ]
+
+    def is_date_value(val: str) -> bool:
+        return any(p.match(val.strip()) for p in DATE_PATTERNS)
+
+    def get_section_label(col_num: int) -> str:
+        if not section_label_row:
+            return ""
+        return col_headers.get(col_num, {}).get(section_label_row, "").strip().upper()
+
+    def get_date_value(col_num: int) -> str:
+        return col_headers.get(col_num, {}).get(date_axis_row, "").strip()
+
+    sales_cols = []
+    all_col_nums = sorted(col_headers.keys())
+
+    in_sales_block = False
+    for col_num in all_col_nums:
+        if col_num < first_sales_col:
+            continue
+
+        date_val    = get_date_value(col_num)
+        sec_label   = get_section_label(col_num)
+
+        # Check if section label signals end of sales block
+        if sec_label and stop_labels and sec_label in stop_labels:
+            break  # hit a stop label — sales block ended
+
+        # Check if this column has a date value in the date axis row
+        if date_val and is_date_value(date_val):
+            # Verify section label matches (if sales has a label)
+            if sales_label and sec_label and sec_label != sales_label:
+                break  # section changed
+            sales_cols.append(col_num)
+            in_sales_block = True
+        elif in_sales_block:
+            # Was in sales block — if no date value and no section label, skip (empty col)
+            if not date_val and not sec_label:
+                continue
+            # Otherwise the block has ended
+            break
+
+    return sales_cols
+
+
+def build_column_classify_prompt(schema: dict, filename: str,
+                                  date_cols: list, postgres_matched: set) -> str:
+    """
+    Pass 2 — AI classifies non-date columns only.
+    Small focused prompt — only the product/inventory/metadata columns.
+    """
+    date_col_set = set(date_cols)
+    non_date_cols = [
+        c for c in schema.get("columns", [])
+        if c["col"] not in date_col_set
+        and (c.get("sample_non_zero") or c.get("header_stack"))
+    ]
+
+    # Annotate with postgres match info
+    for col in non_date_cols:
+        col["postgres_matched"] = any(
+            str(v).upper() in postgres_matched
+            for v in col.get("sample_non_zero", [])
+        )
+        col["embedded_postgres_matched"] = any(
+            ext.get("sku", "").upper() in postgres_matched
+            for ext in col.get("embedded_sku_extractions", [])
+        )
+
+    cols_json = json.dumps(non_date_cols, indent=2)
+
+    return f"""You are classifying the non-sales columns of a retail sales spreadsheet.
+
+File: {filename}
+Sheet: {schema["sheet_name"]}
+
+The sales date columns have already been identified. Classify only the columns below.
 
 Each column has:
-- header_stack: all non-empty header values top-down (row number, value, whether merged)
-- borders: cell border styles (section boundaries)
-- data_types: types found in data rows
+- header_stack: header values with row numbers (top-down)
+- data_types: Python types found in data rows
 - sample_non_zero: up to 5 non-zero sample values
-- pct_zero: fraction of data rows that are zero or null
-- postgres_matched: true if any sample values were found in the supplier inventory database
-- embedded_sku_extractions: supplier SKUs extracted from this column's text values (if any)
-- embedded_postgres_matched: true if any embedded SKUs matched the supplier inventory database
+- pct_zero: fraction of data rows that are zero/null
+- postgres_matched: true if sample values matched the supplier inventory database
+- embedded_sku_extractions: supplier SKUs extracted from text values
+- embedded_postgres_matched: true if extracted SKUs matched the supplier database
 
 Classify each column as one of:
-- sales_date: a weekly sales period column (unit sales data)
-- retailer_sku: retailer's product identifier (WIC#, DPCI, SKU Number etc)
-- supplier_sku: supplier's internal part number / style code
-- description: product name or description (may contain embedded supplier SKU)
+- retailer_sku: retailer's product identifier (WIC#, DPCI, SKU Number, Item# etc)
+- supplier_sku: supplier's internal part number or style code
+- description: product name/description text (may contain embedded supplier SKU)
 - cost: unit cost or wholesale price
 - retail_price: retail selling price
-- inventory: current on-hand stock quantity (most recent snapshot)
-- open_order: open purchase order quantity
-- other: anything else (subtotals, categories, percentages, stale inventory, etc)
+- inventory: current on-hand stock quantity (even if currently zero/empty)
+- open_order: open purchase order quantity (even if currently zero/empty)
+- other: business unit codes, subtotals, YTD totals, stale inventory, percentages, etc
 
-Key reasoning rules:
-- sales_date columns have weekly date ranges or fiscal week labels as headers and integer data
-- A column is sales_date based on its HEADER (weekly date), not whether it currently has data — YTD files pre-populate future weeks with empty columns that are still sales_date columns
-- inventory columns typically appear AFTER sales columns and represent point-in-time stock counts
-- If multiple inventory columns exist for the same date, only the AGGREGATE total should be classified as inventory — breakdowns (DC, Store) are other
-- open_order columns represent pending purchase orders
-- Borders signal section boundaries — use them to group related columns
-- A column labeled "Year to Date" or "YTD" with cumulative totals is other, not sales_date
-- Stale inventory (prior weeks) should be other, not inventory
-- Header labels like "Remaining Inventory" and "Total Open Orders Qty" always classify as inventory and open_order respectively, even if currently empty
-
-IMPORTANT — GROUP SIMILAR COLUMNS:
-If multiple consecutive columns share the same classification and pattern (e.g., 52 weekly sales date columns all with date range headers and integer data), classify them as a group using "cols" instead of "col". This reduces response size significantly.
-
-Also identify:
-- data_start_row: the row where product data begins
-- date_axis_row: the row containing the sales date headers
-- year_boundary: true if sales dates span December and January
+Key rules:
+- Header label is AUTHORITATIVE — "Remaining Inventory" = inventory, "Total Open Orders Qty" = open_order always
+- "Year to Date" / "YTD" columns = other
+- Business unit codes (NAD, RET) = other
+- Multiple inventory snapshots: most recent = inventory, prior weeks = other
+- postgres_matched strongly suggests retailer_sku or supplier_sku
+- embedded_postgres_matched means has_embedded_supplier_sku = true
 
 COLUMNS:
 {cols_json}
 
 Respond with JSON only:
 {{
-  "data_start_row": 7,
-  "date_axis_row": 5,
-  "year_present": true,
-  "year_boundary": false,
   "columns": [
     {{"col": 1, "classification": "retailer_sku", "confidence": "high", "reason": "one sentence", "has_embedded_supplier_sku": false}},
-    {{"cols": [9, 10, 11, 12, 13, 59], "classification": "sales_date", "confidence": "high", "reason": "weekly date range headers with integer sales data", "has_embedded_supplier_sku": false}},
-    {{"col": 60, "classification": "inventory", "confidence": "high", "reason": "one sentence", "has_embedded_supplier_sku": false}}
+    ...
   ]
 }}"""
 
@@ -1198,11 +1333,12 @@ async def stage_postgres_sku_lookup(session_id: str):
 
 
 async def stage_schema_classify(session_id: str):
-    """Stage 2c — AI classification using schema + Postgres matches."""
+    """Stage 2c — Pass 1: AI identifies date column pattern per sheet."""
     session = _sessions[session_id]
     session["stage"]  = "locating"
     session["status"] = "running"
 
+    # Store postgres matches for use in Pass 2
     pg_matches = session.get("postgres_results", {}).get("matches", [])
     matched_values = set()
     for row in pg_matches:
@@ -1210,6 +1346,7 @@ async def stage_schema_classify(session_id: str):
             v = row.get(field, "")
             if v:
                 matched_values.add(v.upper())
+    session["_matched_values"] = matched_values
 
     for sheet_name in session["qualified_sheets"]:
         schema = session.get("_schemas", {}).get(sheet_name, {})
@@ -1217,15 +1354,12 @@ async def stage_schema_classify(session_id: str):
             session["grid"][sheet_name] = {"error": "No schema available"}
             continue
 
-        # Annotate columns with postgres_matched and embedded_postgres_matched
+        # Annotate postgres matches into schema columns
         for col in schema.get("columns", []):
-            postgres_confirmed = any(
+            col["postgres_matched"] = any(
                 str(v).upper() in matched_values
                 for v in col.get("sample_non_zero", [])
             )
-            col["postgres_matched"] = postgres_confirmed
-
-            # Check if embedded SKUs matched Postgres
             embedded_matched = any(
                 ext.get("sku", "").upper() in matched_values
                 for ext in col.get("embedded_sku_extractions", [])
@@ -1234,11 +1368,12 @@ async def stage_schema_classify(session_id: str):
             if embedded_matched:
                 col["has_embedded_supplier_sku"] = True
 
-        prompt = build_schema_classify_prompt(schema, session["filename"])
+        # Pass 1 — AI identifies date schema pattern only
+        prompt = build_date_schema_prompt(schema, session["filename"])
         job_id = str(uuid.uuid4())
         _jobs[job_id] = {
             "session_id": session_id,
-            "stage":      "schema_classify",
+            "stage":      "date_schema",
             "sheet_name": sheet_name,
             "schema":     schema,
             "created_at": time.time(),
@@ -1532,7 +1667,59 @@ async def stage_assemble(session_id: str):
 async def discovery_timeout_handler(sid: str, stage: str):
     """Handle timed-out discovery jobs."""
     session = _sessions[sid]
-    if stage == "schema_classify":
+    if stage == "date_schema":
+        # Pass 1 response — AI identified date column pattern
+        sheet_name = job["sheet_name"]
+        schema     = job["schema"]
+        raw  = request_body
+        text = raw.get("text", "") or ""
+        if isinstance(text, str):
+            clean = text.replace("```json", "").replace("```", "").strip()
+            try:
+                date_schema = json.loads(clean)
+            except:
+                date_schema = {"error": f"Parse error: {text[:100]}"}
+        else:
+            date_schema = raw
+
+        if "error" not in date_schema:
+            # Python enumerates all sales date columns from the pattern
+            sales_cols_1based = find_sales_cols_from_schema(schema, date_schema)
+            sales_cols_0based = [c - 1 for c in sales_cols_1based]
+
+            # Store for use in Pass 2
+            session.setdefault("_date_schemas", {})[sheet_name] = date_schema
+            session.setdefault("_sales_cols", {})[sheet_name] = sales_cols_0based
+
+            # Fire Pass 2 — column classification
+            matched_values = session.get("_matched_values", set())
+            prompt = build_column_classify_prompt(schema, session["filename"],
+                                                   sales_cols_1based, matched_values)
+            job_id2 = str(uuid.uuid4())
+            _jobs[job_id2] = {
+                "session_id": session_id,
+                "stage":      "schema_classify",
+                "sheet_name": sheet_name,
+                "schema":     schema,
+                "date_schema": date_schema,
+                "sales_cols": sales_cols_0based,
+                "created_at": time.time(),
+            }
+            err = fire_webhook(N8N_AI_WEBHOOK, job_id2, {"prompt": prompt})
+            if err:
+                session["column_mapping"][sheet_name] = []
+                session.setdefault("errors", []).append(f"Column classify webhook error: {err}")
+            else:
+                session["status"] = "awaiting_ai"
+                session["_pending_jobs"].add(job_id2)
+        else:
+            session["grid"][sheet_name]           = {"error": date_schema.get("error")}
+            session["column_mapping"][sheet_name] = []
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_identify_retailer, session_id)
+
+    elif stage in ("schema_classify", "date_schema"):
         asyncio.create_task(stage_identify_retailer(sid))
     elif stage == "postgres_sku":
         session["postgres_results"] = {"matches": [], "error": "timed out"}
@@ -1595,9 +1782,64 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         session["status"] = "awaiting_ai"
 
     # Store result by stage
-    if stage == "schema_classify":
+    if stage == "date_schema":
+        # Pass 1 response — AI identified date column pattern
         sheet_name = job["sheet_name"]
         schema     = job["schema"]
+        raw  = request_body
+        text = raw.get("text", "") or ""
+        if isinstance(text, str):
+            clean = text.replace("```json", "").replace("```", "").strip()
+            try:
+                date_schema = json.loads(clean)
+            except:
+                date_schema = {"error": f"Parse error: {text[:100]}"}
+        else:
+            date_schema = raw
+
+        if "error" not in date_schema:
+            # Python enumerates all sales date columns from the pattern
+            sales_cols_1based = find_sales_cols_from_schema(schema, date_schema)
+            sales_cols_0based = [c - 1 for c in sales_cols_1based]
+
+            # Store for use in Pass 2
+            session.setdefault("_date_schemas", {})[sheet_name] = date_schema
+            session.setdefault("_sales_cols", {})[sheet_name] = sales_cols_0based
+
+            # Fire Pass 2 — column classification
+            matched_values = session.get("_matched_values", set())
+            prompt = build_column_classify_prompt(schema, session["filename"],
+                                                   sales_cols_1based, matched_values)
+            job_id2 = str(uuid.uuid4())
+            _jobs[job_id2] = {
+                "session_id": session_id,
+                "stage":      "schema_classify",
+                "sheet_name": sheet_name,
+                "schema":     schema,
+                "date_schema": date_schema,
+                "sales_cols": sales_cols_0based,
+                "created_at": time.time(),
+            }
+            err = fire_webhook(N8N_AI_WEBHOOK, job_id2, {"prompt": prompt})
+            if err:
+                session["column_mapping"][sheet_name] = []
+                session.setdefault("errors", []).append(f"Column classify webhook error: {err}")
+            else:
+                session["status"] = "awaiting_ai"
+                session["_pending_jobs"].add(job_id2)
+        else:
+            session["grid"][sheet_name]           = {"error": date_schema.get("error")}
+            session["column_mapping"][sheet_name] = []
+
+        if not session["_pending_jobs"]:
+            background_tasks.add_task(stage_identify_retailer, session_id)
+
+    elif stage == "schema_classify":
+        sheet_name  = job["sheet_name"]
+        schema      = job["schema"]
+        date_schema = job.get("date_schema", {})
+        sales_cols  = job.get("sales_cols", [])  # 0-based from Pass 1
+
         raw  = request_body
         text = raw.get("text", "") or ""
         if isinstance(text, str):
@@ -1610,58 +1852,24 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             result = raw
 
         if "error" not in result:
-            # Expand grouped columns (cols: [...]) into individual entries
-            raw_cols = result.get("columns", [])
-            col_results = []
-            for c in raw_cols:
-                if "cols" in c:
-                    for col_num in c["cols"]:
-                        col_results.append({**c, "col": col_num})
-                else:
-                    col_results.append(c)
+            col_results = result.get("columns", [])
+            # Convert 1-based cols from AI to 0-based
+            col_results = [{**c, "col": c["col"] - 1} for c in col_results]
 
-            # Fill in any missing columns — Python checks schema for unclassified date-like cols
-            classified_cols = {c["col"] for c in col_results}
-            for col in schema.get("columns", []):
-                col_1based = col["col"]
-                if col_1based in classified_cols:
-                    continue
-                # Check if header stack contains a date-like value
-                has_date_header = any(
-                    re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}$', h.get("value", "")) or
-                    re.match(r'^\d{1,2}/\d{1,2}-\d{1,2}/\d{1,2}$', h.get("value", "")) or
-                    re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$', h.get("value", ""), re.IGNORECASE)
-                    for h in col.get("header_stack", [])
-                )
-                if has_date_header:
-                    col_results.append({
-                        "col":                  col_1based,
-                        "classification":       "sales_date",
-                        "confidence":           "high",
-                        "reason":               "date header detected by Python fallback",
-                        "has_embedded_supplier_sku": False,
-                    })
-            data_start    = result.get("data_start_row", schema["data_start_row"])
-            date_axis_row = result.get("date_axis_row", data_start - 1)
-            year_boundary  = result.get("year_boundary", False)
-            # year_present only valid for datetime format — date_range_string and fiscal_week_label never embed year
-            raw_format    = result.get("date_axis_format", "mixed")
-            year_present  = raw_format == "datetime"
+            # sales_cols already computed by Python in Pass 1 (0-based)
+            data_start    = date_schema.get("data_start_row", schema["data_start_row"])
+            date_axis_row = date_schema.get("date_axis_row", data_start - 1)
+            year_boundary = date_schema.get("year_boundary", False)
+            year_present  = date_schema.get("year_present", False)
 
-            # Build sales_date_cols from columns classified as sales_date
-            sales_cols = [
-                c["col"] - 1  # convert to 0-based
-                for c in col_results
-                if c.get("classification") == "sales_date"
-            ]
-
-            # Build sample date values from header stack
+            # Build sample date values from header stack using sales_cols
             col_schema_map = {c["col"]: c for c in schema["columns"]}
             sample_vals = []
-            for col_1based in sorted([c["col"] for c in col_results if c.get("classification") == "sales_date"])[:8]:
-                cs = col_schema_map.get(col_1based, {})
+            for col_0 in sorted(sales_cols)[:8]:
+                col_1 = col_0 + 1
+                cs = col_schema_map.get(col_1, {})
                 for h in cs.get("header_stack", []):
-                    if any(c.isdigit() for c in h["value"]):
+                    if any(ch.isdigit() for ch in h["value"]):
                         sample_vals.append(h["value"])
                         break
 
@@ -1675,41 +1883,41 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                 "col_count":              len(sales_cols),
                 "cols":                   sales_cols,
                 "sample_values":          sample_vals,
-                "format":                 "mixed",
+                "format":                 date_schema.get("date_format", "mixed"),
                 "year_present":           year_present,
                 "interleaved_empty_cols": False,
                 "year_boundary_detected": year_boundary,
             }
 
-            # Build sku_candidates from non-sales_date columns that have data
+            # Build sku_candidates from classified non-date columns
             rows = session["_sheets"].get(sheet_name, [])
             sku_candidates = []
             for c in col_results:
-                if c.get("classification") not in ("sales_date",):
-                    col_0 = c["col"] - 1  # 0-based
-                    cs    = col_schema_map.get(c["col"], {})
-                    pre_strings = [
-                        {"row": h["row"] - 1, "value": h["value"]}
-                        for h in cs.get("header_stack", [])
-                    ]
-                    col_vals = [
-                        rows[r][col_0]
-                        for r in range(data_start - 1, min(data_start + 49, len(rows)))
-                        if col_0 < len(rows[r]) and rows[r][col_0] is not None
-                    ]
-                    types = {}
-                    for v in col_vals:
-                        t = classify_cell(v)
-                        types[t] = types.get(t, 0) + 1
-                    dominant = max(types, key=types.get) if types else "string"
-                    sku_candidates.append({
-                        "col":              col_0,
-                        "pre_data_strings": pre_strings,
-                        "dominant_type":    dominant,
-                        "type_distribution": types,
-                        "fill_rate":        round(len(col_vals) / 50, 2),
-                        "sample_values":    [str(v) for v in col_vals[:5]],
-                    })
+                col_0 = c["col"]  # already 0-based
+                col_1 = col_0 + 1
+                cs    = col_schema_map.get(col_1, {})
+                pre_strings = [
+                    {"row": h["row"] - 1, "value": h["value"]}
+                    for h in cs.get("header_stack", [])
+                ]
+                col_vals = [
+                    rows[r][col_0]
+                    for r in range(data_start - 1, min(data_start + 49, len(rows)))
+                    if col_0 < len(rows[r]) and rows[r][col_0] is not None
+                ]
+                types = {}
+                for v in col_vals:
+                    t = classify_cell(v)
+                    types[t] = types.get(t, 0) + 1
+                dominant = max(types, key=types.get) if types else "string"
+                sku_candidates.append({
+                    "col":              col_0,
+                    "pre_data_strings": pre_strings,
+                    "dominant_type":    dominant,
+                    "type_distribution": types,
+                    "fill_rate":        round(len(col_vals) / 50, 2),
+                    "sample_values":    [str(v) for v in col_vals[:5]],
+                })
 
             # Run embedded SKU detection now that we have correct sales_cols
             rows_0based = session["_sheets"].get(sheet_name, [])
