@@ -1024,20 +1024,8 @@ async def stage_locate_grid(session_id: str):
         ws     = wb_full[sheet_name]
         schema = extract_column_schema(ws, sheet_name)
 
-        # Run embedded SKU detection and store in schema
-        rows       = session["_sheets"].get(sheet_name, [])
-        data_start = schema["data_start_row"] - 1  # 0-based
-        # Build sales col candidates from schema — any col with date-like headers
-        all_col_indices = [c["col"] - 1 for c in schema["columns"]]  # 0-based
-        embedded = detect_embedded_sku(rows, all_col_indices, data_start)
-        schema["embedded_sku"] = embedded
-
-        # Annotate schema columns with embedded SKU info
-        embedded_by_col = {e["col"]: e for e in embedded}
-        for col in schema["columns"]:
-            col_0 = col["col"] - 1
-            if col_0 in embedded_by_col:
-                col["embedded_sku_extractions"] = embedded_by_col[col_0]["extractions"]
+        # Embedded SKU detection runs after schema_classify when we know sales_cols
+        schema["embedded_sku"] = []
 
         session["_schemas"][sheet_name] = schema
 
@@ -1136,21 +1124,42 @@ async def stage_postgres_sku_lookup(session_id: str):
     session["stage"]  = "identifying"
     session["status"] = "running"
 
-    # Collect all candidate values from column samples + embedded SKU extractions
+    # Collect all candidate values from column samples
+    # Also run embedded pattern detection on string columns to find supplier SKUs
     col_candidates = {}
     for sheet_name in session["qualified_sheets"]:
         schema = session.get("_schemas", {}).get(sheet_name, {})
+        rows   = session["_sheets"].get(sheet_name, [])
+        data_start = schema.get("data_start_row", 1) - 1
+
         for col in schema.get("columns", []):
             # Sample values
             for val in col.get("sample_non_zero", []):
                 s = str(val).strip()
                 if s:
                     col_candidates.setdefault(s, set()).add(col["col"])
-            # Embedded SKU extractions — these are the most likely supplier SKU candidates
-            for ext in col.get("embedded_sku_extractions", []):
-                sku = ext.get("sku", "").strip()
-                if sku:
-                    col_candidates.setdefault(sku, set()).add(col["col"])
+
+            # For string columns, run embedded SKU pattern matching
+            if "string" in col.get("data_types", []):
+                col_0 = col["col"] - 1
+                str_vals = [
+                    str(rows[r][col_0]).strip()
+                    for r in range(data_start, min(data_start + 30, len(rows)))
+                    if col_0 < len(rows[r]) and isinstance(rows[r][col_0], str)
+                    and rows[r][col_0].strip()
+                ]
+                for val in str_vals:
+                    for _, pattern_re in EMBEDDED_PATTERNS:
+                        m = pattern_re.match(val)
+                        if m:
+                            # Extract SKU part
+                            if pattern_re.pattern.startswith(r'^(.{3'):
+                                sku = m.group(2).strip()
+                            else:
+                                sku = m.group(1).strip()
+                            if sku:
+                                col_candidates.setdefault(sku, set()).add(col["col"])
+                            break
 
     session["_col_candidates"] = {k: list(v) for k, v in col_candidates.items()}
 
@@ -1656,8 +1665,17 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                         "sample_values":    [str(v) for v in col_vals[:5]],
                     })
 
-            # Use embedded SKUs already detected during schema extraction
-            embedded = schema.get("embedded_sku", [])
+            # Run embedded SKU detection now that we have correct sales_cols
+            rows_0based = session["_sheets"].get(sheet_name, [])
+            embedded = detect_embedded_sku(rows_0based, sales_cols, data_start - 1)
+
+            # Annotate schema columns with embedded SKU info for Postgres matching
+            embedded_by_col = {e["col"]: e for e in embedded}
+            for col in schema.get("columns", []):
+                col_0 = col["col"] - 1
+                if col_0 in embedded_by_col:
+                    col["embedded_sku_extractions"] = embedded_by_col[col_0]["extractions"]
+                    col["has_embedded_supplier_sku"] = True
 
             session["grid"][sheet_name] = {
                 "date_axis":      date_axis,
