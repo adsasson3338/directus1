@@ -129,54 +129,6 @@ def find_data_start_row(rows, date_axis_row: int, date_cols: list) -> int:
     return date_axis_row + 1
 
 
-def find_sku_candidates(rows, date_axis_row: int, date_cols: list) -> list:
-    if not date_cols:
-        return []
-    left_boundary = min(date_cols)
-    data_start = find_data_start_row(rows, date_axis_row, date_cols)
-    data_rows = [rows[r] for r in range(data_start, min(data_start + 50, len(rows)))]
-    total_data_rows = len(data_rows)
-    candidates = []
-
-    for col_idx in range(left_boundary):
-        col_vals = [row[col_idx] for row in data_rows if col_idx < len(row) and row[col_idx] is not None]
-        if not col_vals:
-            continue
-
-        types = [classify_cell(v) for v in col_vals]
-        type_counts = {}
-        for t in types:
-            type_counts[t] = type_counts.get(t, 0) + 1
-        dominant = max(type_counts, key=type_counts.get)
-        fill_rate = round(len(col_vals) / total_data_rows, 2) if total_data_rows > 0 else 0
-
-        pre_data_strings = [
-            {"row": row_idx, "value": rows[row_idx][col_idx]}
-            for row_idx in range(data_start)
-            if col_idx < len(rows[row_idx])
-            and isinstance(rows[row_idx][col_idx], str)
-            and rows[row_idx][col_idx].strip()
-        ]
-
-        candidates.append({
-            "col": col_idx,
-            "pre_data_strings": pre_data_strings,
-            "dominant_type": dominant,
-            "type_distribution": type_counts,
-            "fill_rate": fill_rate,
-            "sample_values": [str(v) for v in col_vals[:5]],
-        })
-    return candidates
-
-
-EMBEDDED_PATTERNS = [
-    ("integer_dash_description",        re.compile(r'^(\d{4,10})\s*[-\u2013]\s*(.{3,})$')),
-    ("alphanumeric_space_description",  re.compile(r'^([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s+(.{3,})$', re.IGNORECASE)),
-    ("description_space_alphanumeric",  re.compile(r'^(.{3,})\s{2,}([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s*$', re.IGNORECASE)),
-    ("description_space_nodash_sku",    re.compile(r'^(.{5,})\s+([A-Z]{2,}\d{3,})\s*$', re.IGNORECASE)),
-]
-
-
 def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
     if not date_cols:
         return []
@@ -217,24 +169,6 @@ def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
             })
     return embedded_candidates
 
-
-def find_year_anchors(filename: str, rows: list) -> list:
-    anchors = []
-    for m in YEAR_RE.finditer(filename):
-        anchors.append({"source": "filename", "value": m.group(1)})
-    for row_idx, row in enumerate(rows[:5]):
-        for col_idx, val in enumerate(row):
-            if isinstance(val, datetime):
-                anchors.append({"source": "cell", "row": row_idx, "col": col_idx, "value": str(val.date())})
-            elif isinstance(val, str):
-                for m in YEAR_RE.finditer(val):
-                    anchors.append({"source": "cell", "row": row_idx, "col": col_idx, "value": m.group(1)})
-    return anchors[:6]
-
-
-# ─────────────────────────────────────────────
-# DATE NORMALIZATION — normalize to week-ending Saturday
-# ─────────────────────────────────────────────
 
 def normalize_to_saturday(d: date) -> date:
     """Return the Saturday of the week containing d (Mon=0, Sat=5)."""
@@ -436,38 +370,6 @@ Respond with JSON only:
 }}"""
 
 
-def build_classify_prompt(col: dict, confirmed_cols: list) -> str:
-    confirmed_context = ""
-    if confirmed_cols:
-        confirmed_context = "\nAlready confirmed columns:\n"
-        for c in confirmed_cols:
-            confirmed_context += f"  col {c['col']} ({c['label']}) = {c['classification']}, samples: {c['sample_values'][:3]}\n"
-
-    return f"""You are classifying a column in a retail sales spreadsheet.
-
-Classify it as one of:
-- retailer_sku: the retailer's product identifier (WIC#, DPCI, Item#, UPC etc)
-- supplier_sku: the supplier's internal SKU or style code
-- description: product name or description text
-- cost: unit cost or wholesale price
-- retail_price: retail selling price
-- inventory: stock quantities
-- other: anything else
-
-COLUMN TO CLASSIFY:
-Column index: {col["col"]}
-Label: {col["label"]}
-Dominant type: {col["dominant_type"]}
-Sample values: {col["sample_values"]}
-{confirmed_context}
-Respond with JSON only:
-{{"col": {col["col"]}, "classification": "type", "confidence": "high/medium/low", "reason": "one sentence"}}"""
-
-
-# ─────────────────────────────────────────────
-# DATE CONFIG PROMPT
-# ─────────────────────────────────────────────
-
 def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str,
                        filename: str = "", cross_sheet_anchors: list = None) -> str:
     cross_context = ""
@@ -511,17 +413,6 @@ WHERE file_hash = '{file_hash}'
 LIMIT 1
 """.strip()
 
-def build_file_audit_lookup_sql(file_hash: str) -> str:
-    """Look up file_audit row by file_hash."""
-    return f"""
-SELECT id, status
-FROM file_audit
-WHERE file_hash = '{file_hash}'
-  AND status = 'received'
-ORDER BY received_at DESC
-LIMIT 1
-""".strip()
-
 def build_retailer_identify_sql(retailer_sku_candidates: list) -> str:
     """
     Query retailer_sku_map to identify retailer from SKU candidates.
@@ -543,23 +434,6 @@ WHERE UPPER(retailer_sku) = ANY(ARRAY[{quoted}]::text[])
 GROUP BY retailer
 ORDER BY matches DESC
 LIMIT 1
-""".strip()
-
-
-def build_update_file_audit_sql(file_audit_id: str, discovery_result: dict,
-                                 retailer: str | None, status: str) -> str:
-    """
-    Build SQL to update file_audit row with discovery result and retailer.
-    """
-    result_json = json.dumps(discovery_result).replace("'", "''")
-    retailer_val = f"'{retailer}'" if retailer else "NULL"
-    return f"""
-UPDATE file_audit
-SET discovery_result = '{result_json}'::jsonb,
-    retailer         = {retailer_val},
-    status           = '{status}',
-    updated_at       = now()
-WHERE id = '{file_audit_id}'
 """.strip()
 
 
@@ -654,19 +528,6 @@ def build_file_set_key(retailer: str, date_config: dict) -> str:
     return f"{retailer_clean}_{year_value}-W{week_num:02d}"
 
 
-def build_count_pending_set_sql(retailer: str, file_set_key: str) -> str:
-    """Count files already in pending_set for this file set."""
-    retailer_safe = retailer.replace("'", "''")
-    key_safe = file_set_key.replace("'", "''")
-    return f"""
-SELECT COUNT(*) as pending_count
-FROM file_audit
-WHERE UPPER(retailer) = UPPER('{retailer_safe}')
-  AND file_set_key = '{key_safe}'
-  AND status IN ('pending_set', 'discovery_complete')
-""".strip()
-
-
 def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       retailer: str | None, status: str,
                                       file_set_key: str | None,
@@ -690,84 +551,6 @@ SET discovery_result = convert_from(decode('{result_b64}', 'base64'), 'UTF8')::j
 WHERE id = '{file_audit_id}'
 """.strip()
 
-
-def build_grid_layout_prompt(sheet_name: str, filename: str, rows: list) -> str:
-    """
-    Build a prompt for AI-driven grid layout analysis.
-    Send the first 20 rows as a compact representation.
-    AI identifies sales date columns, product identifier columns, inventory columns, data start row.
-    """
-    # Build compact row representation — show cell types and values
-    compact_rows = []
-    for row_idx, row in enumerate(rows[:20]):
-        cells = []
-        for col_idx, val in enumerate(row):
-            if val is None:
-                cells.append("_")
-            elif isinstance(val, bool):
-                cells.append(str(val))
-            elif isinstance(val, datetime):
-                cells.append(f"DATE({val.strftime('%m/%d/%y')})")
-            elif isinstance(val, int):
-                cells.append(f"INT({val})")
-            elif isinstance(val, float):
-                if 0 <= val <= 1:
-                    cells.append(f"PCT({val:.2f})")
-                else:
-                    cells.append(f"FLT({val:.1f})")
-            elif isinstance(val, str):
-                s = val.strip()
-                if len(s) > 20:
-                    s = s[:20] + "..."
-                cells.append(f'"{s}"')
-            else:
-                cells.append("?")
-        compact_rows.append(f"Row {row_idx}: [{', '.join(cells[:40])}]")
-
-    layout = "\n".join(compact_rows)
-
-    return f"""You are analyzing a retail sales spreadsheet to identify its grid structure.
-
-Sheet: {sheet_name}
-File: {filename}
-
-LAYOUT (first 20 rows, up to 40 columns):
-{layout}
-
-Your task:
-1. Find the DATE AXIS ROW — the row containing weekly date headers for sales data. These are evenly-spaced dates (7 days apart) representing week-ending dates.
-2. Find the SALES DATE COLUMNS — only columns that contain weekly unit sales data. Exclude inventory snapshots, totals, cumulative columns.
-3. Find the DATA START ROW — the first row containing actual product sales data (integers under the date columns).
-4. Find SKU CANDIDATE COLUMNS — columns to the LEFT of the date axis that could contain product identifiers (retailer SKU, supplier SKU, description etc).
-5. Find INVENTORY COLUMNS — columns containing on-hand inventory counts (if any). These may have date headers but contain stock quantities, not weekly sales.
-6. Find YEAR ANCHORS — any cells containing a 4-digit year (20XX).
-
-Important rules:
-- Sales date columns have VARYING integers across product rows (different products sell different amounts)
-- Inventory columns typically have large consistent integers (stock counts)
-- Look at the semantic labels in rows ABOVE the date axis for clues (Sales, INV, Inventory, On Order etc)
-- Cumulative YTD columns should NOT be included in sales date columns
-- Only include date columns that represent individual weekly periods
-
-Respond with JSON only:
-{{
-  "date_axis_row": 0,
-  "date_axis_format": "datetime|date_range_string|fiscal_week_label|mixed",
-  "year_present": true,
-  "year_boundary_detected": false,
-  "sales_date_cols": [1, 2, 3],
-  "inventory_cols": [{{"col": 32, "label": "Total Inv"}}],
-  "data_start_row": 1,
-  "sku_candidate_cols": [0],
-  "year_anchors": [{{"source": "cell", "row": 2, "col": 0, "value": "2026"}}],
-  "sample_date_values": ["Feb Wk 1", "Feb Wk 2"],
-  "notes": "any observations about unusual layout"
-}}"""
-
-
-# ─────────────────────────────────────────────
-# PASS 1 — COLUMN SCHEMA EXTRACTION
-# ─────────────────────────────────────────────
 
 def extract_column_schema(ws, sheet_name: str) -> dict:
     """
@@ -1210,55 +993,6 @@ async def stage_locate_grid(session_id: str):
         session["_schemas"][sheet_name] = schema
 
     await stage_postgres_sku_lookup(session_id)
-
-
-async def stage_identify_columns(session_id: str):
-    """Stage 3 — identify columns via Postgres then one AI call per sheet."""
-    session = _sessions[session_id]
-    session["stage"] = "identifying"
-    session["status"] = "running"
-
-    # Collect all unique values from every left-of-axis column, tagged with col index
-    # No filtering — Python does not decide what is or isn't a SKU candidate
-    col_candidates = {}  # value -> set of col indices it appears in
-
-    for sheet_name in session["qualified_sheets"]:
-        grid = session["grid"].get(sheet_name, {})
-
-        for col in grid.get("sku_candidates", []):
-            col_idx = col["col"]
-            for v in col.get("sample_values", []):
-                s = str(v).strip()
-                if s:
-                    col_candidates.setdefault(s, set()).add(col_idx)
-
-        for emb in grid.get("embedded_sku", []):
-            col_idx = emb["col"]
-            for ext in emb.get("extractions", []):
-                sku = ext.get("sku", "").strip()
-                if sku:
-                    col_candidates.setdefault(sku, set()).add(col_idx)
-
-    # Store col_candidates for use after Postgres responds
-    session["_col_candidates"] = {k: list(v) for k, v in col_candidates.items()}
-
-    candidates = sorted(col_candidates.keys())
-    sql, _ = build_sku_lookup_sql(candidates)
-
-    job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "session_id": session_id,
-        "stage":      "postgres_sku",
-        "created_at": time.time(),
-    }
-
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
-    if err:
-        session["postgres_results"] = {"matches": [], "matched_candidates": [], "error": err}
-        await advance_from_postgres(session_id)
-    else:
-        session["status"] = "awaiting_postgres"
-        session["_pending_jobs"].add(job_id)
 
 
 async def advance_from_postgres(session_id: str):
@@ -1761,9 +1495,7 @@ async def discovery_timeout_handler(sid: str, stage: str):
 
     elif stage in ("schema_classify", "date_schema"):
         asyncio.create_task(stage_identify_retailer(sid))
-    elif stage == "postgres_sku":
-        session["postgres_results"] = {"matches": [], "error": "timed out"}
-        asyncio.create_task(stage_schema_classify(sid))
+
     elif stage == "dedup_check":
         asyncio.create_task(stage_qualify(sid))
     elif stage == "lookup_audit":
@@ -2070,23 +1802,6 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         if not session["_pending_jobs"]:
             background_tasks.add_task(stage_schema_classify, session_id)
 
-    elif stage == "classify_sheet":
-        sheet_name = job["sheet_name"]
-        raw = request_body
-        text = raw.get("text", "") or ""
-        if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
-            try:
-                result = json.loads(clean)
-            except:
-                result = {"error": f"Parse error: {text[:100]}"}
-        else:
-            result = raw
-        result["source"] = "ai"
-        session["column_mapping"][sheet_name] = result.get("columns", result)
-
-        if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_identify_retailer, session_id)
 
     elif stage == "date_config":
         sheet_name = job["sheet_name"]
