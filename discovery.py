@@ -382,7 +382,12 @@ def build_column_classify_prompt(sheet_name: str, sku_candidates: list,
     cols_info = []
     for col in sku_candidates:
         col_idx = col["col"]
-        label = col.get("pre_data_strings", [{}])[-1].get("value", "") if col.get("pre_data_strings") else ""
+        # For inventory cols use first label (semantic), for others use last (closest header)
+        pre_strings = col.get("pre_data_strings", [])
+        if col.get("is_inventory_col") and pre_strings:
+            label = pre_strings[0].get("value", "")
+        else:
+            label = pre_strings[-1].get("value", "") if pre_strings else ""
         samples = col.get("sample_values", [])
         postgres_confirmed = any(str(v).upper() in matched_values for v in samples)
 
@@ -741,6 +746,181 @@ Respond with JSON only:
   "notes": "any observations about unusual layout"
 }}"""
 
+
+# ─────────────────────────────────────────────
+# PASS 1 — COLUMN SCHEMA EXTRACTION
+# ─────────────────────────────────────────────
+
+def extract_column_schema(ws, sheet_name: str) -> dict:
+    """
+    Extract raw column schema from worksheet.
+    Detects data block start, header rows, merged cells, borders.
+    Returns per-column: header stack, borders, data stats.
+    """
+    max_col = ws.max_column
+    max_row  = ws.max_row
+
+    # Build merged cell map
+    merge_map = {}
+    for merge in ws.merged_cells.ranges:
+        val = ws.cell(merge.min_row, merge.min_col).value
+        for row in range(merge.min_row, merge.max_row + 1):
+            for col in range(merge.min_col, merge.max_col + 1):
+                merge_map[(row, col)] = {
+                    "value": val,
+                    "range": str(merge),
+                    "is_top_left": (row == merge.min_row and col == merge.min_col)
+                }
+
+    def get_cell_value(row, col):
+        if (row, col) in merge_map:
+            return merge_map[(row, col)]["value"]
+        return ws.cell(row, col).value
+
+    # Find data block start — first row with >30% numeric values
+    data_start_row = None
+    for row_idx in range(1, min(30, max_row + 1)):
+        values = [ws.cell(row_idx, c).value for c in range(1, max_col + 1)]
+        numeric = sum(1 for v in values if isinstance(v, (int, float)) and not isinstance(v, bool))
+        non_null = sum(1 for v in values if v is not None)
+        if non_null > 0 and numeric / max(non_null, 1) > 0.3:
+            data_start_row = row_idx
+            break
+
+    if not data_start_row:
+        data_start_row = 2
+
+    header_rows = list(range(1, data_start_row))
+
+    columns = []
+    for col_idx in range(1, max_col + 1):
+        # Collect header stack
+        header_stack = []
+        for row_idx in header_rows:
+            val = get_cell_value(row_idx, col_idx)
+            if val is not None and str(val).strip():
+                if isinstance(val, datetime):
+                    val = val.strftime('%m/%d/%y')
+                is_merged   = (row_idx, col_idx) in merge_map
+                merge_parent = merge_map.get((row_idx, col_idx), {}).get("is_top_left", False)
+                header_stack.append({
+                    "row":          row_idx,
+                    "value":        str(val).strip(),
+                    "merged":       is_merged,
+                    "merge_parent": merge_parent,
+                })
+
+        # Border info from last header row
+        last_hrow = header_rows[-1] if header_rows else 1
+        cell = ws.cell(last_hrow, col_idx)
+        borders = {
+            "left":   cell.border.left.style if cell.border.left else None,
+            "right":  cell.border.right.style if cell.border.right else None,
+            "top":    cell.border.top.style if cell.border.top else None,
+            "bottom": cell.border.bottom.style if cell.border.bottom else None,
+        }
+
+        # Data stats
+        data_values = [
+            ws.cell(r, col_idx).value
+            for r in range(data_start_row, min(data_start_row + 100, max_row + 1))
+            if ws.cell(r, col_idx).value is not None
+        ]
+        total    = len(data_values)
+        zeros    = sum(1 for v in data_values if v == 0 or v == 0.0)
+        non_zero = [v for v in data_values if v and v != 0]
+        pct_zero = round(zeros / total, 2) if total > 0 else None
+        sample   = [str(v)[:20] for v in non_zero[:5]]
+
+        types = set()
+        for v in data_values[:50]:
+            if isinstance(v, bool):     types.add("bool")
+            elif isinstance(v, int):    types.add("integer")
+            elif isinstance(v, float):  types.add("float")
+            elif isinstance(v, str):    types.add("string")
+            elif isinstance(v, datetime): types.add("datetime")
+
+        columns.append({
+            "col":              col_idx,
+            "header_stack":     header_stack,
+            "borders":          borders,
+            "data_types":       sorted(types),
+            "sample_non_zero":  sample,
+            "pct_zero":         pct_zero,
+            "total_data_rows":  total,
+        })
+
+    return {
+        "sheet_name":     sheet_name,
+        "data_start_row": data_start_row,
+        "header_rows":    header_rows,
+        "columns":        [c for c in columns if c["header_stack"] or c["sample_non_zero"]],
+        "merged_ranges":  [str(m) for m in ws.merged_cells.ranges],
+    }
+
+
+def build_schema_classify_prompt(schema: dict, filename: str) -> str:
+    """
+    Pass 1+2 combined — send the assembled column schema to AI for classification.
+    AI sees full header stacks, borders, data stats and classifies each column.
+    """
+    cols_json = json.dumps(schema["columns"], indent=2)
+    return f"""You are analyzing a retail sales spreadsheet to classify its columns.
+
+File: {filename}
+Sheet: {schema["sheet_name"]}
+Data starts at row: {schema["data_start_row"]}
+Header rows: {schema["header_rows"]}
+Merged cell ranges: {schema["merged_ranges"]}
+
+Each column has:
+- header_stack: all non-empty header values top-down (row number, value, whether merged)
+- borders: cell border styles (section boundaries)
+- data_types: types found in data rows
+- sample_non_zero: up to 5 non-zero sample values
+- pct_zero: fraction of data rows that are zero or null
+- postgres_matched: true if any sample values were found in the supplier inventory database
+
+Classify each column as one of:
+- sales_date: a weekly sales period column (unit sales data)
+- retailer_sku: retailer's product identifier (WIC#, DPCI, SKU Number etc)
+- supplier_sku: supplier's internal part number / style code
+- description: product name or description (may contain embedded supplier SKU)
+- cost: unit cost or wholesale price
+- retail_price: retail selling price
+- inventory: current on-hand stock quantity (most recent snapshot)
+- open_order: open purchase order quantity
+- other: anything else (subtotals, categories, percentages, stale inventory, etc)
+
+Key reasoning rules:
+- sales_date columns have weekly date ranges or fiscal week labels as headers and varying integer data
+- inventory columns typically appear AFTER sales columns and represent point-in-time stock counts
+- If multiple inventory columns exist for the same date, only the AGGREGATE total should be classified as inventory — breakdowns (DC, Store) are other
+- open_order columns represent pending purchase orders
+- Borders signal section boundaries — use them to group related columns
+- pct_zero helps distinguish active sales columns from empty/placeholder columns
+- Stale inventory (prior weeks) should be other, not inventory
+
+Also identify:
+- data_start_row: the row where product data begins
+- date_axis_row: the row containing the sales date headers
+- year_boundary: true if sales dates span December and January
+
+COLUMNS:
+{cols_json}
+
+Respond with JSON only:
+{{
+  "data_start_row": 7,
+  "date_axis_row": 5,
+  "year_present": true,
+  "year_boundary": false,
+  "columns": [
+    {{"col": 1, "classification": "description", "confidence": "high", "reason": "one sentence", "has_embedded_supplier_sku": false}},
+    ...
+  ]
+}}"""
+
 # ─────────────────────────────────────────────
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
@@ -821,32 +1001,29 @@ async def advance_from_qualify(session_id: str):
 
 
 async def stage_locate_grid(session_id: str):
-    """Stage 2 — locate grid via AI layout analysis."""
-    session = _sessions[session_id]
-    session["stage"] = "locating"
+    """
+    Stage 2 — pure Python schema extraction.
+    Opens workbook with full fidelity (merges + borders).
+    Extracts per-column schema for all qualified sheets.
+    Then advances to Postgres SKU lookup.
+    """
+    session  = _sessions[session_id]
+    session["stage"]  = "locating"
     session["status"] = "running"
-    sheets = session["_sheets"]
+
+    # Need full workbook (not read-only) for merge + border detection
+    wb_full = openpyxl.load_workbook(io.BytesIO(session["_raw_data"]), data_only=True)
+    session["_schemas"] = {}
 
     for sheet_name in session["qualified_sheets"]:
-        rows = sheets[sheet_name]
-        prompt = build_grid_layout_prompt(sheet_name, session["filename"], rows)
+        if sheet_name not in wb_full.sheetnames:
+            session["grid"][sheet_name] = {"error": "Sheet not found in workbook"}
+            continue
+        ws     = wb_full[sheet_name]
+        schema = extract_column_schema(ws, sheet_name)
+        session["_schemas"][sheet_name] = schema
 
-        job_id = str(uuid.uuid4())
-        _jobs[job_id] = {
-            "session_id": session_id,
-            "stage":      "locate_grid",
-            "sheet_name": sheet_name,
-            "created_at": time.time(),
-        }
-        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
-        if err:
-            session["grid"][sheet_name] = {"error": f"Webhook error: {err}"}
-        else:
-            session["status"] = "awaiting_ai"
-            session["_pending_jobs"].add(job_id)
-
-    if not session["_pending_jobs"]:
-        await stage_identify_columns(session_id)
+    await stage_postgres_sku_lookup(session_id)
 
 
 async def stage_identify_columns(session_id: str):
@@ -933,6 +1110,105 @@ async def advance_from_postgres(session_id: str):
         await stage_identify_retailer(session_id)
 
 
+
+
+async def stage_postgres_sku_lookup(session_id: str):
+    """Stage 2b — Postgres SKU lookup on candidate column values from all sheets."""
+    session = _sessions[session_id]
+    session["stage"]  = "identifying"
+    session["status"] = "running"
+
+    # Collect all candidate values from non-sales_date column samples
+    col_candidates = {}
+    for sheet_name in session["qualified_sheets"]:
+        schema = session.get("_schemas", {}).get(sheet_name, {})
+        for col in schema.get("columns", []):
+            for val in col.get("sample_non_zero", []):
+                s = str(val).strip()
+                if s:
+                    col_candidates.setdefault(s, set()).add(col["col"])
+
+        # Also check embedded SKUs from detect_embedded_sku
+        rows = session["_sheets"].get(sheet_name, [])
+        schema_data = session.get("_schemas", {}).get(sheet_name, {})
+        data_start  = schema_data.get("data_start_row", 1) - 1
+        # Use all string-dominant columns as candidates
+        for col in schema_data.get("columns", []):
+            if "string" in col.get("data_types", []):
+                col_idx = col["col"] - 1  # 0-based
+                for r in range(data_start, min(data_start + 30, len(rows))):
+                    if col_idx < len(rows[r]) and isinstance(rows[r][col_idx], str):
+                        v = rows[r][col_idx].strip()
+                        if v:
+                            col_candidates.setdefault(v, set()).add(col["col"])
+
+    session["_col_candidates"] = {k: list(v) for k, v in col_candidates.items()}
+
+    candidates = sorted(col_candidates.keys())
+    sql, _ = build_sku_lookup_sql(candidates)
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "session_id": session_id,
+        "stage":      "postgres_sku",
+        "created_at": time.time(),
+    }
+    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    if err:
+        session["postgres_results"] = {"matches": [], "error": err}
+        await stage_schema_classify(session_id)
+    else:
+        session["status"] = "awaiting_postgres"
+        session["_pending_jobs"].add(job_id)
+
+
+async def stage_schema_classify(session_id: str):
+    """Stage 2c — AI classification using schema + Postgres matches."""
+    session = _sessions[session_id]
+    session["stage"]  = "locating"
+    session["status"] = "running"
+
+    pg_matches = session.get("postgres_results", {}).get("matches", [])
+    matched_values = set()
+    for row in pg_matches:
+        for field in ("inventory_sku", "base_variant", "base_model"):
+            v = row.get(field, "")
+            if v:
+                matched_values.add(v.upper())
+
+    for sheet_name in session["qualified_sheets"]:
+        schema = session.get("_schemas", {}).get(sheet_name, {})
+        if not schema:
+            session["grid"][sheet_name] = {"error": "No schema available"}
+            continue
+
+        # Annotate columns with postgres_matched
+        for col in schema.get("columns", []):
+            postgres_confirmed = any(
+                str(v).upper() in matched_values
+                for v in col.get("sample_non_zero", [])
+            )
+            col["postgres_matched"] = postgres_confirmed
+
+        prompt = build_schema_classify_prompt(schema, session["filename"])
+        job_id = str(uuid.uuid4())
+        _jobs[job_id] = {
+            "session_id": session_id,
+            "stage":      "schema_classify",
+            "sheet_name": sheet_name,
+            "schema":     schema,
+            "created_at": time.time(),
+        }
+        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+        if err:
+            session["grid"][sheet_name]           = {"error": f"Webhook error: {err}"}
+            session["column_mapping"][sheet_name] = []
+        else:
+            session["status"] = "awaiting_ai"
+            session["_pending_jobs"].add(job_id)
+
+    if not session["_pending_jobs"]:
+        await stage_identify_retailer(session_id)
 
 async def stage_identify_retailer(session_id: str):
     """Stage 3b — identify retailer by querying retailer_sku_map."""
@@ -1212,120 +1488,17 @@ async def stage_assemble(session_id: str):
 async def discovery_timeout_handler(sid: str, stage: str):
     """Handle timed-out discovery jobs."""
     session = _sessions[sid]
-    if stage == "locate_grid":
-        sheet_name = job["sheet_name"]
-        raw  = request_body
-        text = raw.get("text", "") or ""
-        if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
-            try:
-                result = json.loads(clean)
-            except:
-                result = {"error": f"Parse error: {text[:100]}"}
-        else:
-            result = raw
-
-        if "error" not in result:
-            rows       = session["_sheets"].get(sheet_name, [])
-            date_axis_row = result.get("date_axis_row", 0)
-            sales_cols    = result.get("sales_date_cols", [])
-            data_start    = result.get("data_start_row", 1)
-            inv_cols      = result.get("inventory_cols", [])
-            year_anchors  = result.get("year_anchors", [])
-
-            # Add filename year anchor if not present
-            for m in YEAR_RE.finditer(session["filename"]):
-                year_anchors.insert(0, {"source": "filename", "value": m.group(1)})
-
-            # Build sku_candidates from cols left of date axis
-            left_boundary  = min(sales_cols) if sales_cols else 0
-            candidates     = find_sku_candidates(rows, date_axis_row, sales_cols)
-            embedded       = detect_embedded_sku(rows, sales_cols, data_start)
-
-            # Also add inventory columns as candidates so classifier sees them
-            for inv_col in inv_cols:
-                col_idx = inv_col.get("col")
-                if col_idx is None:
-                    continue
-                col_vals = [
-                    rows[r][col_idx] for r in range(data_start, min(data_start + 50, len(rows)))
-                    if col_idx < len(rows[r]) and rows[r][col_idx] is not None
-                ]
-                if not col_vals:
-                    continue
-                types = [classify_cell(v) for v in col_vals]
-                type_counts = {}
-                for t in types:
-                    type_counts[t] = type_counts.get(t, 0) + 1
-                dominant = max(type_counts, key=type_counts.get)
-                fill_rate = round(len(col_vals) / min(50, len(rows) - data_start), 2)
-
-                # Get label from date axis row and row above
-                pre_strings = []
-                for label_row_idx in [date_axis_row - 1, date_axis_row]:
-                    if 0 <= label_row_idx < len(rows):
-                        lv = rows[label_row_idx][col_idx] if col_idx < len(rows[label_row_idx]) else None
-                        if lv and str(lv).strip():
-                            pre_strings.append({"row": label_row_idx, "value": str(lv).strip()})
-
-                candidates.append({
-                    "col":              col_idx,
-                    "pre_data_strings": pre_strings,
-                    "dominant_type":    dominant,
-                    "type_distribution": type_counts,
-                    "fill_rate":        fill_rate,
-                    "sample_values":    [str(v) for v in col_vals[:5]],
-                    "is_inventory_col": True,
-                })
-
-            # Build date_axis dict compatible with rest of pipeline
-            sample_vals = []
-            if date_axis_row < len(rows):
-                header_row = rows[date_axis_row]
-                for ci in sales_cols[:8]:
-                    if ci < len(header_row) and header_row[ci] is not None:
-                        sample_vals.append(str(header_row[ci]))
-
-            year_present = result.get("year_present", False)
-            date_axis = {
-                "row":                   date_axis_row,
-                "col_count":             len(sales_cols),
-                "cols":                  sales_cols,
-                "sample_values":         sample_vals,
-                "format":                result.get("date_axis_format", "mixed"),
-                "year_present":          year_present,
-                "interleaved_empty_cols": False,
-                "year_boundary_detected": result.get("year_boundary_detected", False),
-            }
-
-            session["grid"][sheet_name] = {
-                "date_axis":      date_axis,
-                "data_start_row": data_start,
-                "sku_candidates": candidates,
-                "embedded_sku":   embedded,
-                "year_anchors":   year_anchors[:6],
-                "inventory_cols": inv_cols,
-                "notes":          result.get("notes", ""),
-            }
-        else:
-            session["grid"][sheet_name] = {"error": result.get("error")}
-
-        if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_identify_columns, session_id)
-
-    elif stage == "locate_grid":
-        asyncio.create_task(stage_identify_columns(sid))
+    if stage == "schema_classify":
+        asyncio.create_task(stage_identify_retailer(sid))
+    elif stage == "postgres_sku":
+        session["postgres_results"] = {"matches": [], "error": "timed out"}
+        asyncio.create_task(stage_schema_classify(sid))
     elif stage == "dedup_check":
         asyncio.create_task(stage_qualify(sid))
     elif stage == "lookup_audit":
         asyncio.create_task(stage_qualify(sid))
     elif stage == "qualify":
         asyncio.create_task(advance_from_qualify(sid))
-    elif stage == "postgres_sku":
-        session["postgres_results"] = {"matches": [], "error": "timed out"}
-        asyncio.create_task(advance_from_postgres(sid))
-    elif stage == "classify_sheet":
-        asyncio.create_task(stage_identify_retailer(sid))
     elif stage == "identify_retailer":
         asyncio.create_task(stage_identify_retailer_ai(sid))
     elif stage == "identify_retailer_ai":
@@ -1378,8 +1551,9 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         session["status"] = "awaiting_ai"
 
     # Store result by stage
-    if stage == "locate_grid":
+    if stage == "schema_classify":
         sheet_name = job["sheet_name"]
+        schema     = job["schema"]
         raw  = request_body
         text = raw.get("text", "") or ""
         if isinstance(text, str):
@@ -1392,92 +1566,104 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             result = raw
 
         if "error" not in result:
-            rows       = session["_sheets"].get(sheet_name, [])
-            date_axis_row = result.get("date_axis_row", 0)
-            sales_cols    = result.get("sales_date_cols", [])
-            data_start    = result.get("data_start_row", 1)
-            inv_cols      = result.get("inventory_cols", [])
-            year_anchors  = result.get("year_anchors", [])
+            col_results   = result.get("columns", [])
+            data_start    = result.get("data_start_row", schema["data_start_row"])
+            date_axis_row = result.get("date_axis_row", data_start - 1)
+            year_present  = result.get("year_present", False)
+            year_boundary = result.get("year_boundary", False)
 
-            # Add filename year anchor if not present
-            for m in YEAR_RE.finditer(session["filename"]):
-                year_anchors.insert(0, {"source": "filename", "value": m.group(1)})
+            # Build sales_date_cols from columns classified as sales_date
+            sales_cols = [
+                c["col"] - 1  # convert to 0-based
+                for c in col_results
+                if c.get("classification") == "sales_date"
+            ]
 
-            # Build sku_candidates from cols left of date axis
-            left_boundary  = min(sales_cols) if sales_cols else 0
-            candidates     = find_sku_candidates(rows, date_axis_row, sales_cols)
-            embedded       = detect_embedded_sku(rows, sales_cols, data_start)
-
-            # Also add inventory columns as candidates so classifier sees them
-            for inv_col in inv_cols:
-                col_idx = inv_col.get("col")
-                if col_idx is None:
-                    continue
-                col_vals = [
-                    rows[r][col_idx] for r in range(data_start, min(data_start + 50, len(rows)))
-                    if col_idx < len(rows[r]) and rows[r][col_idx] is not None
-                ]
-                if not col_vals:
-                    continue
-                types = [classify_cell(v) for v in col_vals]
-                type_counts = {}
-                for t in types:
-                    type_counts[t] = type_counts.get(t, 0) + 1
-                dominant = max(type_counts, key=type_counts.get)
-                fill_rate = round(len(col_vals) / min(50, len(rows) - data_start), 2)
-
-                # Get label from date axis row and row above
-                pre_strings = []
-                for label_row_idx in [date_axis_row - 1, date_axis_row]:
-                    if 0 <= label_row_idx < len(rows):
-                        lv = rows[label_row_idx][col_idx] if col_idx < len(rows[label_row_idx]) else None
-                        if lv and str(lv).strip():
-                            pre_strings.append({"row": label_row_idx, "value": str(lv).strip()})
-
-                candidates.append({
-                    "col":              col_idx,
-                    "pre_data_strings": pre_strings,
-                    "dominant_type":    dominant,
-                    "type_distribution": type_counts,
-                    "fill_rate":        fill_rate,
-                    "sample_values":    [str(v) for v in col_vals[:5]],
-                    "is_inventory_col": True,
-                })
-
-            # Build date_axis dict compatible with rest of pipeline
+            # Build sample date values from header stack
+            col_schema_map = {c["col"]: c for c in schema["columns"]}
             sample_vals = []
-            if date_axis_row < len(rows):
-                header_row = rows[date_axis_row]
-                for ci in sales_cols[:8]:
-                    if ci < len(header_row) and header_row[ci] is not None:
-                        sample_vals.append(str(header_row[ci]))
+            for col_1based in sorted([c["col"] for c in col_results if c.get("classification") == "sales_date"])[:8]:
+                cs = col_schema_map.get(col_1based, {})
+                for h in cs.get("header_stack", []):
+                    if any(c.isdigit() for c in h["value"]):
+                        sample_vals.append(h["value"])
+                        break
 
-            year_present = result.get("year_present", False)
+            # Year anchors from filename
+            year_anchors = []
+            for m in YEAR_RE.finditer(session["filename"]):
+                year_anchors.append({"source": "filename", "value": m.group(1)})
+
             date_axis = {
-                "row":                   date_axis_row,
-                "col_count":             len(sales_cols),
-                "cols":                  sales_cols,
-                "sample_values":         sample_vals,
-                "format":                result.get("date_axis_format", "mixed"),
-                "year_present":          year_present,
+                "row":                    date_axis_row - 1,  # 0-based
+                "col_count":              len(sales_cols),
+                "cols":                   sales_cols,
+                "sample_values":          sample_vals,
+                "format":                 "mixed",
+                "year_present":           year_present,
                 "interleaved_empty_cols": False,
-                "year_boundary_detected": result.get("year_boundary_detected", False),
+                "year_boundary_detected": year_boundary,
             }
+
+            # Build sku_candidates from non-sales_date columns that have data
+            rows = session["_sheets"].get(sheet_name, [])
+            sku_candidates = []
+            for c in col_results:
+                if c.get("classification") not in ("sales_date",):
+                    col_0 = c["col"] - 1  # 0-based
+                    cs    = col_schema_map.get(c["col"], {})
+                    pre_strings = [
+                        {"row": h["row"] - 1, "value": h["value"]}
+                        for h in cs.get("header_stack", [])
+                    ]
+                    col_vals = [
+                        rows[r][col_0]
+                        for r in range(data_start - 1, min(data_start + 49, len(rows)))
+                        if col_0 < len(rows[r]) and rows[r][col_0] is not None
+                    ]
+                    types = {}
+                    for v in col_vals:
+                        t = classify_cell(v)
+                        types[t] = types.get(t, 0) + 1
+                    dominant = max(types, key=types.get) if types else "string"
+                    sku_candidates.append({
+                        "col":              col_0,
+                        "pre_data_strings": pre_strings,
+                        "dominant_type":    dominant,
+                        "type_distribution": types,
+                        "fill_rate":        round(len(col_vals) / 50, 2),
+                        "sample_values":    [str(v) for v in col_vals[:5]],
+                    })
+
+            # Detect embedded SKUs in description columns
+            embedded = detect_embedded_sku(rows, sales_cols, data_start - 1)
 
             session["grid"][sheet_name] = {
                 "date_axis":      date_axis,
-                "data_start_row": data_start,
-                "sku_candidates": candidates,
+                "data_start_row": data_start - 1,  # 0-based
+                "sku_candidates": sku_candidates,
                 "embedded_sku":   embedded,
                 "year_anchors":   year_anchors[:6],
-                "inventory_cols": inv_cols,
-                "notes":          result.get("notes", ""),
             }
+
+            # Column mapping — convert 1-based cols to 0-based, store all non-sales-date
+            session["column_mapping"][sheet_name] = [
+                {
+                    "col":                  c["col"] - 1,
+                    "classification":       c["classification"],
+                    "confidence":           c.get("confidence", "high"),
+                    "reason":               c.get("reason", ""),
+                    "has_embedded_supplier_sku": c.get("has_embedded_supplier_sku", False),
+                }
+                for c in col_results
+                if c.get("classification") != "sales_date"
+            ]
         else:
-            session["grid"][sheet_name] = {"error": result.get("error")}
+            session["grid"][sheet_name]           = {"error": result.get("error")}
+            session["column_mapping"][sheet_name] = []
 
         if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_identify_columns, session_id)
+            background_tasks.add_task(stage_identify_retailer, session_id)
 
     elif stage == "dedup_check":
         rows = request_body.get("matches", [])
@@ -1522,7 +1708,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
     elif stage == "postgres_sku":
         session["postgres_results"] = request_body
         if not session["_pending_jobs"]:
-            background_tasks.add_task(advance_from_postgres, session_id)
+            background_tasks.add_task(stage_schema_classify, session_id)
 
     elif stage == "classify_sheet":
         sheet_name = job["sheet_name"]
@@ -1687,7 +1873,7 @@ async def analyze(
         "status":           "running",
         "filename":         upload.filename,
         "file_hash":        fhash,
-        "file_audit_id":    file_audit_id,  # may be overridden by hash lookup
+        "file_audit_id":    file_audit_id,
         "retailer":         None,
         "qualified_sheets": [],
         "qualify_results":  {},
@@ -1699,6 +1885,7 @@ async def analyze(
         "errors":           [],
         "result":           None,
         "_sheets":          sheets,
+        "_raw_data":        data,   # kept for schema extraction (needs borders/merges)
         "_pending_jobs":    set(),
         "created_at":       time.time(),
     }
