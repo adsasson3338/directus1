@@ -567,7 +567,10 @@ def build_insert_retailer_config_sql(retailer: str, file_audit_id: str,
     """
     Insert a pending_review config row for a newly identified retailer.
     """
-    def safe(v): return json.dumps(v).replace("'", "''")
+    qs = sql_escape(json.dumps(discovery_result.get("qualified_sheets", [])))
+    cm = sql_escape(json.dumps(discovery_result.get("column_mapping", {})))
+    dc = sql_escape(json.dumps(discovery_result.get("date_config", {})))
+    fl = sql_escape(json.dumps(discovery_result.get("flags", {})))
 
     return f"""
 INSERT INTO retailer_configs (
@@ -576,10 +579,10 @@ INSERT INTO retailer_configs (
 )
 VALUES (
     '{retailer}', 'pending_review', 1, '{file_audit_id}',
-    '{safe(discovery_result.get("qualified_sheets", []))}'::jsonb,
-    '{safe(discovery_result.get("column_mapping", {}))}'::jsonb,
-    '{safe(discovery_result.get("date_config", {}))}'::jsonb,
-    '{safe(discovery_result.get("flags", {}))}'::jsonb
+    '{qs}'::jsonb,
+    '{cm}'::jsonb,
+    '{dc}'::jsonb,
+    '{fl}'::jsonb
 )
 ON CONFLICT DO NOTHING
 """.strip()
@@ -650,17 +653,22 @@ WHERE UPPER(retailer) = UPPER('{retailer_safe}')
 """.strip()
 
 
+def sql_escape(v) -> str:
+    """Escape a value for safe inline SQL embedding."""
+    return str(v).replace("\\", "\\\\").replace("'", "''")
+
+
 def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       retailer: str | None, status: str,
                                       file_set_key: str | None,
                                       file_hash: str | None = None,
                                       filename: str | None = None) -> str:
     """Update file_audit with discovery result, retailer, status, file_set_key, hash and filename."""
-    result_json  = json.dumps(discovery_result).replace("'", "''")
-    retailer_val = f"'{retailer}'" if retailer else "NULL"
-    key_val      = f"'{file_set_key}'" if file_set_key else "NULL"
+    result_json  = sql_escape(json.dumps(discovery_result))
+    retailer_val = f"'{sql_escape(retailer)}'" if retailer else "NULL"
+    key_val      = f"'{sql_escape(file_set_key)}'" if file_set_key else "NULL"
     hash_val     = f"'{file_hash}'" if file_hash else "NULL"
-    fname_val    = f"'{filename.replace(chr(39), chr(39)*2)}'" if filename else "NULL"
+    fname_val    = f"'{sql_escape(filename)}'" if filename else "NULL"
     return f"""
 UPDATE file_audit
 SET discovery_result = '{result_json}'::jsonb,
