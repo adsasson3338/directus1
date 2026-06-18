@@ -54,6 +54,14 @@ def is_date_like(val) -> bool:
     )
 
 
+
+EMBEDDED_PATTERNS = [
+    ("integer_dash_description",        re.compile(r'^(\d{4,10})\s*[-–]\s*(.{3,})$')),
+    ("alphanumeric_space_description",  re.compile(r'^([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s+(.{3,})$', re.IGNORECASE)),
+    ("description_space_alphanumeric",  re.compile(r'^(.{3,})\s{2,}([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s*$', re.IGNORECASE)),
+    ("description_space_nodash_sku",    re.compile(r'^(.{5,})\s+([A-Z]{2,}\d{3,})\s*$', re.IGNORECASE)),
+]
+
 # ─────────────────────────────────────────────
 # GRID DETECTION
 # ─────────────────────────────────────────────
