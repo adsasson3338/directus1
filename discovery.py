@@ -1609,11 +1609,22 @@ async def stage_date_config(session_id: str):
         # Year is present — no AI needed
         if date_axis.get("year_present"):
             year_value = None
+            # First try year anchors
             for a in anchors:
                 y = str(a.get("value", ""))[:4]
                 if y.isdigit():
                     year_value = int(y)
                     break
+            # If no anchors, extract from sample date values (e.g. "01/03/26" → 2026)
+            if not year_value:
+                for sample in date_axis.get("sample_values", []):
+                    parts = str(sample).replace("-", "/").split("/")
+                    if len(parts) >= 3:
+                        y = parts[-1].strip()[:4]
+                        if y.isdigit():
+                            yr = int(y)
+                            year_value = 2000 + yr if yr < 100 else yr
+                            break
             session["date_config"][sheet_name] = {
                 "date_format":            date_axis["format"],
                 "year_present":           True,
