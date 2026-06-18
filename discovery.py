@@ -569,7 +569,7 @@ def sql_escape(v) -> str:
 
 def json_safe(v) -> str:
     """Serialize to JSON with unicode preserved, then SQL-escape."""
-    return json_safe(v, ensure_ascii=False)
+    return sql_escape(json.dumps(v, ensure_ascii=False))
 
 
 def build_insert_retailer_config_sql(retailer: str, file_audit_id: str,
