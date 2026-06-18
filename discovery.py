@@ -908,15 +908,17 @@ Sales date columns are a consecutive block with:
 - The block ENDS when the section label changes (e.g. "INV", "Total", "On Order") or a non-date value appears
 
 Identify:
-1. date_axis_row: row number (1-based) containing the actual date values
-2. section_label_row: row number (1-based) containing section labels like "Sales" above date cols (null if none)
-3. sales_section_label: the text that appears above sales columns (e.g. "Sales", null if no label)
-4. stop_labels: list of labels that signal the END of the sales block (e.g. ["INV", "Total", "On Order"])
-5. first_sales_col: column number (1-based) of the FIRST sales date column
-6. date_format: pattern description e.g. "MM/DD/YY", "MM/DD-MM/DD", "Mon Wk N"
-7. data_start_row: first row (1-based) with actual product data
-8. year_present: true only if year is embedded in the date values themselves
+1. date_axis_row: row number (1-based) of the row containing the ACTUAL DATE VALUES like "01/03/26", "12/21-12/27", "Feb Wk 1" — NOT the column label row with text like "SKU Number" or "Business Unit"
+2. section_label_row: row number (1-based) containing section group labels like "Sales" or "INV" ABOVE the date row (null if none)
+3. sales_section_label: the exact label above the SALES date columns (e.g. "Sales", null if no label)
+4. stop_labels: exact labels that signal the END of the sales block (e.g. ["INV", "TOTAL", "On Order"])
+5. first_sales_col: column number (1-based) of the FIRST column containing a sales date value
+6. date_format: pattern e.g. "MM/DD/YY", "MM/DD-MM/DD", "Mon Wk N"
+7. data_start_row: first row (1-based) with actual product/SKU data
+8. year_present: true only if a year is embedded in the date values themselves
 9. year_boundary: true if dates span December and January
+
+IMPORTANT: date_axis_row is the row with actual date/week values, not text labels.
 
 Respond with JSON only:
 {{
