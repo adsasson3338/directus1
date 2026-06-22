@@ -682,7 +682,7 @@ def build_date_schema_prompt(schema: dict, filename: str) -> str:
         for col in schema.get("columns", []):
             val = ""
             for h in col.get("header_stack", []):
-                if h["row"] == row_num - 1:  # convert to 0-based
+                if h["row"] == row_num:  # both are 1-based
                     val = h["value"][:15]
                     break
             if val:
@@ -739,7 +739,7 @@ def detect_date_axis_row(schema: dict) -> int:
     row_date_counts = {}
     for col in schema.get("columns", []):
         for h in col.get("header_stack", []):
-            row = h["row"] + 1  # 1-based
+            row = h["row"]  # already 1-based
             val = str(h.get("value", "")).strip()
             if (re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", val) or
                 re.match(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$", val) or
@@ -769,7 +769,7 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     col_headers = {}
     for col in schema.get("columns", []):
         col_num = col["col"]
-        headers = {h["row"] + 1: h["value"] for h in col.get("header_stack", [])}  # 1-based
+        headers = {h["row"]: h["value"] for h in col.get("header_stack", [])}  # already 1-based
         col_headers[col_num] = headers
 
     # Date matching patterns
