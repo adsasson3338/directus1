@@ -497,7 +497,10 @@ Filename: {filename}
 Sheet names: {sheets}
 Header strings found in sheets: {header_strings[:20]}
 
-Based on these clues, identify the retailer. If you cannot determine it with reasonable confidence, return null.
+Only identify the retailer if the clues EXPLICITLY mention the retailer name or a well-known retailer-specific identifier (e.g. "Walgreens", "WIC#", "DPCI", "Staples").
+
+DO NOT GUESS. If the retailer name is not explicitly present in the filename, sheet names, or headers, return null.
+A generic filename like "D56_FCSTs_2026.xlsx" with no retailer name is NOT sufficient — return null.
 
 Respond with JSON only:
 {{"retailer": "retailer name or null", "confidence": "high/medium/low", "reason": "one sentence"}}"""
