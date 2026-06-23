@@ -268,6 +268,7 @@ def extract_sales_and_inventory(
     sku_supplier   = {}  # retailer_sku -> supplier_sku
     inventory_map  = {}  # retailer_sku -> {on_hand_qty, open_order_qty}
     unresolved     = set()
+    inv_as_of_date = None  # most recent inventory snapshot date from column headers
 
     for sheet_name in qualified_sheets:
         if sheet_name not in wb.sheetnames:
@@ -310,6 +311,14 @@ def extract_sales_and_inventory(
 
         if not date_axis or retailer_sku_col is None:
             continue
+
+        # Extract inventory snapshot date from column headers above data_start
+        if inventory_col is not None:
+            for hrow_idx in range(min(data_start, len(rows))):
+                if inventory_col < len(rows[hrow_idx]) and rows[hrow_idx][inventory_col]:
+                    parsed = parse_date_value(str(rows[hrow_idx][inventory_col]).strip(), dc)
+                    if parsed and (inv_as_of_date is None or str(parsed) > inv_as_of_date):
+                        inv_as_of_date = str(parsed)
 
         date_axis_row = date_axis.get("row", 0)
         date_col_idxs = date_axis.get("cols", [])
@@ -402,6 +411,7 @@ def extract_sales_and_inventory(
         "sales":           sales_rows,
         "inventory":       inventory_rows,
         "unresolved_skus": sorted(unresolved),
+        "inv_as_of_date":  inv_as_of_date,
     }
 
 
@@ -573,9 +583,12 @@ async def stage_process_files(session_id: str):
 
         all_unresolved.update(extracted["unresolved_skus"])
 
-        # Track as_of_date — use most recent week_ending from extracted sales
-        for row in extracted["sales"]:
-            as_of_dates.append(row["week_ending"])
+        # Track as_of_date — prefer inventory column header date, fall back to latest sales week
+        if extracted.get("inv_as_of_date"):
+            as_of_dates.append(extracted["inv_as_of_date"])
+        else:
+            for row in extracted["sales"]:
+                as_of_dates.append(row["week_ending"])
 
     # Rebuild sales rows with supplier SKU
     sku_supplier = session.get("_sku_supplier", {})
@@ -841,11 +854,15 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
 
     elif stage == "write_sales_batch":
         if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_write_inventory, session_id)
+            if not session.get("_inventory_started"):
+                session["_inventory_started"] = True
+                background_tasks.add_task(stage_write_inventory, session_id)
 
     elif stage == "write_inventory_batch":
         if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_write_inventory, session_id)
+            if not session.get("_finalize_started"):
+                session["_finalize_started"] = True
+                background_tasks.add_task(stage_finalize, session_id)
 
     elif stage == "finalize_audit":
         if not session["_pending_jobs"]:
