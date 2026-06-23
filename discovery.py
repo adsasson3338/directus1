@@ -22,6 +22,21 @@ from shared import (
     register_discovery_timeout_handler,
 )
 
+# ─────────────────────────────────────────────
+# AI RESPONSE PARSER
+# ─────────────────────────────────────────────
+
+def parse_ai_response(text: str) -> str:
+    """Strip thinking blocks and code fences from AI response before JSON parsing."""
+    if not isinstance(text, str):
+        return text
+    # Strip <think>...</think> blocks (Qwen and other thinking models)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # Strip ```json and ``` fences
+    text = text.replace("```json", "").replace("```", "")
+    return text.strip()
+
+
 router = APIRouter()
 
 # ─────────────────────────────────────────────
@@ -1429,7 +1444,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         raw  = request_body
         text = raw.get("text", "") or ""
         if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
+            clean = parse_ai_response(text)
             try:
                 date_schema = json.loads(clean)
             except:
@@ -1483,7 +1498,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         raw  = request_body
         text = raw.get("text", "") or ""
         if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
+            clean = parse_ai_response(text)
             try:
                 result = json.loads(clean)
             except:
@@ -1652,7 +1667,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         # Parse AI response
         text = raw.get("text", "") or raw.get("response", "") or ""
         if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
+            clean = parse_ai_response(text)
             try:
                 verdict = json.loads(clean)
             except:
@@ -1676,7 +1691,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         raw = request_body
         text = raw.get("text", "") or ""
         if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
+            clean = parse_ai_response(text)
             try:
                 result = json.loads(clean)
             except:
@@ -1707,7 +1722,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
         raw = request_body
         text = raw.get("text", "") or ""
         if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
+            clean = parse_ai_response(text)
             try:
                 result = json.loads(clean)
             except:
