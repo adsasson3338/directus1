@@ -340,7 +340,7 @@ def extract_sales_and_inventory(
             if retailer_sku_col >= len(row) or row[retailer_sku_col] is None:
                 continue
 
-            rsku = str(row[retailer_sku_col]).strip()
+            rsku = str(row[retailer_sku_col]).strip().strip("\r\n")
             if not rsku or rsku.lower() in ("total", "grand total", "subtotal", ""):
                 continue
 
