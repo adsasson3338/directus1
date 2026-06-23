@@ -490,7 +490,7 @@ async def stage_fetch_audit_rows(session_id: str):
             "created_at": time.time(),
             "pipeline":   "ingestion",
         }
-        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
             session["errors"].append(f"Failed to fetch audit row {audit_id}: {err}")
         else:
@@ -506,7 +506,7 @@ async def stage_fetch_audit_rows(session_id: str):
             "created_at": time.time(),
             "pipeline":   "ingestion",
         }
-        err = fire_webhook(N8N_FETCH_FILE_WEBHOOK, file_job_id, {"file_audit_id": audit_id})
+        err = await fire_webhook(N8N_FETCH_FILE_WEBHOOK, file_job_id, {"file_audit_id": audit_id})
         if err:
             session["errors"].append(f"Failed to fetch file binary for {audit_id}: {err}")
         else:
@@ -639,7 +639,7 @@ async def stage_lookup_supplier_skus(session_id: str):
         "created_at": time.time(),
         "pipeline":   "ingestion",
     }
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         session["errors"].append(f"Failed to look up supplier SKUs: {err}")
         await stage_create_table(session_id)
@@ -662,7 +662,7 @@ async def stage_create_table(session_id: str):
         "created_at": time.time(),
             "pipeline":  "ingestion",
         }
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         session["errors"].append(f"Failed to create sales table: {err}")
         await stage_write_sales(session_id)
@@ -699,7 +699,7 @@ async def stage_write_sales(session_id: str):
             "created_at": time.time(),
             "pipeline":  "ingestion",
         }
-        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
             session["errors"].append(f"Failed to write sales batch {i}: {err}")
         else:
@@ -738,7 +738,7 @@ async def stage_write_inventory(session_id: str):
             "created_at": time.time(),
             "pipeline":  "ingestion",
         }
-        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
             session["errors"].append(f"Failed to write inventory batch {i}: {err}")
         else:
@@ -764,7 +764,7 @@ async def stage_finalize(session_id: str):
             "created_at": time.time(),
             "pipeline":  "ingestion",
         }
-        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
             session["errors"].append(f"Failed to update audit status: {err}")
         else:
