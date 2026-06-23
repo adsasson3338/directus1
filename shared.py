@@ -30,14 +30,18 @@ _jobs: dict     = {}  # job_id -> {session_id, stage, pipeline, ...}
 # WEBHOOK HELPER
 # ─────────────────────────────────────────────
 
-def fire_webhook(url: str, job_id: str, payload: dict) -> str | None:
+async def fire_webhook(url: str, job_id: str, payload: dict) -> str | None:
+    """Fire a webhook without blocking the event loop."""
     body = json.dumps({"job_id": job_id, **payload}).encode()
-    try:
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
-        return None
-    except Exception as e:
-        return str(e)
+    def _send():
+        try:
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+            return None
+        except Exception as e:
+            return str(e)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _send)
 
 # ─────────────────────────────────────────────
 # DATE HELPER
@@ -98,7 +102,7 @@ async def cleanup_stale_jobs():
             elif _discovery_timeout_handler:
                 await _discovery_timeout_handler(sid, stage)
 
-        # Expire stale sessions
+        # Expire stale in-progress sessions
         stale_session_ids = [
             sid for sid, s in list(_sessions.items())
             if now - s.get("created_at", now) > SESSION_TIMEOUT_SECONDS
@@ -109,3 +113,14 @@ async def cleanup_stale_jobs():
             session["stage"]  = "failed"
             session["status"] = "failed"
             session["result"] = {"error": "Session timed out", "errors": session.get("errors", [])}
+
+        # Evict completed/failed sessions after grace period (15 min)
+        # Prevents memory leak — each session holds full workbook bytes
+        GRACE_SECONDS = 900
+        evict_ids = [
+            sid for sid, s in list(_sessions.items())
+            if s.get("status") in ("complete", "failed")
+            and now - s.get("created_at", now) > GRACE_SECONDS
+        ]
+        for sid in evict_ids:
+            _sessions.pop(sid, None)
