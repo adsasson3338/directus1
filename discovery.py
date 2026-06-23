@@ -178,11 +178,6 @@ def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
     return embedded_candidates
 
 
-def normalize_to_saturday(d: date) -> date:
-    """Return the Saturday of the week containing d (Mon=0, Sat=5)."""
-    days_to_saturday = (5 - d.weekday()) % 7
-    return d + timedelta(days=days_to_saturday)
-
 
 # ─────────────────────────────────────────────
 # QUALIFY SIGNALS
@@ -308,74 +303,6 @@ WHERE UPPER(inventory_sku) = ANY(ARRAY[{quoted}]::text[])
 # ─────────────────────────────────────────────
 # COLUMN CLASSIFY PROMPT
 # ─────────────────────────────────────────────
-
-def build_column_classify_prompt(sheet_name: str, sku_candidates: list,
-                                  embedded_sku: list, postgres_matches: list,
-                                  col_candidates: dict) -> str:
-    """
-    Build a single prompt to classify all columns in a sheet.
-    AI receives full context: columns, Postgres matches, embedded SKU detections.
-    """
-    matched_values = set()
-    for row in postgres_matches:
-        for field in ("inventory_sku", "base_variant", "base_model"):
-            v = row.get(field, "")
-            if v:
-                matched_values.add(v.upper())
-
-    cols_info = []
-    for col in sku_candidates:
-        col_idx = col["col"]
-        # For inventory cols use first label (semantic), for others use last (closest header)
-        pre_strings = col.get("pre_data_strings", [])
-        if col.get("is_inventory_col") and pre_strings:
-            label = pre_strings[0].get("value", "")
-        else:
-            label = pre_strings[-1].get("value", "") if pre_strings else ""
-        samples = col.get("sample_values", [])
-        postgres_confirmed = any(str(v).upper() in matched_values for v in samples)
-
-        emb_matches = []
-        for emb in embedded_sku:
-            if emb["col"] == col_idx:
-                for ext in emb.get("extractions", []):
-                    sku = ext.get("sku", "")
-                    if sku.upper() in matched_values:
-                        emb_matches.append(sku)
-
-        cols_info.append({
-            "col":                  col_idx,
-            "label":                label,
-            "dominant_type":        col.get("dominant_type"),
-            "sample_values":        samples,
-            "postgres_matched":     postgres_confirmed,
-            "embedded_sku_matches": emb_matches,
-        })
-
-    return f"""You are classifying columns in a retail sales spreadsheet sheet named "{sheet_name}".
-
-For each column, classify it as one of:
-- retailer_sku: the retailer's product identifier (WIC#, DPCI, Item#, UPC etc)
-- supplier_sku: the supplier's internal SKU or style code
-- description: product name or description text (may contain embedded supplier SKU)
-- cost: unit cost or wholesale price
-- retail_price: retail selling price
-- inventory: stock quantities
-- other: anything else
-
-postgres_matched means the column's values were found in the supplier inventory database.
-embedded_sku_matches lists supplier SKUs extracted from a description column that matched the inventory database.
-
-COLUMNS:
-{json.dumps(cols_info, indent=2)}
-
-Respond with JSON only:
-{{
-  "columns": [
-    {{"col": 0, "classification": "type", "confidence": "high/medium/low", "reason": "one sentence", "has_embedded_supplier_sku": true/false}},
-    ...
-  ]
-}}"""
 
 
 def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str,
@@ -1006,40 +933,6 @@ async def stage_locate_grid(session_id: str):
     await stage_postgres_sku_lookup(session_id)
 
 
-async def advance_from_postgres(session_id: str):
-    """After Postgres results — one AI call per sheet to classify all columns."""
-    session = _sessions[session_id]
-    pg      = session.get("postgres_results", {})
-
-    for sheet_name in session["qualified_sheets"]:
-        grid          = session["grid"].get(sheet_name, {})
-        sku_candidates = grid.get("sku_candidates", [])
-        embedded_sku   = grid.get("embedded_sku", [])
-        matches        = pg.get("matches", [])
-
-        prompt = build_column_classify_prompt(
-            sheet_name, sku_candidates, embedded_sku, matches,
-            session.get("_col_candidates", {})
-        )
-
-        job_id = str(uuid.uuid4())
-        _jobs[job_id] = {
-            "session_id": session_id,
-            "stage":      "classify_sheet",
-            "sheet_name": sheet_name,
-            "created_at": time.time(),
-        }
-
-        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
-        if err:
-            session["column_mapping"][sheet_name] = {"error": f"Webhook error: {err}"}
-        else:
-            session["status"] = "awaiting_ai"
-            session["_pending_jobs"].add(job_id)
-
-    if not session["_pending_jobs"]:
-        await stage_identify_retailer(session_id)
-
 
 
 
@@ -1453,58 +1346,26 @@ async def discovery_timeout_handler(sid: str, stage: str):
     """Handle timed-out discovery jobs."""
     session = _sessions[sid]
     if stage == "date_schema":
-        # Pass 1 response — AI identified date column pattern
-        sheet_name = job["sheet_name"]
-        schema     = job["schema"]
-        raw  = request_body
-        text = raw.get("text", "") or ""
-        if isinstance(text, str):
-            clean = text.replace("```json", "").replace("```", "").strip()
-            try:
-                date_schema = json.loads(clean)
-            except:
-                date_schema = {"error": f"Parse error: {text[:100]}"}
-        else:
-            date_schema = raw
-
-        if "error" not in date_schema:
-            # Python enumerates all sales date columns from the pattern
-            sales_cols_1based = find_sales_cols_from_schema(schema, date_schema)
-            sales_cols_0based = [c - 1 for c in sales_cols_1based]
-
-            # Store for use in Pass 2
-            session.setdefault("_date_schemas", {})[sheet_name] = date_schema
-            session.setdefault("_sales_cols", {})[sheet_name] = sales_cols_0based
-
-            # Fire Pass 2 — column classification
-            matched_values = session.get("_matched_values", set())
-            prompt = build_column_classify_prompt(schema, session["filename"],
-                                                   sales_cols_1based, matched_values)
-            job_id2 = str(uuid.uuid4())
-            _jobs[job_id2] = {
-                "session_id": session_id,
-                "stage":      "schema_classify",
-                "sheet_name": sheet_name,
-                "schema":     schema,
-                "date_schema": date_schema,
-                "sales_cols": sales_cols_0based,
-                "created_at": time.time(),
-            }
-            err = fire_webhook(N8N_AI_WEBHOOK, job_id2, {"prompt": prompt})
-            if err:
+        # Pass 1 timed out — we don't have the job payload here, so we can't
+        # attempt Pass 2. Mark affected sheets as failed and advance the pipeline.
+        for sheet_name in list(session.get("qualified_sheets", [])):
+            if sheet_name not in session.get("_date_schemas", {}):
+                session["grid"].pop(sheet_name, None)
                 session["column_mapping"][sheet_name] = []
-                session.setdefault("errors", []).append(f"Column classify webhook error: {err}")
-            else:
-                session["status"] = "awaiting_ai"
-                session["_pending_jobs"].add(job_id2)
+                session.setdefault("errors", []).append(
+                    f"date_schema timed out for sheet '{sheet_name}' — skipped"
+                )
+                session["qualified_sheets"] = [
+                    s for s in session["qualified_sheets"] if s != sheet_name
+                ]
+        if not session.get("qualified_sheets"):
+            session["stage"]  = "complete"
+            session["status"] = "complete"
+            session["result"] = {"status": "no_sales_data", "qualify_results": session.get("qualify_results", {})}
         else:
-            session["grid"][sheet_name]           = {"error": date_schema.get("error")}
-            session["column_mapping"][sheet_name] = []
+            asyncio.create_task(stage_identify_retailer(sid))
 
-        if not session["_pending_jobs"]:
-            background_tasks.add_task(stage_identify_retailer, session_id)
-
-    elif stage in ("schema_classify", "date_schema"):
+    elif stage == "schema_classify":
         asyncio.create_task(stage_identify_retailer(sid))
 
     elif stage == "dedup_check":
@@ -1998,23 +1859,6 @@ async def analyze(
         "session_id": session_id,
         "sheets":     list(sheets.keys()),
         "poll_url":   f"/analyze/status/{session_id}",
-    })
-
-
-# moved below
-async def analyze_status(session_id: str):
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-
-    session = _sessions[session_id]
-
-    # Don't expose internal state
-    return JSONResponse(content={
-        "session_id": session_id,
-        "stage":      session.get("stage", "unknown"),
-        "status":     session.get("status", "unknown"),
-        "filename":   session["filename"],
-        "result":     session["result"],
     })
 
 
