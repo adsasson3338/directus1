@@ -862,7 +862,7 @@ async def stage_qualify(session_id: str):
             "signals":    signals,
             "created_at": time.time(),
         }
-        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+        err = await fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
         if err:
             session["qualify_results"][sheet_name] = {
                 "disqualified": None,
@@ -986,7 +986,7 @@ async def stage_postgres_sku_lookup(session_id: str):
         "stage":      "postgres_sku",
         "created_at": time.time(),
     }
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         session["postgres_results"] = {"matches": [], "error": err}
         await stage_schema_classify(session_id)
@@ -1041,7 +1041,7 @@ async def stage_schema_classify(session_id: str):
             "schema":     schema,
             "created_at": time.time(),
         }
-        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+        err = await fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
         if err:
             session["grid"][sheet_name]           = {"error": f"Webhook error: {err}"}
             session["column_mapping"][sheet_name] = []
@@ -1091,7 +1091,7 @@ async def stage_identify_retailer(session_id: str):
         "created_at": time.time(),
     }
 
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         await stage_identify_retailer_ai(session_id)
     else:
@@ -1128,7 +1128,7 @@ async def stage_identify_retailer_ai(session_id: str):
         "created_at": time.time(),
     }
 
-    err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+    err = await fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
     if err:
         session["retailer"] = None
         session["flags"]["retailer_identification"] = f"ai_webhook_error: {err}"
@@ -1159,7 +1159,7 @@ async def stage_write_audit(session_id: str):
             "stage":      "query_config",
             "created_at": time.time(),
         }
-        err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+        err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
         if err:
             session["errors"].append(f"Failed to query retailer config: {err}")
             await stage_finalize_audit(session_id, file_set_size=1)
@@ -1216,7 +1216,7 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
         "file_set_size": file_set_size,
         "created_at":   time.time(),
     }
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
+    err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": sql, "params": []})
     if err:
         session["errors"].append(f"Failed to write to file_audit: {err}")
         await stage_assemble(session_id)
@@ -1288,7 +1288,7 @@ async def stage_date_config(session_id: str):
             "sheet_name": sheet_name,
             "date_axis":  date_axis,
         }
-        err = fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
+        err = await fire_webhook(N8N_AI_WEBHOOK, job_id, {"prompt": prompt})
         if err:
             session["date_config"][sheet_name] = {"error": f"Webhook error: {err}"}
         else:
@@ -1460,7 +1460,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                 "sales_cols": sales_cols_0based,
                 "created_at": time.time(),
             }
-            err = fire_webhook(N8N_AI_WEBHOOK, job_id2, {"prompt": prompt})
+            err = await fire_webhook(N8N_AI_WEBHOOK, job_id2, {"prompt": prompt})
             if err:
                 session["column_mapping"][sheet_name] = []
                 session.setdefault("errors", []).append(f"Column classify webhook error: {err}")
@@ -1755,7 +1755,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                 "stage":      "write_config",
                 "created_at": time.time(),
             }
-            err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id2, {"sql": sql, "params": []})
+            err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id2, {"sql": sql, "params": []})
             if err:
                 session["errors"].append(f"Failed to write retailer_config: {err}")
                 background_tasks.add_task(stage_assemble, session_id)
@@ -1842,7 +1842,7 @@ async def analyze(
         "file_audit_id": file_audit_id,  # may be None
         "created_at":    time.time(),
     }
-    err = fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": dedup_sql, "params": []})
+    err = await fire_webhook(N8N_POSTGRES_WEBHOOK, job_id, {"sql": dedup_sql, "params": []})
     if err:
         # Can't check — proceed anyway
         background_tasks.add_task(stage_qualify, session_id)
