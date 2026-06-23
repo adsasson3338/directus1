@@ -194,6 +194,7 @@ ON CONFLICT (retailer_sku, week_ending)
 DO UPDATE SET
     units_sold    = EXCLUDED.units_sold,
     file_audit_id = EXCLUDED.file_audit_id
+WHERE {table}.locked = false
 """.strip()
 
 
