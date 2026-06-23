@@ -80,14 +80,16 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
         except:
             return None
 
-    # fiscal_week_label: "Feb Wk 1", "Mar Wk 2"
-    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*(\d+)$', s, re.IGNORECASE)
+    # fiscal_week_label: "Feb Wk 1", "Mar Wk 2", "Sept Wk 1"
+    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$', s, re.IGNORECASE)
     if m:
-        month_num = MONTH_MAP[m.group(1).lower()]
+        month_num = MONTH_MAP[m.group(1).lower()[:3]]   # slice to 3 chars: "sept" -> "sep"
         week_num  = int(m.group(2))
-        # Approximate: first day of month + (week_num-1)*7 days, then normalize to Saturday
+        # Year boundary: Jan weeks on a Dec->Jan spanning file belong to year+1
+        year_boundary = date_config.get("year_boundary_detected", False)
+        effective_year = (year + 1) if (year_boundary and month_num == 1) else year
         try:
-            first_of_month = date(year, month_num, 1)
+            first_of_month = date(effective_year, month_num, 1)
             approx = first_of_month + timedelta(days=(week_num - 1) * 7)
             return normalize_to_saturday(approx)
         except:
@@ -184,7 +186,7 @@ INSERT INTO {table} (retailer_sku, supplier_sku, week_ending, units_sold, file_a
 VALUES {values_str}
 ON CONFLICT (retailer_sku, week_ending)
 DO UPDATE SET
-    units_sold    = {table}.units_sold + EXCLUDED.units_sold,
+    units_sold    = EXCLUDED.units_sold,
     file_audit_id = EXCLUDED.file_audit_id
 """.strip()
 
@@ -281,6 +283,8 @@ def extract_sales_and_inventory(
         open_order_col    = None
         date_cols         = []
 
+        inventory_candidates = []  # collect all inventory cols to pick best one
+
         for col_info in mapping:
             classification = col_info.get("classification")
             col_idx        = col_info.get("col")
@@ -291,7 +295,19 @@ def extract_sales_and_inventory(
             elif classification == "description":
                 description_col = col_idx
             elif classification == "inventory":
-                inventory_col = col_idx
+                inventory_candidates.append(col_info)
+            elif classification == "open_order":
+                open_order_col = col_idx
+
+        # Pick the best inventory column:
+        # prefer one whose header contains "total", otherwise take the last one
+        if inventory_candidates:
+            total_inv = next(
+                (c for c in inventory_candidates
+                 if "total" in c.get("reason", "").lower()),
+                None
+            )
+            inventory_col = (total_inv or inventory_candidates[-1])["col"]
 
         # Find date axis from grid
         grid       = discovery_result.get("grid", {}).get(sheet_name, {})
@@ -342,6 +358,14 @@ def extract_sales_and_inventory(
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     inv = inventory_map.get(rsku, {"on_hand_qty": 0, "open_order_qty": 0})
                     inv["on_hand_qty"] = int(v)
+                    inventory_map[rsku] = inv
+
+            # Open orders
+            if open_order_col is not None and open_order_col < len(row):
+                v = row[open_order_col]
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    inv = inventory_map.get(rsku, {"on_hand_qty": 0, "open_order_qty": 0})
+                    inv["open_order_qty"] = int(v)
                     inventory_map[rsku] = inv
 
             # Sales — each date column
