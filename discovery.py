@@ -801,15 +801,11 @@ Classify each column as one of:
 - description: product name/description text (may contain embedded supplier SKU)
 - cost: unit cost or wholesale price
 - retail_price: retail selling price
-- inventory: current on-hand stock quantity (even if currently zero/empty)
+- inventory: the single best current total on-hand quantity to ingest — pick exactly one per sheet
 - open_order: open purchase order quantity (even if currently zero/empty)
-- other: business unit codes, subtotals, YTD totals, stale inventory, percentages, etc
+- other: everything else — DC/store inventory sub-components, prior snapshots, YTD totals, percentages, business unit codes, store counts, etc
 
-Key rules:
-- Header label is AUTHORITATIVE — "Remaining Inventory" = inventory, "Total Open Orders Qty" = open_order always
-- "Year to Date" / "YTD" columns = other
-- Business unit codes (NAD, RET) = other
-- Multiple inventory snapshots: most recent = inventory, prior weeks = other
+For inventory: if a sheet has sub-components (DC Inv, Store Inv) alongside a total (Total Inv), classify only the total as inventory. If snapshots are dated, use the most recent total. Only one column per sheet should be classified as inventory.
 - postgres_matched strongly suggests retailer_sku or supplier_sku
 - embedded_postgres_matched means has_embedded_supplier_sku = true
 
