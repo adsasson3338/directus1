@@ -1727,7 +1727,7 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             schema_col_map = {c["col"]: c for c in schema.get("columns", [])}
             session["column_mapping"][sheet_name] = [
                 {
-                    "col":                  c["col"] - 1,
+                    "col":                  c["col"],
                     "classification":       c["classification"],
                     "confidence":           c.get("confidence", "high"),
                     "reason":               c.get("reason", ""),
