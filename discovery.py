@@ -29,7 +29,7 @@ router = APIRouter()
 # ─────────────────────────────────────────────
 
 DATE_RANGE_RE  = re.compile(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$")
-FISCAL_WEEK_RE = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$", re.IGNORECASE)
+FISCAL_WEEK_RE = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$", re.IGNORECASE)
 WK_NUMBER_RE   = re.compile(r"^wk\s*\d+$", re.IGNORECASE)
 YEAR_RE        = re.compile(r"\b(20\d{2})\b")
 
@@ -746,7 +746,7 @@ def detect_date_axis_row(schema: dict) -> int:
             val = str(h.get("value", "")).strip()
             if (re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", val) or
                 re.match(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$", val) or
-                re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$", val, re.IGNORECASE) or
+                re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$", val, re.IGNORECASE) or
                 re.match(r"^wk\s*\d+$", val, re.IGNORECASE)):
                 row_date_counts[row] = row_date_counts.get(row, 0) + 1
     if not row_date_counts:
@@ -779,7 +779,7 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     DATE_PATTERNS = [
         re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}$'),           # MM/DD/YY or MM/DD/YYYY
         re.compile(r'^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$'), # MM/DD-MM/DD
-        re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+wk\s*\d+$', re.IGNORECASE),
+        re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', re.IGNORECASE),
         re.compile(r'^wk\s*\d+$', re.IGNORECASE),
     ]
 
@@ -1733,8 +1733,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
                     "reason":               c.get("reason", ""),
                     "has_embedded_supplier_sku": (
                         c.get("has_embedded_supplier_sku", False) or
-                        schema_col_map.get(c["col"], {}).get("has_embedded_supplier_sku", False) or
-                        schema_col_map.get(c["col"], {}).get("embedded_postgres_matched", False)
+                        schema_col_map.get(c["col"] + 1, {}).get("has_embedded_supplier_sku", False) or
+                        schema_col_map.get(c["col"] + 1, {}).get("embedded_postgres_matched", False)
                     ),
                 }
                 for c in col_results
