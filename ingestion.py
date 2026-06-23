@@ -66,15 +66,21 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
     # date_range_string: "12/21-12/27" or "1/4-1/10"
     m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
     if m:
-        end_month = int(m.group(3))
-        end_day   = int(m.group(4))
-        start_month = int(m.group(1))
-        # Year boundary — if start month is Dec and end is Jan, end is in next year
-        end_year = year
+        end_month     = int(m.group(3))
+        end_day       = int(m.group(4))
+        start_month   = int(m.group(1))
+        year_boundary = date_config.get("year_boundary_detected", False)
+        # Dec→Jan crossing: end date is in the next year
         if start_month == 12 and end_month == 1:
             end_year = year + 1
+        # Jan→Dec crossing (unusual): end date is in the prior year
         elif start_month == 1 and end_month == 12:
             end_year = year - 1
+        # Pure-December range in a year-boundary file: belongs to prior year
+        elif year_boundary and end_month == 12:
+            end_year = year - 1
+        else:
+            end_year = year
         try:
             return date(end_year, end_month, end_day)
         except:
@@ -83,10 +89,10 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
     # fiscal_week_label: "Feb Wk 1", "Mar Wk 2", "Sept Wk 1"
     m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$', s, re.IGNORECASE)
     if m:
-        month_num = MONTH_MAP[m.group(1).lower()[:3]]   # slice to 3 chars: "sept" -> "sep"
-        week_num  = int(m.group(2))
-        # Year boundary: Jan weeks on a Dec->Jan spanning file belong to year+1
+        month_num     = MONTH_MAP[m.group(1).lower()[:3]]  # slice to 3 chars for MONTH_MAP lookup
+        week_num      = int(m.group(2))
         year_boundary = date_config.get("year_boundary_detected", False)
+        # Jan weeks on a year-boundary file belong to year+1
         effective_year = (year + 1) if (year_boundary and month_num == 1) else year
         try:
             first_of_month = date(effective_year, month_num, 1)
@@ -283,8 +289,6 @@ def extract_sales_and_inventory(
         open_order_col    = None
         date_cols         = []
 
-        inventory_candidates = []  # collect all inventory cols to pick best one
-
         for col_info in mapping:
             classification = col_info.get("classification")
             col_idx        = col_info.get("col")
@@ -295,19 +299,9 @@ def extract_sales_and_inventory(
             elif classification == "description":
                 description_col = col_idx
             elif classification == "inventory":
-                inventory_candidates.append(col_info)
+                inventory_col = col_idx
             elif classification == "open_order":
                 open_order_col = col_idx
-
-        # Pick the best inventory column:
-        # prefer one whose header contains "total", otherwise take the last one
-        if inventory_candidates:
-            total_inv = next(
-                (c for c in inventory_candidates
-                 if "total" in c.get("reason", "").lower()),
-                None
-            )
-            inventory_col = (total_inv or inventory_candidates[-1])["col"]
 
         # Find date axis from grid
         grid       = discovery_result.get("grid", {}).get(sheet_name, {})
@@ -348,7 +342,7 @@ def extract_sales_and_inventory(
             # Supplier SKU
             ssku = None
             if supplier_sku_col is not None and supplier_sku_col < len(row):
-                ssku = str(row[supplier_sku_col]).strip() if row[supplier_sku_col] else None
+                ssku = str(row[supplier_sku_col]).strip().strip('\r\n') if row[supplier_sku_col] else None
             if ssku:
                 sku_supplier[rsku] = ssku
 
@@ -427,7 +421,7 @@ async def ingestion_timeout_handler(sid: str, stage: str):
     elif stage == "write_sales_batch":
         asyncio.create_task(stage_write_inventory(sid))
     elif stage == "write_inventory_batch":
-        asyncio.create_task(stage_write_inventory(sid))
+        asyncio.create_task(stage_finalize(sid))
     elif stage == "finalize_audit":
         asyncio.create_task(stage_complete(sid))
 
@@ -579,12 +573,9 @@ async def stage_process_files(session_id: str):
 
         all_unresolved.update(extracted["unresolved_skus"])
 
-        # Track as_of_date from date_config
-        dc = discovery_result.get("date_config", {})
-        for sheet_dc in dc.values():
-            year = sheet_dc.get("year_value")
-            if year:
-                as_of_dates.append(str(year))
+        # Track as_of_date — use most recent week_ending from extracted sales
+        for row in extracted["sales"]:
+            as_of_dates.append(row["week_ending"])
 
     # Rebuild sales rows with supplier SKU
     sku_supplier = session.get("_sku_supplier", {})
