@@ -545,6 +545,88 @@ async def stage_fetch_audit_rows(session_id: str):
         session["result"] = {"error": "Failed to fetch any file binaries", "errors": session["errors"]}
 
 
+async def stage_process_files(session_id: str):
+    """Process file binaries — extract sales and inventory from all audit rows."""
+    session = _sessions[session_id]
+    session["stage"]  = "processing"
+    session["status"] = "running"
+
+    audit_rows = session.get("_audit_rows", {})
+    if not audit_rows:
+        session["stage"]  = "failed"
+        session["status"] = "failed"
+        session["result"] = {"error": "No audit rows found"}
+        return
+
+    retailers = set(r.get("retailer") for r in audit_rows.values() if r.get("retailer"))
+    if not retailers:
+        session["stage"]  = "failed"
+        session["status"] = "failed"
+        session["result"] = {"error": "No retailer identified in audit rows"}
+        return
+
+    retailer = retailers.pop()
+    session["retailer"] = retailer
+
+    all_sales     = {}
+    all_inventory = {}
+    all_unresolved = set()
+    as_of_dates   = []
+    file_bytes    = session.get("_file_bytes", {})
+
+    for audit_id, audit_row in audit_rows.items():
+        discovery_result = audit_row.get("discovery_result")
+        data             = file_bytes.get(audit_id)
+
+        if not discovery_result:
+            session["errors"].append(f"Missing discovery_result for {audit_id}")
+            continue
+        if not data:
+            session["errors"].append(f"No file data available for {audit_id}")
+            continue
+
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception as e:
+            session["errors"].append(f"Failed to open workbook for {audit_id}: {e}")
+            continue
+
+        extracted = extract_sales_and_inventory(wb, discovery_result, retailer, audit_id)
+
+        for row in extracted["sales"]:
+            key = (row["retailer_sku"], row["week_ending"])
+            all_sales[key] = all_sales.get(key, 0) + row["units_sold"]
+            if row.get("supplier_sku"):
+                session.setdefault("_sku_supplier", {})[row["retailer_sku"]] = row["supplier_sku"]
+
+        for row in extracted["inventory"]:
+            all_inventory[row["retailer_sku"]] = row
+
+        all_unresolved.update(extracted["unresolved_skus"])
+
+        if extracted.get("inv_as_of_date"):
+            as_of_dates.append(extracted["inv_as_of_date"])
+        else:
+            for row in extracted["sales"]:
+                as_of_dates.append(row["week_ending"])
+
+    sku_supplier = session.get("_sku_supplier", {})
+    session["sales_rows"] = [
+        {
+            "retailer_sku": rsku,
+            "supplier_sku": sku_supplier.get(rsku),
+            "week_ending":  week_end,
+            "units_sold":   units,
+        }
+        for (rsku, week_end), units in all_sales.items()
+    ]
+    session["inventory_rows"]  = list(all_inventory.values())
+    session["unresolved_skus"] = sorted(all_unresolved)
+    session["as_of_date"]      = max(as_of_dates) if as_of_dates else str(date.today())
+
+    await stage_lookup_supplier_skus(session_id)
+
+
 async def stage_lookup_supplier_skus(session_id: str):
     """Look up supplier SKUs from retailer_sku_map."""
     session   = _sessions[session_id]
