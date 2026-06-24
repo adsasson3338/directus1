@@ -353,12 +353,11 @@ Respond with JSON only:
 
 
 def build_dedup_check_sql(file_hash: str) -> str:
-    """Check if this file has already been processed."""
+    """Check if this file has already been seen — any status means duplicate."""
     return f"""
 SELECT id, status, filename
 FROM file_audit
 WHERE file_hash = '{file_hash}'
-  AND status NOT IN ('received', 'rejected')
 LIMIT 1
 """.strip()
 
