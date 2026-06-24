@@ -396,33 +396,18 @@ def json_safe(v) -> str:
     return sql_escape(json.dumps(v, ensure_ascii=False))
 
 
-def build_insert_retailer_config_sql(retailer: str, file_audit_id: str,
-                                      discovery_result: dict) -> str:
+def build_insert_retailer_config_sql(retailer: str) -> str:
     """
     Insert a pending_review config row for a newly identified retailer.
+    Only fires once — skipped if retailer already exists.
     """
-    def b64(v):
-        return base64.b64encode(json.dumps(v, ensure_ascii=False).encode()).decode()
-
-    qs = b64(discovery_result.get("qualified_sheets", []))
-    cm = b64(discovery_result.get("column_mapping", {}))
-    dc = b64(discovery_result.get("date_config", {}))
-    fl = b64(discovery_result.get("flags", {}))
-
+    safe_retailer = _sql_escape(retailer) if hasattr(retailer, "__class__") else str(retailer).replace("'", "''")
     return f"""
-INSERT INTO retailer_configs (
-    retailer, status, version, file_audit_id,
-    qualified_sheets, column_mapping, date_config, flags
-)
-SELECT
-    '{retailer}', 'pending_review', 1, '{file_audit_id}',
-    convert_from(decode('{qs}', 'base64'), 'UTF8')::jsonb,
-    convert_from(decode('{cm}', 'base64'), 'UTF8')::jsonb,
-    convert_from(decode('{dc}', 'base64'), 'UTF8')::jsonb,
-    convert_from(decode('{fl}', 'base64'), 'UTF8')::jsonb
+INSERT INTO retailer_configs (retailer, status, file_set_size)
+SELECT '{safe_retailer}', 'pending_review', 1
 WHERE NOT EXISTS (
     SELECT 1 FROM retailer_configs
-    WHERE UPPER(retailer) = UPPER('{retailer}')
+    WHERE UPPER(retailer) = UPPER('{safe_retailer}')
 )
 """.strip()
 
@@ -557,15 +542,25 @@ def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       file_set_key: str | None,
                                       file_hash: str | None = None,
                                       filename: str | None = None) -> str:
-    """Update file_audit with discovery result using base64 to avoid SQL quoting issues."""
-    result_b64   = base64.b64encode(json.dumps(discovery_result, ensure_ascii=False).encode()).decode()
+    """Update file_audit — writes discovery_result plus dedicated columns for easy querying."""
+    result_b64 = base64.b64encode(json.dumps(discovery_result, ensure_ascii=False).encode()).decode()
+
+    # Extract the three dedicated columns directly
+    qs_b64 = base64.b64encode(json.dumps(discovery_result.get("qualified_sheets", []), ensure_ascii=False).encode()).decode()
+    cm_b64 = base64.b64encode(json.dumps(discovery_result.get("column_mapping",   {}), ensure_ascii=False).encode()).decode()
+    dc_b64 = base64.b64encode(json.dumps(discovery_result.get("date_config",      {}), ensure_ascii=False).encode()).decode()
+
     retailer_val = f"'{sql_escape(retailer)}'" if retailer else "NULL"
     key_val      = f"'{sql_escape(file_set_key)}'" if file_set_key else "NULL"
     hash_val     = f"'{file_hash}'" if file_hash else "NULL"
     fname_val    = f"'{sql_escape(filename)}'" if filename else "NULL"
+
     return f"""
 UPDATE file_audit
 SET discovery_result = convert_from(decode('{result_b64}', 'base64'), 'UTF8')::jsonb,
+    qualified_sheets = convert_from(decode('{qs_b64}', 'base64'), 'UTF8')::jsonb,
+    column_mapping   = convert_from(decode('{cm_b64}', 'base64'), 'UTF8')::jsonb,
+    date_config      = convert_from(decode('{dc_b64}', 'base64'), 'UTF8')::jsonb,
     retailer         = {retailer_val},
     status           = '{status}',
     file_set_key     = {key_val},
@@ -1525,7 +1520,7 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
                 "date_config":      session.get("date_config", {}),
                 "flags":            session.get("flags", {}),
             }
-            config_sql = build_insert_retailer_config_sql(retailer, file_audit_id, discovery_result)
+            config_sql = build_insert_retailer_config_sql(retailer)
             await call_postgres(config_sql)
     except Exception as e:
         session["errors"].append(f"Failed to write audit/config: {e}")
