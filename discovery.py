@@ -459,24 +459,94 @@ LIMIT 1
 """.strip()
 
 
-def build_file_set_key(retailer: str, date_config: dict) -> str:
+def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> str:
     """
-    Build a file set key from retailer and week period.
-    Uses year_value and earliest date from date_config.
-    Format: retailer_YYYY-WNN
+    Build a file set key from retailer and the latest week-ending date in the file.
+    Uses the most recent parseable date from the grid date_axis sample_values.
+    Format: RETAILER_YYYY-MM-DD (week-ending Saturday of latest data week)
+    Falls back to RETAILER_YYYY-WNN only if no date can be parsed.
     """
-    import datetime
-    retailer_clean = retailer.replace(" ", "_").upper()
-    year_value = None
-    for sheet_config in date_config.values():
-        y = sheet_config.get("year_value")
-        if y:
-            year_value = y
+    from datetime import date as _date, timedelta
+    import re
+
+    retailer_clean = re.sub(r"[^A-Z0-9]", "_", retailer.upper()).strip("_")
+
+    # Collect year_value and year_boundary from date_config
+    year_value    = None
+    year_boundary = False
+    for sheet_cfg in date_config.values():
+        if sheet_cfg.get("year_value"):
+            year_value    = sheet_cfg["year_value"]
+            year_boundary = sheet_cfg.get("year_boundary_detected", False)
             break
     if not year_value:
-        year_value = datetime.date.today().year
-    # Use ISO week of current date as fallback
-    week_num = datetime.date.today().isocalendar()[1]
+        year_value = _date.today().year
+
+    # Try to extract a real week-ending date from grid sample_values
+    latest_date = None
+    if grid:
+        for sheet_grid in grid.values():
+            date_axis = sheet_grid.get("date_axis", {})
+            samples   = date_axis.get("sample_values", [])
+            fmt       = date_axis.get("format", "")
+
+            for sample in samples:
+                s = str(sample).strip()
+                parsed = None
+
+                # MM/DD/YY or MM/DD/YYYY
+                m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$", s)
+                if m:
+                    mo, dy, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    yr = 2000 + yr if yr < 100 else yr
+                    try:
+                        parsed = _date(yr, mo, dy)
+                    except ValueError:
+                        pass
+
+                # MM/DD-MM/DD (date range — use end date)
+                if not parsed:
+                    m = re.match(r"^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$", s)
+                    if m:
+                        end_mo, end_dy = int(m.group(3)), int(m.group(4))
+                        start_mo       = int(m.group(1))
+                        end_yr         = year_value
+                        if year_boundary and end_mo == 12:
+                            end_yr = year_value - 1
+                        elif year_boundary and start_mo == 12 and end_mo == 1:
+                            end_yr = year_value + 1
+                        try:
+                            parsed = _date(end_yr, end_mo, end_dy)
+                        except ValueError:
+                            pass
+
+                # Mon Wk N — approximate to Saturday
+                if not parsed:
+                    MONTH_MAP = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                                 "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+                    m = re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$",
+                                 s, re.IGNORECASE)
+                    if m:
+                        mon_num  = MONTH_MAP[m.group(1).lower()[:3]]
+                        wk_num   = int(m.group(2))
+                        eff_year = (year_value + 1) if (year_boundary and mon_num == 1) else year_value
+                        try:
+                            first = _date(eff_year, mon_num, 1)
+                            approx = first + timedelta(days=(wk_num - 1) * 7)
+                            # normalize to Saturday
+                            parsed = approx + timedelta(days=(5 - approx.weekday()) % 7)
+                        except ValueError:
+                            pass
+
+                if parsed:
+                    if latest_date is None or parsed > latest_date:
+                        latest_date = parsed
+
+    if latest_date:
+        return f"{retailer_clean}_{latest_date.isoformat()}"
+
+    # Fallback — no parseable date found
+    week_num = _date.today().isocalendar()[1]
     return f"{retailer_clean}_{year_value}-W{week_num:02d}"
 
 
@@ -1393,7 +1463,7 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
         "errors":           session.get("errors", []),
     }
 
-    file_set_key = build_file_set_key(retailer, session.get("date_config", {})) if retailer else None
+    file_set_key = build_file_set_key(retailer, session.get("date_config", {}), session.get("grid", {})) if retailer else None
 
     if not retailer:          audit_status = "pending_review"
     elif file_set_size is None: audit_status = "pending_review"
