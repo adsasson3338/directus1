@@ -60,7 +60,7 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
         try:
             d = datetime.strptime(s[:10], "%Y-%m-%d").date()
             return normalize_to_saturday(d)
-        except:
+        except (ValueError, OverflowError):
             return None
 
     # date_range_string: "12/21-12/27" or "1/4-1/10"
@@ -83,7 +83,7 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
             end_year = year
         try:
             return date(end_year, end_month, end_day)
-        except:
+        except (ValueError, OverflowError):
             return None
 
     # fiscal_week_label: "Feb Wk 1", "Mar Wk 2", "Sept Wk 1"
@@ -98,7 +98,7 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
             first_of_month = date(effective_year, month_num, 1)
             approx = first_of_month + timedelta(days=(week_num - 1) * 7)
             return normalize_to_saturday(approx)
-        except:
+        except (ValueError, OverflowError):
             return None
 
     return None
@@ -108,11 +108,36 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
 # SQL BUILDERS
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# SQL HELPERS
+# ─────────────────────────────────────────────
+
+def _sql_escape(v) -> str:
+    """Escape a value for safe inline SQL string embedding."""
+    return str(v).replace("'", "''")
+
+def _safe_table_name(retailer: str) -> str:
+    """Convert retailer name to a safe Postgres identifier."""
+    return re.sub(r"[^a-z0-9_]", "_", retailer.lower()) + "_weekly_sales"
+
+def _validate_uuid(v: str) -> str:
+    """Validate UUID format — raises ValueError if invalid."""
+    import uuid as _uuid
+    return str(_uuid.UUID(str(v)))
+
+def _validate_date(v: str) -> str:
+    """Validate ISO date string — raises ValueError if invalid."""
+    from datetime import date as _date
+    _date.fromisoformat(str(v))
+    return str(v)
+
+
 def build_fetch_audit_row_sql(file_audit_id: str) -> str:
+    safe_id = _validate_uuid(file_audit_id)
     return f"""
 SELECT id, filename, file_hash, minio_path, retailer, status, discovery_result
 FROM file_audit
-WHERE id = '{file_audit_id}'
+WHERE id = '{safe_id}'
 LIMIT 1
 """.strip()
 
@@ -159,7 +184,7 @@ WHERE UPPER(retailer) = UPPER('{retailer_safe}')
 """.strip()
 
 def build_create_sales_table_sql(retailer: str) -> str:
-    table = retailer.lower().replace(" ", "_") + "_weekly_sales"
+    table = _safe_table_name(retailer)
     return f"""
 CREATE TABLE IF NOT EXISTS {table} (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -177,14 +202,15 @@ CREATE TABLE IF NOT EXISTS {table} (
 
 def build_upsert_sales_sql(retailer: str, rows: list, file_audit_id: str) -> str:
     """Build a multi-row upsert for sales data."""
-    table = retailer.lower().replace(" ", "_") + "_weekly_sales"
-    values = []
+    table    = _safe_table_name(retailer)
+    safe_fid = _validate_uuid(file_audit_id)
+    values   = []
     for row in rows:
-        retailer_sku  = str(row["retailer_sku"]).replace("'", "''")
-        supplier_sku  = f"'{str(row['supplier_sku']).replace(chr(39), chr(39)*2)}'" if row.get("supplier_sku") else "NULL"
-        week_ending   = str(row["week_ending"])
-        units_sold    = int(row["units_sold"])
-        values.append(f"('{retailer_sku}', {supplier_sku}, '{week_ending}', {units_sold}, '{file_audit_id}')")
+        retailer_sku = _sql_escape(row["retailer_sku"])
+        supplier_sku = f"'{_sql_escape(row['supplier_sku'])}'" if row.get("supplier_sku") else "NULL"
+        week_ending  = _validate_date(row["week_ending"])
+        units_sold   = int(row["units_sold"])
+        values.append(f"('{retailer_sku}', {supplier_sku}, '{week_ending}', {units_sold}, '{safe_fid}')")
 
     values_str = ",\n".join(values)
     return f"""
@@ -200,12 +226,15 @@ WHERE {table}.locked = false
 
 def build_upsert_inventory_sql(retailer: str, rows: list, file_audit_id: str, as_of_date: str) -> str:
     """Build a multi-row upsert for inventory snapshot."""
-    values = []
+    safe_retailer = _sql_escape(retailer)
+    safe_fid      = _validate_uuid(file_audit_id)
+    safe_date     = _validate_date(as_of_date)
+    values        = []
     for row in rows:
-        retailer_sku   = str(row["retailer_sku"]).replace("'", "''")
-        on_hand        = int(row.get("on_hand_qty") or 0)
-        open_order     = int(row.get("open_order_qty") or 0)
-        values.append(f"('{retailer}', '{retailer_sku}', {on_hand}, {open_order}, '{as_of_date}', '{file_audit_id}')")
+        retailer_sku = _sql_escape(row["retailer_sku"])
+        on_hand      = int(row.get("on_hand_qty") or 0)
+        open_order   = int(row.get("open_order_qty") or 0)
+        values.append(f"('{safe_retailer}', '{retailer_sku}', {on_hand}, {open_order}, '{safe_date}', '{safe_fid}')")
 
     values_str = ",\n".join(values)
     return f"""
@@ -224,13 +253,15 @@ WHERE retailer_inventory.as_of_date <= EXCLUDED.as_of_date
 
 def build_update_audit_status_sql(file_audit_id: str, status: str,
                                    unresolved_skus: list = None) -> str:
-    unresolved_json = json.dumps(unresolved_skus or []).replace("'", "''")
+    safe_id         = _validate_uuid(file_audit_id)
+    safe_status     = _sql_escape(status)
+    unresolved_json = _sql_escape(json.dumps(unresolved_skus or []))
     return f"""
 UPDATE file_audit
-SET status          = '{status}',
+SET status          = '{safe_status}',
     unresolved_skus = '{unresolved_json}'::jsonb,
     updated_at      = now()
-WHERE id = '{file_audit_id}'
+WHERE id = '{safe_id}'
 """.strip()
 
 
@@ -815,7 +846,7 @@ async def ingest_response(job_id: str, job: dict, request_body: dict, background
             if isinstance(dr, str):
                 try:
                     dr = json.loads(dr)
-                except:
+                except (json.JSONDecodeError, ValueError):
                     dr = {}
             row["discovery_result"] = dr
             session["_audit_rows"][audit_id] = row
