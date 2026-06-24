@@ -503,6 +503,16 @@ async def stage_fetch_audit_rows(session_id: str):
     session["stage"]  = "fetching"
     session["status"] = "running"
 
+    # Mark all files as ingesting immediately — Python owns the status from here
+    for audit_id in session["file_audit_ids"]:
+        try:
+            await call_postgres(f"""
+UPDATE file_audit SET status = 'ingesting', updated_at = now()
+WHERE id = '{_validate_uuid(audit_id)}'
+""".strip())
+        except Exception as e:
+            session["errors"].append(f"Failed to mark ingesting for {audit_id}: {e}")
+
     for audit_id in session["file_audit_ids"]:
         # Fetch audit row directly from Postgres
         try:
