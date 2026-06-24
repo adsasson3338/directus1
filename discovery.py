@@ -891,7 +891,21 @@ async def advance_from_qualify(session_id: str):
     session["qualified_sheets"] = qualified
 
     if not qualified:
-        session["stage"] = "complete"
+        # Write rejected status to file_audit before closing session
+        file_audit_id = session.get("file_audit_id")
+        if file_audit_id:
+            try:
+                sql = build_update_file_audit_full_sql(
+                    file_audit_id,
+                    {"status": "no_sales_data", "qualify_results": results},
+                    None, "rejected", None,
+                    file_hash=session.get("file_hash"),
+                    filename=session.get("filename"),
+                )
+                await call_postgres(sql)
+            except Exception as e:
+                session.setdefault("errors", []).append(f"Failed to write rejected status: {e}")
+        session["stage"]  = "complete"
         session["status"] = "complete"
         session["result"] = {"status": "no_sales_data", "qualify_results": results}
         return
@@ -1159,6 +1173,19 @@ async def stage_schema_classify(session_id: str):
             session["column_mapping"].pop(sheet_name, None)
 
     if not session["qualified_sheets"]:
+        file_audit_id = session.get("file_audit_id")
+        if file_audit_id:
+            try:
+                sql = build_update_file_audit_full_sql(
+                    file_audit_id,
+                    {"status": "no_sales_data", "qualify_results": session["qualify_results"]},
+                    None, "rejected", None,
+                    file_hash=session.get("file_hash"),
+                    filename=session.get("filename"),
+                )
+                await call_postgres(sql)
+            except Exception as e:
+                session.setdefault("errors", []).append(f"Failed to write rejected status: {e}")
         session["stage"]  = "complete"
         session["status"] = "complete"
         session["result"] = {"status": "no_sales_data", "qualify_results": session["qualify_results"]}
