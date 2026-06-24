@@ -1556,6 +1556,64 @@ async def stage_assemble(session_id: str):
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+async def handle_discovery_file_binary(session_id: str, data: bytes, filename: str):
+    """Called when file binary arrives from n8n for a discovery session."""
+    if session_id not in _sessions:
+        return
+
+    session = _sessions[session_id]
+
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        session["stage"]  = "complete"
+        session["status"] = "complete"
+        session["result"] = {"error": f"'{filename}' is not an Excel file"}
+        return
+
+    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+    if len(data) > MAX_UPLOAD_BYTES:
+        session["stage"]  = "complete"
+        session["status"] = "complete"
+        session["result"] = {"error": "File too large — max 50MB"}
+        return
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as e:
+        session["stage"]  = "complete"
+        session["status"] = "complete"
+        session["result"] = {"error": f"Cannot open {filename}: {e}"}
+        return
+
+    sheets = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        sheets[sheet_name] = list(ws.iter_rows(values_only=True))
+
+    session["_sheets"]   = sheets
+    session["_raw_data"] = data
+    if not session.get("file_hash"):
+        session["file_hash"] = file_hash(data)
+
+    # Dedup check — skip if this hash belongs to a different file_audit row
+    try:
+        dedup_rows = await call_postgres(build_dedup_check_sql(session["file_hash"]))
+        if dedup_rows and dedup_rows[0].get("id") != session.get("file_audit_id"):
+            existing_id     = dedup_rows[0].get("id")
+            existing_status = dedup_rows[0].get("status")
+            session["stage"]  = "complete"
+            session["status"] = "complete"
+            session["result"] = {
+                "skipped":   True,
+                "reason":    f"File already processed — existing row {existing_id} has status '{existing_status}'",
+                "file_hash": session["file_hash"],
+            }
+            return
+    except Exception as e:
+        session["errors"].append(f"Dedup check failed: {e}")
+
+    await stage_qualify(session_id)
+
+
 @router.post("/analyze")
 async def analyze(
     files: List[UploadFile] = File(...),
@@ -1636,6 +1694,84 @@ async def analyze(
         "status":     "accepted",
         "session_id": session_id,
         "sheets":     list(sheets.keys()),
+        "poll_url":   f"/analyze/status/{session_id}",
+    })
+
+
+
+@router.post("/analyze/from_audit")
+async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTasks = BackgroundTasks()):
+    """
+    Trigger discovery from a file_audit_id — file is fetched from MinIO via n8n.
+    Used by the polling workflow for received files.
+    """
+    file_audit_id = request_body.get("file_audit_id")
+    if not file_audit_id:
+        raise HTTPException(status_code=400, detail="file_audit_id required")
+
+    try:
+        safe_id = _validate_uuid(file_audit_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file_audit_id format")
+
+    # Fetch audit row to get filename and check dedup
+    try:
+        rows = await call_postgres(build_fetch_audit_row_sql(safe_id))
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"file_audit row {safe_id} not found")
+        audit_row = rows[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch audit row: {e}")
+
+    filename  = audit_row.get("filename", "unknown.xlsx")
+    file_hash_val = audit_row.get("file_hash")
+
+    session_id = str(uuid.uuid4())
+    _sessions[session_id] = {
+        "stage":            "accepted",
+        "status":           "running",
+        "filename":         filename,
+        "file_hash":        file_hash_val,
+        "file_audit_id":    safe_id,
+        "retailer":         None,
+        "qualified_sheets": [],
+        "qualify_results":  {},
+        "grid":             {},
+        "postgres_results": {},
+        "column_mapping":   {},
+        "date_config":      {},
+        "flags":            {},
+        "errors":           [],
+        "result":           None,
+        "_sheets":          None,   # populated when file arrives
+        "_raw_data":        None,
+        "_pending_jobs":    set(),
+        "created_at":       time.time(),
+    }
+
+    # Fire fetch-file webhook — file binary will arrive at /file/{job_id}
+    # But discovery needs the binary before it can start — use a flag to wait
+    file_job_id = str(uuid.uuid4())
+    _jobs[file_job_id] = {
+        "session_id": session_id,
+        "stage":      "fetch_file_binary",
+        "audit_id":   safe_id,
+        "pipeline":   "discovery",
+        "created_at": time.time(),
+    }
+    err = await fire_fetch_file_webhook(file_job_id, safe_id)
+    if err:
+        _sessions.pop(session_id, None)
+        _jobs.pop(file_job_id, None)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch file: {err}")
+
+    _sessions[session_id]["_pending_jobs"].add(file_job_id)
+
+    return JSONResponse(content={
+        "status":     "accepted",
+        "session_id": session_id,
         "poll_url":   f"/analyze/status/{session_id}",
     })
 
