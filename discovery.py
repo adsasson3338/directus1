@@ -907,6 +907,29 @@ Respond with JSON only:
 }}"""
 
 # ─────────────────────────────────────────────
+# FILE TYPE DETECTION
+# ─────────────────────────────────────────────
+
+# Keywords that identify known non-sales file types.
+# Maps keyword (lowercase, found in filename or sheet names) → audit status
+KNOWN_FILE_TYPES = {
+    "on hand inventory alpha": "inventory_report",  # primary match — most specific first
+    "on hand":                 "inventory_report",  # fallback
+}
+
+def detect_known_file_type(filename: str, sheet_names: list) -> str | None:
+    """
+    Check filename and sheet names against known non-sales file type keywords.
+    Returns the audit status to assign, or None if unrecognized.
+    """
+    haystack = (filename + " " + " ".join(sheet_names)).lower()
+    for keyword, status in KNOWN_FILE_TYPES.items():
+        if keyword in haystack:
+            return status
+    return None
+
+
+# ─────────────────────────────────────────────
 # PIPELINE STAGES
 # ─────────────────────────────────────────────
 
@@ -963,23 +986,28 @@ async def advance_from_qualify(session_id: str):
     session["qualified_sheets"] = qualified
 
     if not qualified:
-        # Write rejected status to file_audit before closing session
         file_audit_id = session.get("file_audit_id")
+        # Check if this is a known non-sales file type before marking rejected
+        known_type = detect_known_file_type(
+            session.get("filename", ""),
+            list(session.get("_sheets", {}).keys())
+        )
+        audit_status = known_type or "rejected"
         if file_audit_id:
             try:
                 sql = build_update_file_audit_full_sql(
                     file_audit_id,
                     {"status": "no_sales_data", "qualify_results": results},
-                    None, "rejected", None,
+                    None, audit_status, None,
                     file_hash=session.get("file_hash"),
                     filename=session.get("filename"),
                 )
                 await call_postgres(sql)
             except Exception as e:
-                session.setdefault("errors", []).append(f"Failed to write rejected status: {e}")
+                session.setdefault("errors", []).append(f"Failed to write {audit_status} status: {e}")
         session["stage"]  = "complete"
         session["status"] = "complete"
-        session["result"] = {"status": "no_sales_data", "qualify_results": results}
+        session["result"] = {"status": audit_status, "qualify_results": results}
         return
 
     await stage_locate_grid(session_id)
@@ -1246,21 +1274,26 @@ async def stage_schema_classify(session_id: str):
 
     if not session["qualified_sheets"]:
         file_audit_id = session.get("file_audit_id")
+        known_type = detect_known_file_type(
+            session.get("filename", ""),
+            list(session.get("_sheets", {}).keys())
+        )
+        audit_status = known_type or "rejected"
         if file_audit_id:
             try:
                 sql = build_update_file_audit_full_sql(
                     file_audit_id,
                     {"status": "no_sales_data", "qualify_results": session["qualify_results"]},
-                    None, "rejected", None,
+                    None, audit_status, None,
                     file_hash=session.get("file_hash"),
                     filename=session.get("filename"),
                 )
                 await call_postgres(sql)
             except Exception as e:
-                session.setdefault("errors", []).append(f"Failed to write rejected status: {e}")
+                session.setdefault("errors", []).append(f"Failed to write {audit_status} status: {e}")
         session["stage"]  = "complete"
         session["status"] = "complete"
-        session["result"] = {"status": "no_sales_data", "qualify_results": session["qualify_results"]}
+        session["result"] = {"status": audit_status, "qualify_results": session["qualify_results"]}
         return
 
     await stage_identify_retailer(session_id)
