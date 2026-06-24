@@ -1447,8 +1447,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             clean = parse_ai_response(text)
             try:
                 date_schema = json.loads(clean)
-            except:
-                date_schema = {"error": f"Parse error: {text[:100]}"}
+            except (json.JSONDecodeError, ValueError) as e:
+                date_schema = {"error": f"Parse error: {e} — {text[:100]}"}
         else:
             date_schema = raw
 
@@ -1501,8 +1501,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             clean = parse_ai_response(text)
             try:
                 result = json.loads(clean)
-            except:
-                result = {"error": f"Parse error: {text[:100]}"}
+            except (json.JSONDecodeError, ValueError) as e:
+                result = {"error": f"Parse error: {e} — {text[:100]}"}
         else:
             result = raw
 
@@ -1670,8 +1670,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             clean = parse_ai_response(text)
             try:
                 verdict = json.loads(clean)
-            except:
-                verdict = {"disqualified": None, "reason": f"Parse error: {text[:100]}"}
+            except (json.JSONDecodeError, ValueError) as e:
+                verdict = {"disqualified": None, "reason": f"Parse error: {e} — {text[:100]}"}
         else:
             verdict = raw
         verdict["source"] = "ai"
@@ -1694,8 +1694,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             clean = parse_ai_response(text)
             try:
                 result = json.loads(clean)
-            except:
-                result = {"error": f"Parse error: {text[:100]}"}
+            except (json.JSONDecodeError, ValueError) as e:
+                result = {"error": f"Parse error: {e} — {text[:100]}"}
         else:
             result = raw
         result["normalize_to"] = "week_ending_saturday"
@@ -1725,8 +1725,8 @@ async def webhook_response(job_id: str, request_body: dict, background_tasks: Ba
             clean = parse_ai_response(text)
             try:
                 result = json.loads(clean)
-            except:
-                result = {"retailer": None, "confidence": None, "reason": f"Parse error: {text[:100]}"}
+            except (json.JSONDecodeError, ValueError) as e:
+                result = {"retailer": None, "confidence": None, "reason": f"Parse error: {e} — {text[:100]}"}
         else:
             result = raw
         session["retailer"] = result.get("retailer")
@@ -1809,7 +1809,11 @@ async def analyze(
     if not upload.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail=f"'{upload.filename}' is not an Excel file")
 
-    data = await upload.read()
+    # Reject files over 50MB before reading into memory
+    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+    data = await upload.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large — max 50MB, got {len(data) // (1024*1024)}MB")
 
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
