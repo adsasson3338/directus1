@@ -767,31 +767,36 @@ async def stage_complete(session_id: str):
 
 @router.post("/file/{job_id}")
 async def file_upload_response(job_id: str, file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
-    """Receive binary file from n8n S3 webhook and store in session."""
+    """Receive binary file from n8n S3 webhook — handles both discovery and ingestion pipelines."""
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
     job        = _jobs.pop(job_id)
     session_id = job["session_id"]
-    audit_id   = job["audit_id"]
+    pipeline   = job.get("pipeline", "ingestion")
 
     if session_id not in _sessions:
         return JSONResponse(content={"status": "ok", "note": "session already closed"})
 
     session = _sessions[session_id]
     session["_pending_jobs"].discard(job_id)
-
-    # Store file bytes
     data = await file.read()
-    session.setdefault("_file_bytes", {})[audit_id] = data
-    session.setdefault("_filenames", {})[audit_id] = file.filename
 
-    # Proceed when all file binaries received and audit rows fetched
-    expected = len(session["file_audit_ids"])
-    if (not session["_pending_jobs"]
-            and len(session.get("_audit_rows", {})) >= expected
-            and len(session.get("_file_bytes", {})) >= expected):
-        background_tasks.add_task(stage_process_files, session_id)
+    if pipeline == "discovery":
+        # Route to discovery pipeline handler
+        from discovery import handle_discovery_file_binary
+        background_tasks.add_task(handle_discovery_file_binary, session_id, data, file.filename)
+    else:
+        # Ingestion pipeline
+        audit_id = job["audit_id"]
+        session.setdefault("_file_bytes", {})[audit_id] = data
+        session.setdefault("_filenames", {})[audit_id] = file.filename
+
+        expected = len(session["file_audit_ids"])
+        if (not session["_pending_jobs"]
+                and len(session.get("_audit_rows", {})) >= expected
+                and len(session.get("_file_bytes", {})) >= expected):
+            background_tasks.add_task(stage_process_files, session_id)
 
     return JSONResponse(content={"status": "ok", "job_id": job_id})
 
