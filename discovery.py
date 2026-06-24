@@ -414,14 +414,16 @@ INSERT INTO retailer_configs (
     retailer, status, version, file_audit_id,
     qualified_sheets, column_mapping, date_config, flags
 )
-VALUES (
+SELECT
     '{retailer}', 'pending_review', 1, '{file_audit_id}',
     convert_from(decode('{qs}', 'base64'), 'UTF8')::jsonb,
     convert_from(decode('{cm}', 'base64'), 'UTF8')::jsonb,
     convert_from(decode('{dc}', 'base64'), 'UTF8')::jsonb,
     convert_from(decode('{fl}', 'base64'), 'UTF8')::jsonb
+WHERE NOT EXISTS (
+    SELECT 1 FROM retailer_configs
+    WHERE UPPER(retailer) = UPPER('{retailer}')
 )
-ON CONFLICT DO NOTHING
 """.strip()
 
 
@@ -1465,10 +1467,16 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
 
     file_set_key = build_file_set_key(retailer, session.get("date_config", {}), session.get("grid", {})) if retailer else None
 
-    if not retailer:          audit_status = "pending_review"
-    elif file_set_size is None: audit_status = "pending_review"
-    elif file_set_size > 1:   audit_status = "pending_set"
-    else:                     audit_status = "discovery_complete"
+    # Only trust Postgres-confirmed retailer identification for automated ingestion
+    # AI-confirmed retailer requires human review to prevent garbage data
+    retailer_id_flag = session.get("flags", {}).get("retailer_identification", "")
+    retailer_confirmed = retailer_id_flag.startswith("confirmed:")  # Postgres match only
+
+    if not retailer:                audit_status = "pending_review"
+    elif file_set_size is None:     audit_status = "pending_review"
+    elif not retailer_confirmed:    audit_status = "pending_review"  # AI-identified — needs human sign-off
+    elif file_set_size > 1:         audit_status = "pending_set"
+    else:                           audit_status = "discovery_complete"
 
     sql = build_update_file_audit_full_sql(
         file_audit_id, result, retailer, audit_status, file_set_key,
