@@ -1,9 +1,8 @@
 """
 discovery.py — Discovery pipeline: qualify, locate, identify, date, write audit.
 """
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
-from typing import List
 import asyncio
 import openpyxl
 import base64
@@ -1615,91 +1614,6 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
 
 
 @router.post("/analyze")
-async def analyze(
-    files: List[UploadFile] = File(...),
-    file_audit_id: str = Form(None),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one file required")
-
-    upload = files[0]
-
-    if not upload.filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail=f"'{upload.filename}' is not an Excel file")
-
-    # Reject files over 50MB before reading into memory
-    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-    data = await upload.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"File too large — max 50MB, got {len(data) // (1024*1024)}MB")
-
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot open {upload.filename}: {e}")
-
-    sheets = {}
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        sheets[sheet_name] = list(ws.iter_rows(values_only=True))
-
-    fhash = file_hash(data)
-
-    session_id = str(uuid.uuid4())
-    _sessions[session_id] = {
-        "stage":            "accepted",
-        "status":           "running",
-        "filename":         upload.filename,
-        "file_hash":        fhash,
-        "file_audit_id":    file_audit_id,
-        "retailer":         None,
-        "qualified_sheets": [],
-        "qualify_results":  {},
-        "grid":             {},
-        "postgres_results": {},
-        "column_mapping":   {},
-        "date_config":      {},
-        "flags":            {},
-        "errors":           [],
-        "result":           None,
-        "_sheets":          sheets,
-        "_raw_data":        data,
-        "created_at":       time.time(),
-    }
-
-    async def _run():
-        # Dedup check — skip if file already processed
-        try:
-            dedup_rows = await call_postgres(build_dedup_check_sql(fhash))
-            if dedup_rows and dedup_rows[0].get("id"):
-                existing_id     = dedup_rows[0].get("id")
-                existing_status = dedup_rows[0].get("status")
-                _sessions[session_id]["stage"]  = "complete"
-                _sessions[session_id]["status"] = "complete"
-                _sessions[session_id]["result"] = {
-                    "skipped":   True,
-                    "reason":    f"File already processed — existing row {existing_id} has status '{existing_status}'",
-                    "file_hash": fhash,
-                }
-                return
-        except Exception as e:
-            _sessions[session_id]["errors"].append(f"Dedup check failed: {e}")
-
-        await stage_qualify(session_id)
-
-    background_tasks.add_task(_run)
-
-    return JSONResponse(content={
-        "status":     "accepted",
-        "session_id": session_id,
-        "sheets":     list(sheets.keys()),
-        "poll_url":   f"/analyze/status/{session_id}",
-    })
-
-
-
-@router.post("/analyze/from_audit")
 async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTasks = BackgroundTasks()):
     """
     Trigger discovery from a file_audit_id — file is fetched from MinIO via n8n.
@@ -1768,6 +1682,29 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
         raise HTTPException(status_code=500, detail=f"Failed to fetch file: {err}")
 
     _sessions[session_id]["_pending_jobs"].add(file_job_id)
+
+    async def _wait_for_file():
+        """Wait for file binary to arrive then run discovery."""
+        for _ in range(120):  # wait up to 120 seconds
+            await asyncio.sleep(1)
+            session = _sessions.get(session_id)
+            if not session:
+                return
+            if session.get("_file_ready"):
+                await handle_discovery_file_binary(
+                    session_id,
+                    session["_raw_data"],
+                    session.get("_filename", filename)
+                )
+                return
+        # Timed out waiting for file
+        session = _sessions.get(session_id)
+        if session:
+            session["stage"]  = "complete"
+            session["status"] = "complete"
+            session["result"] = {"error": "Timed out waiting for file binary from MinIO"}
+
+    background_tasks.add_task(_wait_for_file)
 
     return JSONResponse(content={
         "status":     "accepted",
