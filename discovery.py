@@ -1319,7 +1319,7 @@ async def stage_identify_retailer(session_id: str):
             sql  = build_retailer_identify_sql(sorted(retailer_sku_candidates))
             rows = await call_postgres(sql)
             if rows and int(rows[0].get("matches", 0)) >= 3:
-                session["retailer"] = rows[0].get("retailer")
+                session["retailer"] = rows[0].get("retailer", "").lower()
                 session["flags"]["retailer_identification"] = (
                     f"confirmed: {session['retailer']} ({rows[0].get('matches')} matches)"
                 )
@@ -1356,7 +1356,7 @@ async def stage_identify_retailer_ai(session_id: str):
     except Exception as e:
         result = {"retailer": None, "confidence": None, "reason": f"AI error: {e}"}
 
-    session["retailer"] = result.get("retailer")
+    session["retailer"] = result.get("retailer", "").lower() if result.get("retailer") else None
     session["flags"]["retailer_identification"] = (
         f"ai_confirmed: {session['retailer']} ({result.get('confidence', 'unknown')} confidence)"
         if session["retailer"]
