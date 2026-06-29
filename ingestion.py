@@ -650,9 +650,40 @@ async def stage_lookup_supplier_skus(session_id: str):
         row["retailer_sku"] for row in sales_rows if not row.get("supplier_sku")
     })
 
+    await stage_validate_schema(session_id)
+
+
+async def stage_validate_schema(session_id: str):
+    """Verify the retailer view exists in Postgres before writing."""
+    session   = _sessions[session_id]
+    retailer  = session["retailer"]
+    session["stage"]  = "validating_schema"
+    session["status"] = "running"
+
+    view_name = re.sub(r"[^a-z0-9_]", "_", retailer.lower()) + "_weekly_sales"
+
+    try:
+        rows = await call_postgres(f"""
+SELECT 1 FROM information_schema.views
+WHERE table_schema = 'public'
+  AND table_name = '{_sql_escape(view_name)}'
+""".strip())
+    except Exception as e:
+        session["stage"]  = "failed"
+        session["status"] = "failed"
+        session["result"] = {"error": f"Schema validation failed: {e}", "errors": session.get("errors", [])}
+        return
+
+    if not rows:
+        session["stage"]  = "failed"
+        session["status"] = "failed"
+        session["result"] = {
+            "error": f"View '{view_name}' does not exist — run schema migration before ingesting '{retailer}'",
+            "errors": session.get("errors", []),
+        }
+        return
+
     await stage_write_sales(session_id)
-
-
 
 
 async def stage_write_sales(session_id: str):
