@@ -114,7 +114,6 @@ def _sql_escape(v) -> str:
     """Escape a value for safe inline SQL string embedding."""
     return str(v).replace("'", "''")
 
-def _safe_table_name(retailer: str) -> str:
     """Convert retailer name to a safe Postgres identifier."""
     return re.sub(r"[^a-z0-9_]", "_", retailer.lower()) + "_weekly_sales"
 
@@ -181,44 +180,32 @@ WHERE UPPER(retailer) = UPPER('{retailer_safe}')
   AND supplier_sku IS NOT NULL
 """.strip()
 
-def build_create_sales_table_sql(retailer: str) -> str:
-    table = _safe_table_name(retailer)
-    return f"""
-CREATE TABLE IF NOT EXISTS {table} (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    retailer_sku    TEXT NOT NULL,
-    supplier_sku    TEXT,
-    week_ending     DATE NOT NULL,
-    units_sold      INTEGER NOT NULL,
-    file_audit_id   UUID,
-    ingested_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    locked          BOOLEAN NOT NULL DEFAULT true,
-    UNIQUE (retailer_sku, week_ending)
-)
-""".strip()
-
 
 def build_upsert_sales_sql(retailer: str, rows: list, file_audit_id: str) -> str:
-    """Build a multi-row upsert for sales data."""
-    table    = _safe_table_name(retailer)
-    safe_fid = _validate_uuid(file_audit_id)
-    values   = []
+    """Build a multi-row upsert into unified weekly_sales table."""
+    safe_retailer = _sql_escape(retailer)
+    safe_fid      = _validate_uuid(file_audit_id)
+    values        = []
     for row in rows:
         retailer_sku = _sql_escape(row["retailer_sku"])
         supplier_sku = f"'{_sql_escape(row['supplier_sku'])}'" if row.get("supplier_sku") else "NULL"
         week_ending  = _validate_date(row["week_ending"])
         units_sold   = int(row["units_sold"])
-        values.append(f"('{retailer_sku}', {supplier_sku}, '{week_ending}', {units_sold}, '{safe_fid}')")
+        values.append(
+            f"('{safe_retailer}', '{retailer_sku}', {supplier_sku}, '{week_ending}', {units_sold}, '{safe_fid}')"
+        )
 
     values_str = ",\n".join(values)
     return f"""
-INSERT INTO {table} (retailer_sku, supplier_sku, week_ending, units_sold, file_audit_id)
+INSERT INTO weekly_sales (retailer, retailer_sku, supplier_sku, week_ending, units_sold, file_audit_id)
 VALUES {values_str}
-ON CONFLICT (retailer_sku, week_ending)
+ON CONFLICT (retailer, retailer_sku, week_ending)
 DO UPDATE SET
     units_sold    = EXCLUDED.units_sold,
-    file_audit_id = EXCLUDED.file_audit_id
-WHERE {table}.locked = false
+    supplier_sku  = EXCLUDED.supplier_sku,
+    file_audit_id = EXCLUDED.file_audit_id,
+    ingested_at   = now()
+WHERE weekly_sales.locked = false
 """.strip()
 
 
@@ -663,22 +650,9 @@ async def stage_lookup_supplier_skus(session_id: str):
         row["retailer_sku"] for row in sales_rows if not row.get("supplier_sku")
     })
 
-    await stage_create_table(session_id)
-
-
-async def stage_create_table(session_id: str):
-    """Ensure retailer sales table exists."""
-    session  = _sessions[session_id]
-    retailer = session["retailer"]
-    session["stage"]  = "creating_table"
-    session["status"] = "running"
-
-    try:
-        await call_postgres(build_create_sales_table_sql(retailer))
-    except Exception as e:
-        session["errors"].append(f"Failed to create sales table: {e}")
-
     await stage_write_sales(session_id)
+
+
 
 
 async def stage_write_sales(session_id: str):
