@@ -981,7 +981,7 @@ async def stage_qualify(session_id: str):
 
         # AI call — direct, no webhook
         try:
-            text   = await call_ai(build_qualify_prompt(signals))
+            text   = await call_ai(build_qualify_prompt(signals), label="qualify")
             clean  = parse_ai_response(text)
             verdict = json.loads(clean)
         except (json.JSONDecodeError, ValueError) as e:
@@ -1150,7 +1150,7 @@ async def stage_schema_classify(session_id: str):
 
         # Pass 1 — AI identifies date schema pattern
         try:
-            text        = await call_ai(build_date_schema_prompt(schema, session["filename"]))
+            text        = await call_ai(build_date_schema_prompt(schema, session["filename"]), label="date_schema")
             clean       = parse_ai_response(text)
             date_schema = json.loads(clean)
         except (json.JSONDecodeError, ValueError) as e:
@@ -1173,7 +1173,7 @@ async def stage_schema_classify(session_id: str):
         # Pass 2 — AI classifies non-date columns
         try:
             text   = await call_ai(build_column_classify_prompt(schema, session["filename"],
-                                                                  sales_cols_1based, matched_values))
+                                                                  sales_cols_1based, matched_values), label="column_classify")
             clean  = parse_ai_response(text)
             result = json.loads(clean)
         except (json.JSONDecodeError, ValueError) as e:
@@ -1376,7 +1376,7 @@ async def stage_identify_retailer_ai(session_id: str):
     try:
         text   = await call_ai(build_retailer_identify_prompt(
             session["filename"], session["qualified_sheets"], header_strings
-        ))
+        ), label="retailer_identify")
         clean  = parse_ai_response(text)
         result = json.loads(clean)
     except (json.JSONDecodeError, ValueError) as e:
@@ -1449,7 +1449,7 @@ async def stage_date_config(session_id: str):
         try:
             text   = await call_ai(build_date_prompt(date_axis, anchors, sheet_name,
                                                       filename=session["filename"],
-                                                      cross_sheet_anchors=cross_sheet_anchors))
+                                                      cross_sheet_anchors=cross_sheet_anchors), label="date_config")
             clean  = parse_ai_response(text)
             result = json.loads(clean)
         except (json.JSONDecodeError, ValueError) as e:
