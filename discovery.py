@@ -328,7 +328,7 @@ def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str,
 
     return f"""You are configuring the date settings for a retail sales sheet.
 
-Determine the year value and week convention from the evidence.
+Determine the year settings from the evidence below.
 The file was received as: {filename}
 
 Sheet: {sheet_name}
@@ -338,12 +338,19 @@ Year boundary detected: {date_axis.get("year_boundary_detected", False)}
 Sample date values: {date_axis["sample_values"]}
 Year anchors in this sheet: {year_anchors}{cross_context}
 
-Important: If dates span December and January, December dates belong to the EARLIER year and January dates belong to the LATER year. Use the file date and year anchors to determine which years those are.
+Rules:
+- year_value is the primary/later year (e.g. the year the file was sent)
+- year_start is the year the FIRST date column belongs to
+- If dates span December and January: December belongs to the EARLIER year, January to the LATER year
+- If year_boundary_detected is true, year_start will be year_value - 1
+- If all dates are in one year, year_start equals year_value
+- All dates will be normalized to week-ending Saturday
 
-All dates will be normalized to week-ending Saturday.
+Example for a March 2026 file containing Dec 2025 through Mar 2026 data:
+year_value = 2026, year_start = 2025, year_boundary_detected = true
 
 Respond with JSON only:
-{{"year_value": 2026, "year_inference_strategy": "how year was determined", "week_convention": "what convention the source uses", "year_boundary_note": "null or explanation if dates span two years"}}"""
+{{"year_value": 2026, "year_start": 2025, "year_boundary_detected": true, "year_inference_strategy": "one sentence", "week_convention": "what convention the source uses"}}"""
 
 
 
@@ -1415,12 +1422,14 @@ async def stage_date_config(session_id: str):
                             yr = int(y)
                             year_value = 2000 + yr if yr < 100 else yr
                             break
+            year_boundary = date_axis.get("year_boundary_detected", False)
             session["date_config"][sheet_name] = {
                 "date_format":             date_axis["format"],
                 "year_present":            True,
                 "year_value":              year_value,
+                "year_start":              year_value - 1 if year_boundary else year_value,
                 "year_inference_strategy": "embedded_in_dates",
-                "year_boundary_detected":  date_axis.get("year_boundary_detected", False),
+                "year_boundary_detected":  year_boundary,
                 "normalize_to":            "week_ending_saturday",
                 "source":                  "python",
                 # Grid fields ingestion needs — stored here so it never reads grid directly
@@ -1448,11 +1457,18 @@ async def stage_date_config(session_id: str):
 
         result["normalize_to"]        = "week_ending_saturday"
         result["source"]              = "ai"
+        # Ensure year_boundary_detected and year_start are always present
+        # even if AI omits them — fall back to grid values as ground truth
+        if "year_boundary_detected" not in result:
+            result["year_boundary_detected"] = date_axis.get("year_boundary_detected", False)
+        if "year_start" not in result:
+            yb = result.get("year_boundary_detected", False)
+            yv = result.get("year_value", date.today().year)
+            result["year_start"] = yv - 1 if yb else yv
         # Grid fields ingestion needs — stored here so it never reads grid directly
-        result["year_boundary_detected"] = date_axis.get("year_boundary_detected", False)
-        result["date_axis_row"]          = date_axis.get("row", 0)
-        result["date_cols"]              = date_axis.get("cols", [])
-        result["data_start_row"]         = grid.get("data_start_row", 1)
+        result["date_axis_row"]  = date_axis.get("row", 0)
+        result["date_cols"]      = date_axis.get("cols", [])
+        result["data_start_row"] = grid.get("data_start_row", 1)
         session["date_config"][sheet_name] = result
 
     await stage_multisheet(session_id)
