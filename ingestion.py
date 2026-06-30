@@ -716,7 +716,7 @@ async def stage_write_inventory(session_id: str):
 
 
 async def stage_finalize(session_id: str):
-    """Update file_audit status."""
+    """Update file_audit status and refresh materialized forecast views."""
     session      = _sessions[session_id]
     unresolved   = session.get("unresolved_skus", [])
     audit_status = "ingested_partial" if unresolved else "ingested"
@@ -726,6 +726,13 @@ async def stage_finalize(session_id: str):
             await call_postgres(build_update_audit_status_sql(audit_id, audit_status, unresolved))
         except Exception as e:
             session["errors"].append(f"Failed to update audit status for {audit_id}: {e}")
+
+    # Refresh materialized forecast views — non-fatal if they fail
+    for view in ("mv_sku_seasonality", "mv_weekly_forecast"):
+        try:
+            await call_postgres(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view}")
+        except Exception as e:
+            session["errors"].append(f"View refresh failed for {view} (non-fatal): {e}")
 
     await stage_complete(session_id)
 
