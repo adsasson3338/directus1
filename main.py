@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import asyncio
 
-from shared import cleanup_stale_jobs
+from shared import cleanup_stale_jobs, sweep_stale_analyzing_rows
 from discovery import router as discovery_router
 from ingestion import router as ingestion_router
 
@@ -13,6 +13,7 @@ from ingestion import router as ingestion_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(cleanup_stale_jobs())
+    asyncio.create_task(sweep_stale_analyzing_rows())
     yield
 
 
