@@ -273,7 +273,6 @@ def extract_sales_and_inventory(
 
     for sheet_name in qualified_sheets:
         if sheet_name not in wb.sheetnames:
-            print(f"[DEBUG] Sheet '{sheet_name}' not in workbook sheets: {wb.sheetnames}")
             continue
 
         ws      = wb[sheet_name]
@@ -282,7 +281,6 @@ def extract_sales_and_inventory(
         dc      = date_config.get(sheet_name, {})
 
         if not mapping or not rows:
-            print(f"[DEBUG] Sheet '{sheet_name}': mapping={bool(mapping)} rows={len(rows) if rows else 0} — skipping")
             continue
 
         # Find column roles
@@ -313,9 +311,7 @@ def extract_sales_and_inventory(
         data_start = grid.get("data_start_row", 1)
 
         if not date_axis or retailer_sku_col is None:
-            print(f"[DEBUG] Sheet '{sheet_name}': date_axis={bool(date_axis)} retailer_sku_col={retailer_sku_col} — skipping")
             continue
-        print(f"[DEBUG] Sheet '{sheet_name}': date_axis row={date_axis.get('row')} cols={date_axis.get('cols')} rows_in_sheet={len(rows)}")
 
         # Extract inventory snapshot date from column headers above data_start
         if inventory_col is not None:
@@ -330,37 +326,23 @@ def extract_sales_and_inventory(
 
         # Parse date headers
         header_row = rows[date_axis_row] if date_axis_row < len(rows) else []
-        print(f"[DEBUG] Sheet '{sheet_name}': date_axis_row={date_axis_row} header_row_len={len(header_row)} date_col_idxs_sample={date_col_idxs[:5]}")
-        if header_row:
-            print(f"[DEBUG] header_row sample at date cols: {[header_row[c] if c < len(header_row) else 'OUT_OF_RANGE' for c in date_col_idxs[:5]]}")
         date_map   = {}  # col_idx -> date
         for col_idx in date_col_idxs:
             if col_idx < len(header_row):
                 parsed = parse_date_value(header_row[col_idx], dc)
                 if parsed:
                     date_map[col_idx] = parsed
-        print(f"[DEBUG] Sheet '{sheet_name}': date_map built with {len(date_map)} entries")
 
         if not date_map:
-            print(f"[DEBUG] Sheet '{sheet_name}': date_map empty — skipping sheet")
             continue
 
         # Process data rows
-        row_count = 0
         for row in rows[data_start:]:
-            row_count += 1
-            if row_count <= 3:
-                print(f"[DEBUG] row {row_count}: len={len(row)} retailer_sku_col={retailer_sku_col} row[retailer_sku_col]={row[retailer_sku_col] if retailer_sku_col < len(row) else 'OUT_OF_RANGE'!r}")
             if retailer_sku_col >= len(row) or row[retailer_sku_col] is None:
                 continue
 
             rsku = str(row[retailer_sku_col]).strip().strip("\r\n")
             if not rsku or rsku.lower() in ("total", "grand total", "subtotal", ""):
-                continue
-
-            # Skip subtotal/category rows
-            if retailer_sku_col > 0 and (row[0] is None or str(row[0]).strip().upper().startswith("TOTAL")):
-                print(f"[DEBUG] Skipping row with rsku={rsku!r} because row[0]={row[0]!r}")
                 continue
 
             # Supplier SKU
@@ -401,8 +383,6 @@ def extract_sales_and_inventory(
 
                 key = (rsku, str(week_end))
                 sales_map[key] = sales_map.get(key, 0) + units
-
-        print(f"[DEBUG] Sheet '{sheet_name}': processed {row_count} rows, sales_map now has {len(sales_map)} entries")
 
     # Build output rows
     sales_rows = []
