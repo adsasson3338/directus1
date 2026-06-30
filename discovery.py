@@ -18,6 +18,7 @@ from shared import (
     _sessions,
     call_postgres, call_ai,
     normalize_to_saturday,
+    _validate_uuid,
 )
 
 # ─────────────────────────────────────────────
