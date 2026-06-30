@@ -1710,18 +1710,18 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
     _sessions[session_id]["_pending_jobs"].add(file_job_id)
 
     async def _wait_for_file():
-        """Wait for file binary to arrive then run discovery."""
+        """
+        Poll for completion. The actual file binary is delivered to
+        POST /file/{job_id} (in ingestion.py), which invokes
+        handle_discovery_file_binary directly as a background task.
+        This loop just waits for that task to finish and update session status.
+        """
         for _ in range(120):  # wait up to 120 seconds
             await asyncio.sleep(1)
             session = _sessions.get(session_id)
             if not session:
                 return
-            if session.get("_file_ready"):
-                await handle_discovery_file_binary(
-                    session_id,
-                    session["_raw_data"],
-                    session.get("_filename", filename)
-                )
+            if session.get("status") in ("complete", "failed"):
                 return
         # Timed out waiting for file
         session = _sessions.get(session_id)
