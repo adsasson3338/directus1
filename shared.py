@@ -174,3 +174,30 @@ async def cleanup_stale_jobs():
         ]
         for sid in evict_ids:
             _sessions.pop(sid, None)
+
+
+async def sweep_stale_analyzing_rows():
+    """
+    Recover file_audit rows stuck in 'analyzing'. A row enters this state
+    the moment /analyze claims it (see build_claim_file_audit_sql) and should
+    leave it within minutes under normal discovery runtimes. If a row has
+    sat in 'analyzing' longer than SESSION_TIMEOUT_SECONDS, the process that
+    claimed it almost certainly crashed or was killed before finishing —
+    the in-memory session is gone, so this is a pure SQL recovery, not a
+    lookup against _sessions. Moves it to 'failed' so it surfaces through
+    the existing file_audit alerts webhook instead of sitting invisible.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await call_postgres(f"""
+UPDATE file_audit
+SET status = 'failed',
+    notes  = COALESCE(notes || E'\\n', '') || 'Auto-failed: stuck in analyzing past {SESSION_TIMEOUT_SECONDS}s — discovery process likely crashed',
+    updated_at = now()
+WHERE status = 'analyzing'
+  AND updated_at < now() - INTERVAL '{SESSION_TIMEOUT_SECONDS} seconds'
+""".strip())
+        except Exception:
+            # Don't let a transient DB error kill the sweep loop itself
+            pass
