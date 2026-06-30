@@ -86,6 +86,17 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
         except (ValueError, OverflowError):
             return None
 
+    # plain single date string: "01/04/25", "1/4/25", "01/04/2025"
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
+    if m:
+        mm, dd, yy = int(m.group(1)), int(m.group(2)), m.group(3)
+        yyyy = int(yy) if len(yy) == 4 else (2000 + int(yy))
+        try:
+            d = date(yyyy, mm, dd)
+            return normalize_to_saturday(d)
+        except (ValueError, OverflowError):
+            return None
+
     # fiscal_week_label: "Feb Wk 1", "Mar Wk 2", "Sept Wk 1"
     m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$', s, re.IGNORECASE)
     if m:
