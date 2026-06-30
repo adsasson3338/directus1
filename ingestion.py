@@ -70,14 +70,14 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
         end_day       = int(m.group(4))
         start_month   = int(m.group(1))
         year_boundary = date_config.get("year_boundary_detected", False)
-        # Dec→Jan crossing: end date is in the next year
+        # Dec→Jan crossing: year_value is the later (Jan) year,
+        # so December belongs to year - 1 and January belongs to year
         if start_month == 12 and end_month == 1:
-            end_year = year + 1
+            end_year = year          # Jan end date is in year_value year
+        elif start_month == 12 and end_month == 12 and year_boundary:
+            end_year = year - 1      # Pure-December range in year-boundary file: prior year
         # Jan→Dec crossing (unusual): end date is in the prior year
         elif start_month == 1 and end_month == 12:
-            end_year = year - 1
-        # Pure-December range in a year-boundary file: belongs to prior year
-        elif year_boundary and end_month == 12:
             end_year = year - 1
         else:
             end_year = year
