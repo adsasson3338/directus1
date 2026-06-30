@@ -7,6 +7,7 @@ import json
 import time
 import asyncio
 import urllib.request
+import uuid
 from datetime import date, timedelta
 
 import asyncpg
@@ -22,6 +23,20 @@ from config import (
     SESSION_TIMEOUT_SECONDS,
     SESSION_GRACE_SECONDS,
 )
+
+# ─────────────────────────────────────────────
+# VALIDATION HELPERS (shared by discovery and ingestion)
+# ─────────────────────────────────────────────
+
+def _validate_uuid(v: str) -> str:
+    """Validate UUID format — raises ValueError if invalid."""
+    return str(uuid.UUID(str(v)))
+
+
+def _validate_date(v: str) -> str:
+    """Validate ISO date string — raises ValueError if invalid."""
+    date.fromisoformat(str(v))
+    return str(v)
 
 # ─────────────────────────────────────────────
 # SHARED STATE
