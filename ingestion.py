@@ -19,6 +19,7 @@ from shared import (
     _sessions, _jobs,
     call_postgres, fire_fetch_file_webhook,
     normalize_to_saturday,
+    _validate_uuid, _validate_date,
 )
 
 router = APIRouter()
@@ -116,18 +117,6 @@ def _sql_escape(v) -> str:
 
     """Convert retailer name to a safe Postgres identifier."""
     return re.sub(r"[^a-z0-9_]", "_", retailer.lower()) + "_weekly_sales"
-
-def _validate_uuid(v: str) -> str:
-    """Validate UUID format — raises ValueError if invalid."""
-    import uuid as _uuid
-    return str(_uuid.UUID(str(v)))
-
-def _validate_date(v: str) -> str:
-    """Validate ISO date string — raises ValueError if invalid."""
-    from datetime import date as _date
-    _date.fromisoformat(str(v))
-    return str(v)
-
 
 def build_fetch_audit_row_sql(file_audit_id: str) -> str:
     safe_id = _validate_uuid(file_audit_id)
