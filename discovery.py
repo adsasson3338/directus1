@@ -537,6 +537,23 @@ def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> s
     return f"{retailer_clean}_{year_value}-W{week_num:02d}"
 
 
+def build_claim_file_audit_sql(file_audit_id: str) -> str:
+    """
+    Atomically flip status received -> analyzing, conditioned on the row
+    still being 'received'. Returns the updated id if this call won the
+    race, or zero rows if another concurrent poll already claimed it.
+    Prevents the same file_audit row from being picked up twice by
+    overlapping polling runs while discovery is still in progress.
+    """
+    return f"""
+UPDATE file_audit
+SET status = 'analyzing', updated_at = now()
+WHERE id = '{file_audit_id}'
+  AND status = 'received'
+RETURNING id
+""".strip()
+
+
 def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       retailer: str | None, status: str,
                                       file_set_key: str | None,
@@ -1667,6 +1684,20 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
 
     filename  = audit_row.get("filename", "unknown.xlsx")
     file_hash_val = audit_row.get("file_hash")
+
+    # Atomically claim this row — flips received -> analyzing.
+    # If another concurrent poll already claimed it, bail out cleanly
+    # instead of running discovery twice on the same file.
+    try:
+        claim_rows = await call_postgres(build_claim_file_audit_sql(safe_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to claim audit row: {e}")
+
+    if not claim_rows:
+        return JSONResponse(content={
+            "status": "skipped",
+            "reason": f"file_audit row {safe_id} is no longer 'received' — already claimed or processed",
+        })
 
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
