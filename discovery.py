@@ -15,10 +15,11 @@ import time
 from datetime import datetime, date, timedelta
 
 from shared import (
-    _sessions,
-    call_postgres, call_ai,
+    _sessions, _jobs,
+    call_postgres, call_ai, fire_fetch_file_webhook,
     normalize_to_saturday,
-    _validate_uuid,
+    _validate_uuid, _sql_escape,
+    build_fetch_audit_row_sql,
 )
 
 # ─────────────────────────────────────────────
