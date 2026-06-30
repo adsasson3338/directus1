@@ -78,8 +78,12 @@ async def call_postgres(sql: str) -> list:
 # AI
 # ─────────────────────────────────────────────
 
-async def call_ai(prompt: str) -> str:
+async def call_ai(prompt: str, label: str = "") -> str:
     """Call OpenRouter and return the response text. Raises on error."""
+    # Log prompt (truncated for readability)
+    tag = f"[AI:{label}]" if label else "[AI]"
+    print(f"{tag} PROMPT ({len(prompt)} chars):\n{prompt[:500]}{'...' if len(prompt) > 500 else ''}")
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -95,7 +99,10 @@ async def call_ai(prompt: str) -> str:
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        result = data["choices"][0]["message"]["content"]
+
+    print(f"{tag} RESPONSE ({len(result)} chars):\n{result[:500]}{'...' if len(result) > 500 else ''}")
+    return result
 
 
 # ─────────────────────────────────────────────
