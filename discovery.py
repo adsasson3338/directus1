@@ -1622,7 +1622,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
     # Dedup check — skip if this hash belongs to a different file_audit row
     try:
         dedup_rows = await call_postgres(build_dedup_check_sql(session["file_hash"]))
-        if dedup_rows and dedup_rows[0].get("id") != session.get("file_audit_id"):
+        if dedup_rows and str(dedup_rows[0].get("id")) != str(session.get("file_audit_id")):
             existing_id     = dedup_rows[0].get("id")
             existing_status = dedup_rows[0].get("status")
             session["stage"]  = "complete"
@@ -1714,20 +1714,27 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
         Poll for completion. The actual file binary is delivered to
         POST /file/{job_id} (in ingestion.py), which invokes
         handle_discovery_file_binary directly as a background task.
-        This loop just waits for that task to finish and update session status.
+        This loop just waits for that task to finish — it never overwrites
+        a session that has progressed past the initial 'accepted' stage,
+        since that would mean real processing is underway (e.g. AI column
+        classification across multiple sheets, which can legitimately take
+        a while) and must not be stomped by an artificial timeout.
         """
-        for _ in range(120):  # wait up to 120 seconds
+        for _ in range(300):  # wait up to 5 minutes
             await asyncio.sleep(1)
             session = _sessions.get(session_id)
             if not session:
                 return
             if session.get("status") in ("complete", "failed"):
                 return
-        # Timed out waiting for file
+        # Timed out — only treat as a real failure if the file binary itself
+        # never arrived (session never progressed past "accepted"/"running"
+        # with no sheets loaded). Otherwise leave the session alone; it is
+        # still legitimately processing and will complete on its own.
         session = _sessions.get(session_id)
-        if session:
+        if session and session.get("_sheets") is None:
             session["stage"]  = "complete"
-            session["status"] = "complete"
+            session["status"] = "failed"
             session["result"] = {"error": "Timed out waiting for file binary from MinIO"}
 
     background_tasks.add_task(_wait_for_file)
