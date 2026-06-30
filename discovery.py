@@ -260,6 +260,7 @@ def extract_qualify_signals(rows: list, sheet_name: str, filename: str) -> dict:
         "crosshair_sample": crosshair_sample,
         "column_labels":    sorted(column_labels, key=len)[:10],
         "inline_strings":   sorted(inline_strings, key=len)[:10],
+        "date_col_count":   len(date_axis["cols"]) if date_axis else 0,
     }
 
 
@@ -278,6 +279,7 @@ Disqualify if any of the following are true:
 EVIDENCE:
 Sheet name: {signals["sheet_name"]}
 Filename: {signals["filename"]}
+Detected date columns: {signals.get("date_col_count", 0)}
 Crosshair sample values: {signals["crosshair_sample"]}
 Dominant crosshair type: {signals["dominant_type"]}
 Column labels: {signals["column_labels"]}
