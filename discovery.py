@@ -1423,6 +1423,10 @@ async def stage_date_config(session_id: str):
                 "year_boundary_detected":  date_axis.get("year_boundary_detected", False),
                 "normalize_to":            "week_ending_saturday",
                 "source":                  "python",
+                # Grid fields ingestion needs — stored here so it never reads grid directly
+                "date_axis_row":           date_axis.get("row", 0),
+                "date_cols":               date_axis.get("cols", []),
+                "data_start_row":          grid.get("data_start_row", 1),
             }
             continue
 
@@ -1442,8 +1446,13 @@ async def stage_date_config(session_id: str):
         except Exception as e:
             result = {"error": f"AI error: {e}"}
 
-        result["normalize_to"] = "week_ending_saturday"
-        result["source"]       = "ai"
+        result["normalize_to"]        = "week_ending_saturday"
+        result["source"]              = "ai"
+        # Grid fields ingestion needs — stored here so it never reads grid directly
+        result["year_boundary_detected"] = date_axis.get("year_boundary_detected", False)
+        result["date_axis_row"]          = date_axis.get("row", 0)
+        result["date_cols"]              = date_axis.get("cols", [])
+        result["data_start_row"]         = grid.get("data_start_row", 1)
         session["date_config"][sheet_name] = result
 
     await stage_multisheet(session_id)
