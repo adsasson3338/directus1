@@ -38,6 +38,22 @@ def _validate_date(v: str) -> str:
     date.fromisoformat(str(v))
     return str(v)
 
+
+def _sql_escape(v) -> str:
+    """Escape a value for safe inline SQL string embedding."""
+    return str(v).replace("'", "''")
+
+
+def build_fetch_audit_row_sql(file_audit_id: str) -> str:
+    """Fetch a single file_audit row by id — used by both discovery and ingestion."""
+    safe_id = _validate_uuid(file_audit_id)
+    return f"""
+SELECT id, filename, file_hash, minio_path, retailer, status, discovery_result
+FROM file_audit
+WHERE id = '{safe_id}'
+LIMIT 1
+""".strip()
+
 # ─────────────────────────────────────────────
 # SHARED STATE
 # ─────────────────────────────────────────────
