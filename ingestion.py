@@ -141,13 +141,12 @@ def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) ->
     rule is skipped for that column.
     """
     base_year    = date_config.get("year_value", date.today().year)
+    # year_start is set by discovery — the year the first date column belongs to.
+    # If absent (old discovery results), fall back to year_value - 1 for boundary files.
     year_boundary = date_config.get("year_boundary_detected", False)
-    # For year-boundary files, discovery sets year_value to the LATER year.
-    # Start counting from year_value - 1 so December columns land in the
-    # earlier year and the rollover fires naturally at the Dec→Jan boundary.
-    current_year = base_year - 1 if year_boundary else base_year
-    prev_month   = None
-    date_map     = {}
+    current_year  = date_config.get("year_start", base_year - 1 if year_boundary else base_year)
+    prev_month    = None
+    date_map      = {}
 
     for col_idx in date_col_idxs:
         if col_idx >= len(header_row):
@@ -408,8 +407,8 @@ def extract_sales_and_inventory(
                     if parsed and (inv_as_of_date is None or str(parsed) > inv_as_of_date):
                         inv_as_of_date = str(parsed)
 
-        date_axis_row = date_axis.get("row", 0)
-        date_col_idxs = date_axis.get("cols", [])
+        date_axis_row = dc.get("date_axis_row", 0)
+        date_col_idxs = dc.get("date_cols", [])
 
         # Build date map using monotonic sequence rule — no year guessing
         header_row = rows[date_axis_row] if date_axis_row < len(rows) else ()
