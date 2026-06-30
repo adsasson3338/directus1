@@ -19,7 +19,8 @@ from shared import (
     _sessions, _jobs,
     call_postgres, fire_fetch_file_webhook,
     normalize_to_saturday,
-    _validate_uuid, _validate_date,
+    _validate_uuid, _validate_date, _sql_escape,
+    build_fetch_audit_row_sql,
 )
 
 router = APIRouter()
@@ -110,23 +111,6 @@ def parse_date_value(val, date_config: dict) -> Optional[date]:
 # ─────────────────────────────────────────────
 # SQL HELPERS
 # ─────────────────────────────────────────────
-
-def _sql_escape(v) -> str:
-    """Escape a value for safe inline SQL string embedding."""
-    return str(v).replace("'", "''")
-
-    """Convert retailer name to a safe Postgres identifier."""
-    return re.sub(r"[^a-z0-9_]", "_", retailer.lower()) + "_weekly_sales"
-
-def build_fetch_audit_row_sql(file_audit_id: str) -> str:
-    safe_id = _validate_uuid(file_audit_id)
-    return f"""
-SELECT id, filename, file_hash, minio_path, retailer, status, discovery_result
-FROM file_audit
-WHERE id = '{safe_id}'
-LIMIT 1
-""".strip()
-
 
 def build_fetch_retailer_config_sql(retailer: str) -> str:
     retailer_safe = retailer.replace("'", "''")
