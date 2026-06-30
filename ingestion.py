@@ -346,7 +346,11 @@ def extract_sales_and_inventory(
             continue
 
         # Process data rows
+        row_count = 0
         for row in rows[data_start:]:
+            row_count += 1
+            if row_count <= 3:
+                print(f"[DEBUG] row {row_count}: len={len(row)} retailer_sku_col={retailer_sku_col} row[retailer_sku_col]={row[retailer_sku_col] if retailer_sku_col < len(row) else 'OUT_OF_RANGE'!r}")
             if retailer_sku_col >= len(row) or row[retailer_sku_col] is None:
                 continue
 
@@ -397,6 +401,8 @@ def extract_sales_and_inventory(
 
                 key = (rsku, str(week_end))
                 sales_map[key] = sales_map.get(key, 0) + units
+
+        print(f"[DEBUG] Sheet '{sheet_name}': processed {row_count} rows, sales_map now has {len(sales_map)} entries")
 
     # Build output rows
     sales_rows = []
