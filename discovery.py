@@ -1568,6 +1568,30 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
         session["result"] = {"error": f"'{filename}' is not an Excel file"}
         return
 
+    # Immediate filename check — internal D365 inventory exports never need
+    # sales-data qualification, so route them before opening the workbook at all.
+    known_type = detect_known_file_type(filename, [])
+    if known_type:
+        file_audit_id = session.get("file_audit_id")
+        if not session.get("file_hash"):
+            session["file_hash"] = file_hash(data)
+        if file_audit_id:
+            try:
+                sql = build_update_file_audit_full_sql(
+                    file_audit_id,
+                    {"status": "routed_by_filename"},
+                    None, known_type, None,
+                    file_hash=session.get("file_hash"),
+                    filename=filename,
+                )
+                await call_postgres(sql)
+            except Exception as e:
+                session.setdefault("errors", []).append(f"Failed to write {known_type} status: {e}")
+        session["stage"]  = "complete"
+        session["status"] = "complete"
+        session["result"] = {"status": known_type}
+        return
+
     MAX_UPLOAD_BYTES = 50 * 1024 * 1024
     if len(data) > MAX_UPLOAD_BYTES:
         session["stage"]  = "complete"
