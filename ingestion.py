@@ -356,6 +356,7 @@ def extract_sales_and_inventory(
 
             # Skip subtotal/category rows
             if retailer_sku_col > 0 and (row[0] is None or str(row[0]).strip().upper().startswith("TOTAL")):
+                print(f"[DEBUG] Skipping row with rsku={rsku!r} because row[0]={row[0]!r}")
                 continue
 
             # Supplier SKU
