@@ -36,83 +36,166 @@ MONTH_MAP = {
 
 
 
-def parse_date_value(val, date_config: dict) -> Optional[date]:
+def _extract_leading_month(val) -> Optional[int]:
     """
-    Parse a date column header value to a week-ending Saturday date.
-    Handles: datetime objects, date_range_string (12/21-12/27), fiscal_week_label (Feb Wk 1)
+    Extract the tracking month from a date header — used to detect year
+    rollovers via monotonic sequence. For date ranges we use the END month
+    since that's what gets resolved as the actual date. For all other formats
+    we use the leading/only month.
     """
-    year = date_config.get("year_value", date.today().year)
-    fmt  = date_config.get("date_format") or date_config.get("format", "")
-
     if isinstance(val, datetime):
-        return normalize_to_saturday(val.date())
-
+        return val.month
     if isinstance(val, date):
-        return normalize_to_saturday(val)
-
+        return val.month
     if not isinstance(val, str):
         return None
-
     s = val.strip()
-
-    # datetime string: "2026-01-03 00:00:00"
+    # ISO datetime string
     if re.match(r'^\d{4}-\d{2}-\d{2}', s):
         try:
-            d = datetime.strptime(s[:10], "%Y-%m-%d").date()
-            return normalize_to_saturday(d)
-        except (ValueError, OverflowError):
+            return int(s[5:7])
+        except (ValueError, IndexError):
             return None
-
-    # date_range_string: "12/21-12/27" or "1/4-1/10"
+    # date_range_string: use END month (that's what gets resolved as the date)
     m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
     if m:
-        end_month     = int(m.group(3))
-        end_day       = int(m.group(4))
-        start_month   = int(m.group(1))
-        year_boundary = date_config.get("year_boundary_detected", False)
-        # Dec→Jan crossing: year_value is the later (Jan) year,
-        # so December belongs to year - 1 and January belongs to year
-        if start_month == 12 and end_month == 1:
-            end_year = year          # Jan end date is in year_value year
-        elif start_month == 12 and end_month == 12 and year_boundary:
-            end_year = year - 1      # Pure-December range in year-boundary file: prior year
-        # Jan→Dec crossing (unusual): end date is in the prior year
-        elif start_month == 1 and end_month == 12:
-            end_year = year - 1
-        else:
-            end_year = year
+        return int(m.group(3))
+    # plain single date: MM/DD/YY or MM/DD/YYYY
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
+    if m:
+        return int(m.group(1))
+    # fiscal_week_label: "Feb Wk 1"
+    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', s, re.IGNORECASE)
+    if m:
+        return MONTH_MAP[m.group(1).lower()[:3]]
+    return None
+
+
+def _resolve_date(val, year: int) -> Optional[date]:
+    """
+    Resolve a single date header value to a week-ending Saturday,
+    given an already-determined year. No year logic here — year is
+    passed in from build_date_map which owns that decision.
+    """
+    if isinstance(val, datetime):
+        return normalize_to_saturday(val.date())
+    if isinstance(val, date):
+        return normalize_to_saturday(val)
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    # ISO datetime string — year already embedded, ignore passed year
+    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
         try:
-            return date(end_year, end_month, end_day)
+            return normalize_to_saturday(datetime.strptime(s[:10], "%Y-%m-%d").date())
         except (ValueError, OverflowError):
             return None
-
-    # plain single date string: "01/04/25", "1/4/25", "01/04/2025"
+    # plain single date with year embedded — ignore passed year
     m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
     if m:
         mm, dd, yy = int(m.group(1)), int(m.group(2)), m.group(3)
         yyyy = int(yy) if len(yy) == 4 else (2000 + int(yy))
         try:
-            d = date(yyyy, mm, dd)
-            return normalize_to_saturday(d)
+            return normalize_to_saturday(date(yyyy, mm, dd))
         except (ValueError, OverflowError):
             return None
-
-    # fiscal_week_label: "Feb Wk 1", "Mar Wk 2", "Sept Wk 1"
+    # date_range_string: use end date with passed year
+    m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
+    if m:
+        end_month, end_day = int(m.group(3)), int(m.group(4))
+        try:
+            return date(year, end_month, end_day)
+        except (ValueError, OverflowError):
+            return None
+    # fiscal_week_label: "Feb Wk 1"
     m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$', s, re.IGNORECASE)
     if m:
-        month_num     = MONTH_MAP[m.group(1).lower()[:3]]  # slice to 3 chars for MONTH_MAP lookup
-        week_num      = int(m.group(2))
-        year_boundary = date_config.get("year_boundary_detected", False)
-        # Jan weeks on a year-boundary file belong to year+1
-        effective_year = (year + 1) if (year_boundary and month_num == 1) else year
+        month_num = MONTH_MAP[m.group(1).lower()[:3]]
+        week_num  = int(m.group(2))
         try:
-            first_of_month = date(effective_year, month_num, 1)
+            first_of_month = date(year, month_num, 1)
             approx = first_of_month + timedelta(days=(week_num - 1) * 7)
             return normalize_to_saturday(approx)
         except (ValueError, OverflowError):
             return None
-
     return None
+
+
+def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) -> dict:
+    """
+    Build col_idx -> week_ending date mapping for all date columns.
+
+    Year assignment uses the monotonic-sequence rule:
+    - Start from year_value (discovery's determination)
+    - Extract the leading month from each header in sequence
+    - When the month number drops (e.g. Dec→Jan, or Wk4→Wk1 across months),
+      increment the current year
+    - Assign the current year to each column before resolving its date
+
+    This means ingestion never guesses year logic — it only needs
+    year_value from discovery, and derives everything else from the
+    sequence of headers as they actually appear in the file.
+
+    For formats with year embedded (datetime objects, "01/04/25" strings,
+    ISO strings), the embedded year takes precedence and the monotonic
+    rule is skipped for that column.
+    """
+    base_year    = date_config.get("year_value", date.today().year)
+    year_boundary = date_config.get("year_boundary_detected", False)
+    # For year-boundary files, discovery sets year_value to the LATER year.
+    # Start counting from year_value - 1 so December columns land in the
+    # earlier year and the rollover fires naturally at the Dec→Jan boundary.
+    current_year = base_year - 1 if year_boundary else base_year
+    prev_month   = None
+    date_map     = {}
+
+    for col_idx in date_col_idxs:
+        if col_idx >= len(header_row):
+            continue
+        val = header_row[col_idx]
+        if val is None:
+            continue
+
+        # For formats with year already embedded, resolve directly
+        # and update prev_month but don't apply the monotonic rule
+        has_embedded_year = (
+            isinstance(val, (datetime, date)) or
+            (isinstance(val, str) and (
+                re.match(r'^\d{4}-\d{2}-\d{2}', val.strip()) or
+                re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', val.strip())
+            ))
+        )
+        if has_embedded_year:
+            resolved = _resolve_date(val, current_year)
+            if resolved:
+                date_map[col_idx] = resolved
+                prev_month = _extract_leading_month(val)
+            continue
+
+        # Apply monotonic rule to assign year
+        leading_month = _extract_leading_month(val)
+        if leading_month is not None and prev_month is not None:
+            if leading_month < prev_month:
+                current_year += 1
+        if leading_month is not None:
+            prev_month = leading_month
+
+        resolved = _resolve_date(val, current_year)
+        if resolved:
+            date_map[col_idx] = resolved
+
+    return date_map
+
+
+# Keep parse_date_value as a legacy fallback — not used in main pipeline
+def parse_date_value(val, date_config: dict) -> Optional[date]:
+    """Legacy single-value date parser. Use build_date_map for production paths."""
+    year = date_config.get("year_value", date.today().year)
+    if isinstance(val, datetime):
+        return normalize_to_saturday(val.date())
+    if isinstance(val, date):
+        return normalize_to_saturday(val)
+    return _resolve_date(val, year)
 
 
 # ─────────────────────────────────────────────
@@ -324,14 +407,9 @@ def extract_sales_and_inventory(
         date_axis_row = date_axis.get("row", 0)
         date_col_idxs = date_axis.get("cols", [])
 
-        # Parse date headers
-        header_row = rows[date_axis_row] if date_axis_row < len(rows) else []
-        date_map   = {}  # col_idx -> date
-        for col_idx in date_col_idxs:
-            if col_idx < len(header_row):
-                parsed = parse_date_value(header_row[col_idx], dc)
-                if parsed:
-                    date_map[col_idx] = parsed
+        # Build date map using monotonic sequence rule — no year guessing
+        header_row = rows[date_axis_row] if date_axis_row < len(rows) else ()
+        date_map   = build_date_map(header_row, date_col_idxs, dc)
 
         if not date_map:
             continue
