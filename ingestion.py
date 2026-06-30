@@ -388,19 +388,23 @@ def extract_sales_and_inventory(
             elif classification == "open_order":
                 open_order_col = col_idx
 
-        # Find date axis from grid
-        grid       = discovery_result.get("grid", {}).get(sheet_name, {})
-        date_axis  = grid.get("date_axis", {})
-        data_start = grid.get("data_start_row", 1)
+        # Find date axis from date_config — discovery stores these directly now
+        # so ingestion never needs to read grid at all
+        date_axis_row = dc.get("date_axis_row", 0)
+        date_col_idxs = dc.get("date_cols", [])
+        data_start    = dc.get("data_start_row", 1)
 
-        if not date_axis or retailer_sku_col is None:
+        if not date_col_idxs or retailer_sku_col is None:
             continue
 
         # Extract inventory snapshot date from column headers above data_start
         if inventory_col is not None:
             for hrow_idx in range(min(data_start, len(rows))):
                 if inventory_col < len(rows[hrow_idx]) and rows[hrow_idx][inventory_col]:
-                    parsed = parse_date_value(str(rows[hrow_idx][inventory_col]).strip(), dc)
+                    parsed = _resolve_date(
+                        str(rows[hrow_idx][inventory_col]).strip(),
+                        dc.get("year_value", date.today().year)
+                    )
                     if parsed and (inv_as_of_date is None or str(parsed) > inv_as_of_date):
                         inv_as_of_date = str(parsed)
 
