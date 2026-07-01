@@ -799,21 +799,45 @@ def extract_column_schema(ws, sheet_name: str) -> dict:
     }
 
 
+def detect_first_sales_col(schema: dict, date_axis_row: int) -> int:
+    """
+    Detect the first column (1-based) containing a date-like value in the date axis row.
+    """
+    DATE_PATTERNS = [
+        re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}$'),
+        re.compile(r'^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$'),
+        re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', re.IGNORECASE),
+        re.compile(r'^wk\s*\d+$', re.IGNORECASE),
+    ]
+    for col in sorted(schema.get("columns", []), key=lambda c: c["col"]):
+        for h in col.get("header_stack", []):
+            if h["row"] == date_axis_row:
+                val = str(h.get("value", "")).strip()
+                if any(p.match(val) for p in DATE_PATTERNS):
+                    return col["col"]
+    return 1
+
+
 def build_date_schema_prompt(schema: dict, filename: str) -> str:
     """
-    Pass 1 - AI identifies the sales date column pattern.
-    Python then enumerates all matching columns mechanically.
+    AI identifies only the semantic label context for the sales date block:
+    - What label (if any) appears above the sales columns (e.g. "UNITS", "Sales")
+    - What labels signal the END of the sales block (e.g. "INV", "TOTAL", "On Order")
+    - What row contains those section labels
+
+    Everything else (date_axis_row, first_sales_col, data_start_row, year_present,
+    year_boundary, date_format) is detected by Python from the data directly.
     """
     header_rows = schema.get("header_rows", [])
 
-    # Build compact header grid showing all columns
+    # Build compact header grid
     header_grid = []
     for row_num in header_rows:
         row_cells = []
         for col in schema.get("columns", []):
             val = ""
             for h in col.get("header_stack", []):
-                if h["row"] == row_num:  # both are 1-based
+                if h["row"] == row_num:
                     val = h["value"][:15]
                     break
             if val:
@@ -823,46 +847,24 @@ def build_date_schema_prompt(schema: dict, filename: str) -> str:
 
     grid_text = "\n".join(header_grid)
 
-    return f"""You are analyzing the header structure of a retail sales spreadsheet to identify the sales date column pattern.
+    return f"""You are analyzing the header structure of a retail sales spreadsheet.
 
 File: {filename}
 Sheet: {schema["sheet_name"]}
 
-HEADER ROWS (compact - showing only non-empty cells):
+HEADER ROWS:
 {grid_text}
 
-Your task: Identify the pattern that defines weekly sales date columns.
-
-Sales date columns are a consecutive block with:
-- Weekly date values in one row (e.g. "01/03/26", "12/21-12/27", "Feb Wk 1")
-- Possibly a section label in the row above (e.g. "Sales", "UNITS") - or nothing above them
-- The block ENDS when the section label changes (e.g. "INV", "Total", "On Order") or a non-date value appears
+The sales date columns are a consecutive block of weekly date values (e.g. "01/03/26", "12/21-12/27", "Feb Wk 1").
+They may have a section label in the row above (e.g. "Sales", "UNITS") and end when the section label changes (e.g. "INV", "TOTAL", "On Order").
 
 Identify:
-1. date_axis_row: row number (1-based) of the row containing the ACTUAL DATE VALUES like "01/03/26", "12/21-12/27", "Feb Wk 1" - NOT the column label row with text like "SKU Number" or "Business Unit"
-2. section_label_row: row number (1-based) containing section group labels like "Sales" or "INV" ABOVE the date row (null if none)
-3. sales_section_label: the exact label above the SALES date columns (e.g. "Sales", null if no label)
-4. stop_labels: exact labels that signal the END of the sales block (e.g. ["INV", "TOTAL", "On Order"])
-5. first_sales_col: column number (1-based) of the FIRST column containing a sales date value
-6. date_format: pattern e.g. "MM/DD/YY", "MM/DD-MM/DD", "Mon Wk N"
-7. data_start_row: first row (1-based) with actual product/SKU data
-8. year_present: true only if a year is embedded in the date values themselves
-9. year_boundary: true if dates span December and January
-
-IMPORTANT: date_axis_row is the row with actual date/week values, not text labels.
+1. section_label_row: row number (1-based) containing section group labels ABOVE the date values (null if none)
+2. sales_section_label: the exact label above the SALES date columns (null if no label row)
+3. stop_labels: exact labels that signal the END of the sales block (empty list if the sheet has no non-sales sections)
 
 Respond with JSON only:
-{{
-  "date_axis_row": 5,
-  "section_label_row": 4,
-  "sales_section_label": "Sales",
-  "stop_labels": ["INV", "TOTAL", "On Order"],
-  "first_sales_col": 6,
-  "date_format": "MM/DD-MM/DD",
-  "data_start_row": 7,
-  "year_present": false,
-  "year_boundary": true
-}}"""
+{{"section_label_row": 4, "sales_section_label": "UNITS", "stop_labels": ["INV", "TOTAL", "On Order"]}}"""
 
 
 def detect_date_axis_row(schema: dict) -> int:
@@ -884,17 +886,15 @@ def detect_date_axis_row(schema: dict) -> int:
 
 def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     """
-    Python enumerates sales date columns using the pattern identified by AI.
-    Scans columns from first_sales_col, collecting those that match the date pattern.
-    Stops when section label changes or date pattern breaks.
+    Python enumerates sales date columns.
+    AI provides only section label context (sales_section_label, stop_labels).
+    Everything else is detected by Python.
     """
-    # Detect date_axis_row from schema directly - more reliable than AI
-    date_axis_row    = detect_date_axis_row(schema)        # 1-based
-    section_label_row = date_schema.get("section_label_row")      # 1-based or None
-    sales_label      = (date_schema.get("sales_section_label") or "").strip().upper()
-    stop_labels      = [s.strip().upper() for s in date_schema.get("stop_labels", [])]
-    first_sales_col  = date_schema.get("first_sales_col", 1)      # 1-based
-    date_format      = date_schema.get("date_format", "")
+    date_axis_row     = detect_date_axis_row(schema)                         # 1-based, Python
+    first_sales_col   = detect_first_sales_col(schema, date_axis_row)        # 1-based, Python
+    section_label_row = date_schema.get("section_label_row")                 # 1-based or None, AI
+    sales_label       = (date_schema.get("sales_section_label") or "").strip().upper()  # AI
+    stop_labels       = [s.strip().upper() for s in date_schema.get("stop_labels", [])]  # AI
 
     # Build col -> header values map
     col_headers = {}
@@ -1283,10 +1283,24 @@ async def stage_schema_classify(session_id: str):
         col_results   = result.get("columns", [])
         col_results   = [{**c, "col": c["col"] - 1} for c in col_results]
 
-        data_start    = date_schema.get("data_start_row", schema["data_start_row"])
-        date_axis_row = date_schema.get("date_axis_row", data_start - 1)
-        year_boundary = date_schema.get("year_boundary", False)
-        year_present  = date_schema.get("year_present", False)
+        data_start    = schema["data_start_row"]               # Python
+        date_axis_row = detect_date_axis_row(schema)           # Python (1-based)
+        rows_data     = session["_sheets"].get(sheet_name, [])
+        axis_row_0    = date_axis_row - 1                      # 0-based
+
+        # Detect format and year flags from actual header values
+        axis_row_vals = [
+            rows_data[axis_row_0][c]
+            for c in sales_cols_0based
+            if axis_row_0 < len(rows_data) and c < len(rows_data[axis_row_0])
+            and rows_data[axis_row_0][c] is not None
+        ]
+        formats = set(classify_cell(v) for v in axis_row_vals)
+        date_fmt = list(formats)[0] if len(formats) == 1 else "mixed"
+
+        year_present  = date_fmt == "datetime" or any(
+            YEAR_RE.search(str(v)) for v in axis_row_vals
+        )
 
         col_schema_map = {c["col"]: c for c in schema["columns"]}
         sample_vals    = []
@@ -1303,25 +1317,25 @@ async def stage_schema_classify(session_id: str):
             for m in YEAR_RE.finditer(session["filename"])
         ]
 
+        # Detect year boundary from actual month sequence
+        month_seq      = extract_month_sequence(rows_data[axis_row_0] if axis_row_0 < len(rows_data) else [], sales_cols_0based)
+        month_set      = set(m for m in month_seq if m is not None)
+        year_boundary  = 12 in month_set and 1 in month_set
+
         date_axis = {
-            "row":                    date_axis_row - 1,
+            "row":                    axis_row_0,
             "col_count":              len(sales_cols_0based),
             "cols":                   sales_cols_0based,
             "sample_values":          sample_vals,
-            "format":                 date_schema.get("date_format", "mixed"),
+            "format":                 date_fmt,
             "year_present":           year_present,
             "interleaved_empty_cols": False,
             "year_boundary_detected": year_boundary,
         }
 
-        # Compute month_sequence for deterministic year_start calculation in stage_date_config
+        # Store month_sequence if boundary detected
         if year_boundary:
-            rows_data = session["_sheets"].get(sheet_name, [])
-            axis_row  = date_axis_row - 1  # 0-based
-            if axis_row < len(rows_data):
-                date_axis["month_sequence"] = extract_month_sequence(
-                    rows_data[axis_row], sales_cols_0based
-                )
+            date_axis["month_sequence"] = month_seq
 
         rows     = session["_sheets"].get(sheet_name, [])
         embedded = detect_embedded_sku(rows, sales_cols_0based, data_start - 1)
