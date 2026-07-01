@@ -1258,6 +1258,37 @@ async def stage_schema_classify(session_id: str):
             "year_boundary_detected": year_boundary,
         }
 
+        # Compute month_sequence for deterministic year_start calculation in stage_date_config
+        if year_boundary:
+            rows_data = session["_sheets"].get(sheet_name, [])
+            axis_row  = date_axis_row - 1  # 0-based
+            if axis_row < len(rows_data):
+                _month_map = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+                              'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
+                month_seq = []
+                for ci in sales_cols_0based:
+                    if ci >= len(rows_data[axis_row]) or rows_data[axis_row][ci] is None:
+                        month_seq.append(None)
+                        continue
+                    val = rows_data[axis_row][ci]
+                    if isinstance(val, datetime):
+                        month_seq.append(val.month)
+                    elif isinstance(val, str):
+                        s = val.strip()
+                        m = re.match(r'^(\d{1,2})/(\d{1,2})[-\u2013](\d{1,2})/(\d{1,2})$', s)
+                        if m:
+                            month_seq.append(int(m.group(3)))  # end month
+                            continue
+                        mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
+                                      s, re.IGNORECASE)
+                        if mf:
+                            month_seq.append(_month_map[mf.group(1).lower()[:3]])
+                            continue
+                        month_seq.append(None)
+                    else:
+                        month_seq.append(None)
+                date_axis["month_sequence"] = month_seq
+
         rows     = session["_sheets"].get(sheet_name, [])
         embedded = detect_embedded_sku(rows, sales_cols_0based, data_start - 1)
 
