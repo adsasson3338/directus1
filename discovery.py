@@ -575,10 +575,72 @@ def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> s
                 break
 
         month_seq = []
+        last_sample_val = None
         if grid and sheet_name:
-            month_seq = grid.get(sheet_name, {}).get("date_axis", {}).get("month_sequence", [])
+            date_axis_g     = grid.get(sheet_name, {}).get("date_axis", {})
+            month_seq       = date_axis_g.get("month_sequence", [])
+            last_sample_val = date_axis_g.get("last_sample_val")
 
-        if month_seq:
+        # First try: parse last_sample_val directly (most accurate)
+        if last_sample_val:
+            s = str(last_sample_val).strip()
+            # MM/DD/YY or MM/DD/YYYY
+            m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$", s)
+            if m:
+                mo, dy, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                yr = 2000 + yr if yr < 100 else yr
+                try:
+                    parsed = _date(yr, mo, dy)
+                    parsed = parsed + timedelta(days=(5 - parsed.weekday()) % 7)
+                    if latest_date is None or parsed > latest_date:
+                        latest_date = parsed
+                except ValueError:
+                    pass
+            # MM/DD-MM/DD range — use end date with year_start + monotonic rule
+            m2 = re.match(r"^(\d{1,2})/(\d{1,2})[--](\d{1,2})/(\d{1,2})$", s)
+            if m2 and not latest_date:
+                end_mo, end_dy = int(m2.group(3)), int(m2.group(4))
+                eff_year = year_start
+                if month_seq:
+                    current = year_start
+                    prev_m = None
+                    for mo in month_seq:
+                        if mo is None: continue
+                        if prev_m is not None and mo < prev_m:
+                            current += 1
+                        prev_m = mo
+                    eff_year = current
+                try:
+                    parsed = _date(eff_year, end_mo, end_dy)
+                    if latest_date is None or parsed > latest_date:
+                        latest_date = parsed
+                except ValueError:
+                    pass
+            # fiscal_week_label — use month_sequence last month
+            mf = re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$", s, re.IGNORECASE)
+            if mf and not latest_date:
+                last_month_num = MONTH_MAP[mf.group(1).lower()[:3]]
+                wk_num = int(mf.group(2))
+                eff_year = year_start
+                if month_seq:
+                    current = year_start
+                    prev_m = None
+                    for mo in month_seq:
+                        if mo is None: continue
+                        if prev_m is not None and mo < prev_m:
+                            current += 1
+                        prev_m = mo
+                    eff_year = current
+                try:
+                    first = _date(eff_year, last_month_num, 1)
+                    approx = first + timedelta(days=(wk_num - 1) * 7)
+                    parsed = approx + timedelta(days=(5 - approx.weekday()) % 7)
+                    if latest_date is None or parsed > latest_date:
+                        latest_date = parsed
+                except ValueError:
+                    pass
+
+        elif month_seq:
             # Walk month_sequence with monotonic year rule to find the last date
             current_year = year_start
             prev_m = None
@@ -1311,6 +1373,17 @@ async def stage_schema_classify(session_id: str):
                     sample_vals.append(h["value"])
                     break
 
+        # Also grab the last date column value for file_set_key calculation
+        last_sample_val = None
+        if sales_cols_0based:
+            last_col_0 = sorted(sales_cols_0based)[-1]
+            last_col_1 = last_col_0 + 1
+            cs = col_schema_map.get(last_col_1, {})
+            for h in cs.get("header_stack", []):
+                if any(ch.isdigit() for ch in h["value"]):
+                    last_sample_val = h["value"]
+                    break
+
         year_anchors = [
             {"source": "filename", "value": m.group(1)}
             for m in YEAR_RE.finditer(session["filename"])
@@ -1336,6 +1409,7 @@ async def stage_schema_classify(session_id: str):
             "date_col_count":         len(sales_cols_0based),
             "cols":                   sales_cols_0based,
             "sample_values":          sample_vals,
+            "last_sample_val":        last_sample_val,
             "format":                 date_fmt,
             "year_present":           year_present,
             "interleaved_empty_cols": False,
