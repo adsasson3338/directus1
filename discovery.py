@@ -1744,6 +1744,18 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
     session = _sessions[session_id]
 
     if not filename.lower().endswith((".xlsx", ".xls")):
+        file_audit_id = session.get("file_audit_id")
+        if file_audit_id:
+            try:
+                sql = build_update_file_audit_full_sql(
+                    file_audit_id,
+                    {"status": "failed", "error": f"'{filename}' is not an Excel file"},
+                    None, "failed", None,
+                    filename=filename,
+                )
+                await call_postgres(sql)
+            except Exception:
+                pass
         session["stage"]  = "complete"
         session["status"] = "complete"
         session["result"] = {"error": f"'{filename}' is not an Excel file"}
@@ -1783,6 +1795,18 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as e:
+        file_audit_id = session.get("file_audit_id")
+        if file_audit_id:
+            try:
+                sql = build_update_file_audit_full_sql(
+                    file_audit_id,
+                    {"status": "failed", "error": f"Cannot open {filename}: {e}"},
+                    None, "failed", None,
+                    filename=filename,
+                )
+                await call_postgres(sql)
+            except Exception:
+                pass
         session["stage"]  = "complete"
         session["status"] = "complete"
         session["result"] = {"error": f"Cannot open {filename}: {e}"}
