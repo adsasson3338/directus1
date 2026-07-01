@@ -141,10 +141,9 @@ def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) ->
     rule is skipped for that column.
     """
     base_year    = date_config.get("year_value", date.today().year)
-    # year_start is set by discovery — the year the first date column belongs to.
-    # If absent (old discovery results), fall back to year_value - 1 for boundary files.
-    year_boundary = date_config.get("year_boundary_detected", False)
-    current_year  = date_config.get("year_start", base_year - 1 if year_boundary else base_year)
+    # year_start is the document year (year with most columns).
+    # Start the monotonic counter there — the rule handles edge months naturally.
+    current_year  = date_config.get("year_start", base_year)
     prev_month    = None
     date_map      = {}
 
