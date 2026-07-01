@@ -896,6 +896,12 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     sales_label       = (date_schema.get("sales_section_label") or "").strip().upper()  # AI
     stop_labels       = [s.strip().upper() for s in date_schema.get("stop_labels", [])]  # AI
 
+    # If AI put section_label_row on the same row as date_axis_row, it got confused —
+    # there is no separate section label row, so ignore section label context entirely
+    if section_label_row == date_axis_row:
+        section_label_row = None
+        sales_label       = ""
+
     # Build col -> header values map
     col_headers = {}
     for col in schema.get("columns", []):
@@ -986,6 +992,7 @@ File: {filename}
 Sheet: {schema["sheet_name"]}
 
 The sales date columns have already been identified. Classify only the columns below.
+You MUST return a classification for EVERY column listed — do not skip any.
 
 Each column has:
 - header_stack: header values with row numbers (top-down)
@@ -1010,7 +1017,7 @@ For inventory: if a sheet has sub-components (DC Inv, Store Inv) alongside a tot
 - postgres_matched strongly suggests retailer_sku or supplier_sku
 - embedded_postgres_matched means has_embedded_supplier_sku = true
 
-COLUMNS:
+COLUMNS ({len(non_date_cols)} total - classify all of them):
 {cols_json}
 
 Respond with JSON only:
@@ -1318,13 +1325,23 @@ async def stage_schema_classify(session_id: str):
         ]
 
         # Detect year boundary from actual month sequence
+        # A boundary exists only when December is followed by January (month drops)
+        # A full-year file (Jan->Dec) contains both months but has no boundary
         month_seq      = extract_month_sequence(rows_data[axis_row_0] if axis_row_0 < len(rows_data) else [], sales_cols_0based)
-        month_set      = set(m for m in month_seq if m is not None)
-        year_boundary  = 12 in month_set and 1 in month_set
+        year_boundary  = False
+        prev_m = None
+        for m in month_seq:
+            if m is None:
+                continue
+            if prev_m is not None and prev_m == 12 and m == 1:
+                year_boundary = True
+                break
+            prev_m = m
 
         date_axis = {
             "row":                    axis_row_0,
             "col_count":              len(sales_cols_0based),
+            "date_col_count":         len(sales_cols_0based),
             "cols":                   sales_cols_0based,
             "sample_values":          sample_vals,
             "format":                 date_fmt,
