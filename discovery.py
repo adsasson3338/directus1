@@ -71,6 +71,88 @@ def is_date_like(val) -> bool:
 
 
 
+MONTH_MAP = {
+    'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+    'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12
+}
+
+def extract_month_sequence(row, col_list: list) -> list:
+    """
+    Extract the tracking month for each date column in order.
+    For date-range strings, uses the END month (the resolved date).
+    For fiscal week labels, uses the month number.
+    For datetime objects, uses the month directly.
+    Returns a list of ints (1-12) or None for unparseable values.
+    """
+    months = []
+    for ci in col_list:
+        if ci >= len(row) or row[ci] is None:
+            months.append(None)
+            continue
+        val = row[ci]
+        if isinstance(val, datetime):
+            months.append(val.month)
+            continue
+        s = str(val).strip()
+        # date_range: use END month
+        m = re.match(r'^(\d{1,2})/(\d{1,2})[-\u2013](\d{1,2})/(\d{1,2})$', s)
+        if m:
+            months.append(int(m.group(3)))
+            continue
+        # fiscal week label
+        mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
+                      s, re.IGNORECASE)
+        if mf:
+            months.append(MONTH_MAP[mf.group(1).lower()[:3]])
+            continue
+        months.append(None)
+    return months
+
+
+def compute_year_start(month_sequence: list, year_value: int) -> int:
+    """
+    Determine the starting year for the date map from the month sequence.
+
+    52-column files (full year): majority rule - find the starting year
+    such that the year with the most columns equals year_value.
+
+    <52-column files (partial year):
+    - Q4 months before January -> prior-year tail -> year_start = year_value - 1
+    - Q1 month at start -> current year -> year_start = year_value
+    - H2 opening month fallback -> year_start = year_value - 1
+    """
+    valid = [m for m in month_sequence if m is not None]
+    if not valid:
+        return year_value
+
+    if len(valid) == 52:
+        for try_start in [year_value - 1, year_value]:
+            counts = {}
+            current = try_start
+            prev = None
+            for m in valid:
+                if prev is not None and m < prev:
+                    current += 1
+                counts[current] = counts.get(current, 0) + 1
+                prev = m
+            if counts and max(counts, key=counts.get) == year_value:
+                return try_start
+        return year_value
+
+    # <52 columns
+    first_month   = valid[0]
+    jan_positions = [i for i, m in enumerate(valid) if m == 1]
+    first_jan     = jan_positions[0] if jan_positions else None
+    q4_before_jan = first_jan is not None and any(
+        m in (10, 11, 12) for m in valid[:first_jan]
+    )
+    if q4_before_jan:
+        return year_value - 1
+    if first_month in (1, 2, 3):
+        return year_value
+    return year_value - 1 if first_month > 6 else year_value
+
+
 EMBEDDED_PATTERNS = [
     ("integer_dash_description",        re.compile(r'^(\d{4,10})\s*[--]\s*(.{3,})$')),
     ("alphanumeric_space_description",  re.compile(r'^([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s+(.{3,})$', re.IGNORECASE)),
@@ -149,41 +231,15 @@ def find_date_axis(rows) -> dict | None:
         cols          = filtered_cols
         best["samples"] = filtered_samples
 
-    # Extract ordered tracking months for all date columns.
-    # Used by stage_date_config to compute year_start deterministically.
-    def _extract_month_sequence(row, col_list):
-        months = []
-        month_map = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
-                     'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
-        for ci in col_list:
-            if ci >= len(row) or row[ci] is None:
-                months.append(None)
-                continue
-            val = row[ci]
-            if isinstance(val, datetime):
-                months.append(val.month)
-                continue
-            s = str(val).strip()
-            m = re.match(r'^(\d{1,2})/(\d{1,2})[--](\d{1,2})/(\d{1,2})$', s)
-            if m:
-                months.append(int(m.group(3)))
-                continue
-            mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
-                          s, re.IGNORECASE)
-            if mf:
-                months.append(month_map[mf.group(1).lower()[:3]])
-                continue
-            months.append(None)
-        return months
-
-    month_sequence = _extract_month_sequence(rows[best["row"]], cols) if year_boundary_detected else []
+    # Extract ordered tracking months for year_boundary_detected detection (fiscal weeks)
+    # and for stage_date_config (via schema path - not from this function's return value)
+    month_sequence = extract_month_sequence(rows[best["row"]], cols) if year_boundary_detected else []
 
     return {
         "row": best["row"], "col_count": len(cols), "cols": cols,
         "sample_values": best["samples"], "format": best["format"],
         "year_present": year_present, "interleaved_empty_cols": interleaved,
         "year_boundary_detected": year_boundary_detected,
-        "month_sequence": month_sequence,
     }
 
 
@@ -1263,31 +1319,9 @@ async def stage_schema_classify(session_id: str):
             rows_data = session["_sheets"].get(sheet_name, [])
             axis_row  = date_axis_row - 1  # 0-based
             if axis_row < len(rows_data):
-                _month_map = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
-                              'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
-                month_seq = []
-                for ci in sales_cols_0based:
-                    if ci >= len(rows_data[axis_row]) or rows_data[axis_row][ci] is None:
-                        month_seq.append(None)
-                        continue
-                    val = rows_data[axis_row][ci]
-                    if isinstance(val, datetime):
-                        month_seq.append(val.month)
-                    elif isinstance(val, str):
-                        s = val.strip()
-                        m = re.match(r'^(\d{1,2})/(\d{1,2})[-\u2013](\d{1,2})/(\d{1,2})$', s)
-                        if m:
-                            month_seq.append(int(m.group(3)))  # end month
-                            continue
-                        mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
-                                      s, re.IGNORECASE)
-                        if mf:
-                            month_seq.append(_month_map[mf.group(1).lower()[:3]])
-                            continue
-                        month_seq.append(None)
-                    else:
-                        month_seq.append(None)
-                date_axis["month_sequence"] = month_seq
+                date_axis["month_sequence"] = extract_month_sequence(
+                    rows_data[axis_row], sales_cols_0based
+                )
 
         rows     = session["_sheets"].get(sheet_name, [])
         embedded = detect_embedded_sku(rows, sales_cols_0based, data_start - 1)
@@ -1494,16 +1528,17 @@ async def stage_date_config(session_id: str):
                             year_value = 2000 + yr if yr < 100 else yr
                             break
             year_boundary = date_axis.get("year_boundary_detected", False)
+            month_seq     = date_axis.get("month_sequence", [])
+            year_start    = compute_year_start(month_seq, year_value) if year_boundary and month_seq else year_value
             session["date_config"][sheet_name] = {
                 "date_format":             date_axis["format"],
                 "year_present":            True,
                 "year_value":              year_value,
-                "year_start":              year_value - 1 if year_boundary else year_value,
+                "year_start":              year_start,
                 "year_inference_strategy": "embedded_in_dates",
                 "year_boundary_detected":  year_boundary,
                 "normalize_to":            "week_ending_saturday",
                 "source":                  "python",
-                # Grid fields ingestion needs - stored here so it never reads grid directly
                 "date_axis_row":           date_axis.get("row", 0),
                 "date_cols":               date_axis.get("cols", []),
                 "data_start_row":          grid.get("data_start_row", 1),
@@ -1530,54 +1565,7 @@ async def stage_date_config(session_id: str):
             result = {"error": f"AI error: {e}"}
 
         year_value = result.get("year_value", date.today().year)
-
-        # Compute year_start deterministically using the A-B-C majority rule:
-        # the year with the most columns is the document year (year_value from AI).
-        # Find the starting year that satisfies this constraint.
-        # Determine year_start from column count and sequence structure.
-        # 52 columns = full year: use majority rule (year with most columns = year_value)
-        # <52 columns: use opening pattern
-        #   - January within first 6 columns: prior-year tail -> year_start = year_value - 1
-        #   - Q1 month (Jan/Feb/Mar) at start: current year -> year_start = year_value
-        #   - Otherwise: use opening month heuristic (H2 start = prior year)
-        if year_boundary and month_sequence:
-            valid = [m for m in month_sequence if m is not None]
-            if not valid:
-                year_start = year_value
-            elif len(valid) == 52:
-                # Majority rule
-                year_start = year_value
-                for try_start in [year_value - 1, year_value]:
-                    counts = {}
-                    current = try_start
-                    prev = None
-                    for m in valid:
-                        if prev is not None and m < prev:
-                            current += 1
-                        counts[current] = counts.get(current, 0) + 1
-                        prev = m
-                    if counts and max(counts, key=counts.get) == year_value:
-                        year_start = try_start
-                        break
-            else:
-                # <52 columns
-                first_month = valid[0]
-                # Find first January position
-                jan_positions = [i for i, m in enumerate(valid) if m == 1]
-                first_jan = jan_positions[0] if jan_positions else None
-                # Q4 months before January means file opens with prior-year tail
-                q4_before_jan = first_jan is not None and any(
-                    m in (10, 11, 12) for m in valid[:first_jan]
-                )
-                q1_at_start = first_month in (1, 2, 3)
-                if q4_before_jan:
-                    year_start = year_value - 1
-                elif q1_at_start:
-                    year_start = year_value
-                else:
-                    year_start = year_value - 1 if first_month > 6 else year_value
-        else:
-            year_start = year_value
+        year_start = compute_year_start(month_sequence, year_value) if year_boundary and month_sequence else year_value
 
         result["normalize_to"]           = "week_ending_saturday"
         result["source"]                 = "ai"
