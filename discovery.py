@@ -113,6 +113,20 @@ def find_date_axis(rows) -> dict | None:
                 months.add(int(m.group(1)))
         if 12 in months and 1 in months:
             year_boundary_detected = True
+    elif best["format"] == "fiscal_week_label":
+        # Check all date cols (not just samples) for Dec and Jan coexistence
+        month_map = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+                     'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
+        fiscal_months = set()
+        row = rows[best["row"]]
+        for ci in best["cols"]:
+            if ci < len(row) and isinstance(row[ci], str):
+                mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
+                              row[ci].strip(), re.IGNORECASE)
+                if mf:
+                    fiscal_months.add(month_map[mf.group(1).lower()[:3]])
+        if 12 in fiscal_months and 1 in fiscal_months:
+            year_boundary_detected = True
 
     # Filter out inventory/summary columns that have date headers but are not sales
     # Check the row above the date axis for inventory-related labels
@@ -134,11 +148,41 @@ def find_date_axis(rows) -> dict | None:
         cols          = filtered_cols
         best["samples"] = filtered_samples
 
+    # Extract ordered tracking months for all date columns.
+    # Used by stage_date_config to compute year_start deterministically.
+    def _extract_month_sequence(row, col_list):
+        months = []
+        month_map = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+                     'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
+        for ci in col_list:
+            if ci >= len(row) or row[ci] is None:
+                months.append(None)
+                continue
+            val = row[ci]
+            if isinstance(val, datetime):
+                months.append(val.month)
+                continue
+            s = str(val).strip()
+            m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
+            if m:
+                months.append(int(m.group(3)))
+                continue
+            mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
+                          s, re.IGNORECASE)
+            if mf:
+                months.append(month_map[mf.group(1).lower()[:3]])
+                continue
+            months.append(None)
+        return months
+
+    month_sequence = _extract_month_sequence(rows[best["row"]], cols) if year_boundary_detected else []
+
     return {
         "row": best["row"], "col_count": len(cols), "cols": cols,
         "sample_values": best["samples"], "format": best["format"],
         "year_present": year_present, "interleaved_empty_cols": interleaved,
         "year_boundary_detected": year_boundary_detected,
+        "month_sequence": month_sequence,
     }
 
 
@@ -344,15 +388,17 @@ Rules:
 - year_value is the primary/later year (e.g. the year the file was sent)
 - year_start is the year the FIRST date column belongs to
 - If dates span December and January: December belongs to the EARLIER year, January to the LATER year
-- If year_boundary_detected is true, year_start will be year_value - 1
 - If all dates are in one year, year_start equals year_value
 - All dates will be normalized to week-ending Saturday
 
 Example for a March 2026 file containing Dec 2025 through Mar 2026 data:
-year_value = 2026, year_start = 2025, year_boundary_detected = true
+year_value = 2026, year_start = 2025
+
+Example for a 2026 file containing Feb 2026 through Jan 2027 data:
+year_value = 2026, year_start = 2026
 
 Respond with JSON only:
-{{"year_value": 2026, "year_start": 2025, "year_boundary_detected": true, "year_inference_strategy": "one sentence", "week_convention": "what convention the source uses"}}"""
+{{"year_value": 2026, "year_start": 2025, "year_inference_strategy": "one sentence", "week_convention": "what convention the source uses"}}"""
 
 
 
@@ -1446,6 +1492,9 @@ async def stage_date_config(session_id: str):
             for a in session["grid"].get(other, {}).get("year_anchors", [])
         ]
 
+        year_boundary  = date_axis.get("year_boundary_detected", False)
+        month_sequence = date_axis.get("month_sequence", [])
+
         try:
             text   = await call_ai(build_date_prompt(date_axis, anchors, sheet_name,
                                                       filename=session["filename"],
@@ -1457,20 +1506,58 @@ async def stage_date_config(session_id: str):
         except Exception as e:
             result = {"error": f"AI error: {e}"}
 
-        result["normalize_to"]        = "week_ending_saturday"
-        result["source"]              = "ai"
-        # Ensure year_boundary_detected and year_start are always present
-        # even if AI omits them — fall back to grid values as ground truth
-        if "year_boundary_detected" not in result:
-            result["year_boundary_detected"] = date_axis.get("year_boundary_detected", False)
-        if "year_start" not in result:
-            yb = result.get("year_boundary_detected", False)
-            yv = result.get("year_value", date.today().year)
-            result["year_start"] = yv - 1 if yb else yv
-        # Grid fields ingestion needs — stored here so it never reads grid directly
-        result["date_axis_row"]  = date_axis.get("row", 0)
-        result["date_cols"]      = date_axis.get("cols", [])
-        result["data_start_row"] = grid.get("data_start_row", 1)
+        year_value = result.get("year_value", date.today().year)
+
+        # Compute year_start deterministically using the A-B-C majority rule:
+        # the year with the most columns is the document year (year_value from AI).
+        # Find the starting year that satisfies this constraint.
+        # Determine year_start from column count and sequence structure.
+        # 52 columns = full year: use majority rule (year with most columns = year_value)
+        # <52 columns: use opening pattern
+        #   - January within first 6 columns: prior-year tail → year_start = year_value - 1
+        #   - Q1 month (Jan/Feb/Mar) at start: current year → year_start = year_value
+        #   - Otherwise: use opening month heuristic (H2 start = prior year)
+        if year_boundary and month_sequence:
+            valid = [m for m in month_sequence if m is not None]
+            if not valid:
+                year_start = year_value
+            elif len(valid) == 52:
+                # Majority rule
+                year_start = year_value
+                for try_start in [year_value - 1, year_value]:
+                    counts = {}
+                    current = try_start
+                    prev = None
+                    for m in valid:
+                        if prev is not None and m < prev:
+                            current += 1
+                        counts[current] = counts.get(current, 0) + 1
+                        prev = m
+                    if counts and max(counts, key=counts.get) == year_value:
+                        year_start = try_start
+                        break
+            else:
+                # <52 columns
+                first_month = valid[0]
+                jan_in_first_6 = any(m == 1 for m in valid[:6])
+                q1_at_start = first_month in (1, 2, 3)
+                if jan_in_first_6:
+                    year_start = year_value - 1
+                elif q1_at_start:
+                    year_start = year_value
+                else:
+                    year_start = year_value - 1 if first_month > 6 else year_value
+        else:
+            year_start = year_value
+
+        result["normalize_to"]           = "week_ending_saturday"
+        result["source"]                 = "ai"
+        result["year_boundary_detected"] = year_boundary
+        result["year_value"]             = year_value
+        result["year_start"]             = year_start
+        result["date_axis_row"]          = date_axis.get("row", 0)
+        result["date_cols"]              = date_axis.get("cols", [])
+        result["data_start_row"]         = grid.get("data_start_row", 1)
         session["date_config"][sheet_name] = result
 
     await stage_multisheet(session_id)
