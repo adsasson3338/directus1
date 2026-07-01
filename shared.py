@@ -22,6 +22,7 @@ from config import (
     JOB_TIMEOUT_SECONDS,
     SESSION_TIMEOUT_SECONDS,
     SESSION_GRACE_SECONDS,
+    AI_LOG_VERBOSE,
 )
 
 # ─────────────────────────────────────────────
@@ -80,9 +81,12 @@ async def call_postgres(sql: str) -> list:
 
 async def call_ai(prompt: str, label: str = "") -> str:
     """Call OpenRouter and return the response text. Raises on error."""
-    # Log prompt (truncated for readability)
     tag = f"[AI:{label}]" if label else "[AI]"
-    print(f"{tag} PROMPT ({len(prompt)} chars):\n{prompt[:500]}{'...' if len(prompt) > 500 else ''}")
+
+    if AI_LOG_VERBOSE:
+        print(f"{tag} PROMPT ({len(prompt)} chars):\n{prompt[:500]}{'...' if len(prompt) > 500 else ''}")
+    else:
+        print(f"{tag} PROMPT ({len(prompt)} chars)")
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
@@ -101,7 +105,10 @@ async def call_ai(prompt: str, label: str = "") -> str:
         data = response.json()
         result = data["choices"][0]["message"]["content"]
 
-    print(f"{tag} RESPONSE ({len(result)} chars):\n{result[:500]}{'...' if len(result) > 500 else ''}")
+    if AI_LOG_VERBOSE:
+        print(f"{tag} RESPONSE ({len(result)} chars):\n{result[:500]}{'...' if len(result) > 500 else ''}")
+    else:
+        print(f"{tag} RESPONSE ({len(result)} chars)")
     return result
 
 
