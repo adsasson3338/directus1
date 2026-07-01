@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 """
-discovery.py — Discovery pipeline: qualify, locate, identify, date, write audit.
+discovery.py - Discovery pipeline: qualify, locate, identify, date, write audit.
 """
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -22,9 +23,9 @@ from shared import (
     build_fetch_audit_row_sql,
 )
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # AI RESPONSE PARSER
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def parse_ai_response(text: str) -> str:
     """Strip thinking blocks and code fences from AI response before JSON parsing."""
@@ -39,11 +40,11 @@ def parse_ai_response(text: str) -> str:
 
 router = APIRouter()
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # CELL CLASSIFICATION
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
-DATE_RANGE_RE  = re.compile(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$")
+DATE_RANGE_RE  = re.compile(r"^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$")
 FISCAL_WEEK_RE = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$", re.IGNORECASE)
 WK_NUMBER_RE   = re.compile(r"^wk\s*\d+$", re.IGNORECASE)
 YEAR_RE        = re.compile(r"\b(20\d{2})\b")
@@ -71,15 +72,15 @@ def is_date_like(val) -> bool:
 
 
 EMBEDDED_PATTERNS = [
-    ("integer_dash_description",        re.compile(r'^(\d{4,10})\s*[-–]\s*(.{3,})$')),
+    ("integer_dash_description",        re.compile(r'^(\d{4,10})\s*[--]\s*(.{3,})$')),
     ("alphanumeric_space_description",  re.compile(r'^([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s+(.{3,})$', re.IGNORECASE)),
     ("description_space_alphanumeric",  re.compile(r'^(.{3,})\s{2,}([A-Z0-9]{2,}-[A-Z0-9\-]{2,})\s*$', re.IGNORECASE)),
     ("description_space_nodash_sku",    re.compile(r'^(.{5,})\s+([A-Z]{2,}\d{3,})\s*$', re.IGNORECASE)),
 ]
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # GRID DETECTION
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def find_date_axis(rows) -> dict | None:
     best = {"row": None, "count": 0, "cols": [], "samples": [], "format": None}
@@ -163,7 +164,7 @@ def find_date_axis(rows) -> dict | None:
                 months.append(val.month)
                 continue
             s = str(val).strip()
-            m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
+            m = re.match(r'^(\d{1,2})/(\d{1,2})[--](\d{1,2})/(\d{1,2})$', s)
             if m:
                 months.append(int(m.group(3)))
                 continue
@@ -238,9 +239,9 @@ def detect_embedded_sku(rows, date_cols: list, data_start_row: int) -> list:
 
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # QUALIFY SIGNALS
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def extract_qualify_signals(rows: list, sheet_name: str, filename: str) -> dict:
     integer_count = float_above_count = float_0_to_1_count = 0
@@ -270,11 +271,16 @@ def extract_qualify_signals(rows: list, sheet_name: str, filename: str) -> dict:
                     if len(crosshair_sample) < 40:
                         crosshair_sample.append(v)
         total = integer_count + float_above_count + float_0_to_1_count
-        if total == 0:                            dominant_type = None
-        elif float_above_count / total > 0.7:     dominant_type = "float_above_1"
-        elif float_0_to_1_count / total > 0.7:   dominant_type = "float_0_to_1"
-        elif integer_count / total > 0.7:         dominant_type = "integer"
-        else:                                     dominant_type = "mixed"
+        if total == 0:
+            dominant_type = None
+        elif float_above_count / total > 0.7:
+            dominant_type = "float_above_1"
+        elif float_0_to_1_count / total > 0.7:
+            dominant_type = "float_0_to_1"
+        elif integer_count / total > 0.7:
+            dominant_type = "integer"
+        else:
+            dominant_type = "mixed"
     else:
         for row in rows[:50]:
             for v in row:
@@ -314,9 +320,9 @@ def build_qualify_prompt(signals: dict) -> str:
 A sheet should be disqualified if it does NOT contain unit sales data. Unit sales data has integer values at the intersection of product identifiers and date columns.
 
 Disqualify if any of the following are true:
-- Crosshair values are decimals above 1 — dollar revenue
-- Crosshair values are between 0 and 1 — percentage metrics
-- Column labels contain $$$ or $$ — dollar sheet
+- Crosshair values are decimals above 1 - dollar revenue
+- Crosshair values are between 0 and 1 - percentage metrics
+- Column labels contain $$$ or $$ - dollar sheet
 - Sheet name contains CFP, Forecast, FCST, Projection, Order
 - Vocabulary contains forecast or projection language
 
@@ -333,15 +339,15 @@ Respond with JSON only:
 {{"disqualified": true or false, "reason": "one sentence explanation"}}"""
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # POSTGRES SQL BUILDER
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def build_sku_lookup_sql(candidates: list) -> tuple[str, list]:
     """
     Build case-insensitive exact match query against inventory_view.
-    Values embedded inline — n8n Postgres node does not support $1 params.
-    Returns (sql, []) — empty params list.
+    Values embedded inline - n8n Postgres node does not support $1 params.
+    Returns (sql, []) - empty params list.
     """
     # Safely quote each candidate for inline SQL
     quoted = ", ".join(
@@ -361,9 +367,9 @@ WHERE UPPER(inventory_sku) = ANY(ARRAY[{quoted}]::text[])
     return sql, []
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # COLUMN CLASSIFY PROMPT
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 
 def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str,
@@ -374,42 +380,28 @@ def build_date_prompt(date_axis: dict, year_anchors: list, sheet_name: str,
 
     return f"""You are configuring the date settings for a retail sales sheet.
 
-Determine the year settings from the evidence below.
+Determine the document year and week convention from the evidence below.
 The file was received as: {filename}
 
 Sheet: {sheet_name}
 Date axis format: {date_axis["format"]}
-Year present in dates: {date_axis["year_present"]}
-Year boundary detected: {date_axis.get("year_boundary_detected", False)}
 Sample date values: {date_axis["sample_values"]}
 Year anchors in this sheet: {year_anchors}{cross_context}
-
-Rules:
-- year_value is the primary/later year (e.g. the year the file was sent)
-- year_start is the year the FIRST date column belongs to
-- If dates span December and January: December belongs to the EARLIER year, January to the LATER year
-- If all dates are in one year, year_start equals year_value
-- All dates will be normalized to week-ending Saturday
-
-Example for a March 2026 file containing Dec 2025 through Mar 2026 data:
-year_value = 2026, year_start = 2025
-
-Example for a 2026 file containing Feb 2026 through Jan 2027 data:
-year_value = 2026, year_start = 2026
+Detected date columns: {date_axis.get("date_col_count", 0)}
 
 Respond with JSON only:
-{{"year_value": 2026, "year_start": 2025, "year_inference_strategy": "one sentence", "week_convention": "what convention the source uses"}}"""
+{{"year_value": 2026, "week_convention": "what convention the source uses", "year_inference_strategy": "one sentence"}}"""
 
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # RETAILER IDENTIFICATION SQL
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 
 
 def build_dedup_check_sql(file_hash: str) -> str:
-    """Check if this file has already been seen — any status means duplicate."""
+    """Check if this file has already been seen - any status means duplicate."""
     return f"""
 SELECT id, status, filename
 FROM file_audit
@@ -420,7 +412,7 @@ LIMIT 1
 def build_retailer_identify_sql(retailer_sku_candidates: list) -> str:
     """
     Query retailer_sku_map to identify retailer from SKU candidates.
-    Returns retailer and match count — 3+ matches confirms identity.
+    Returns retailer and match count - 3+ matches confirms identity.
     """
     quoted = ", ".join(
         "'" + str(c).replace("'", "''") + "'"
@@ -454,7 +446,7 @@ def json_safe(v) -> str:
 def build_insert_retailer_config_sql(retailer: str) -> str:
     """
     Insert a pending_review config row for a newly identified retailer.
-    Only fires once — skipped if retailer already exists.
+    Only fires once - skipped if retailer already exists.
     """
     safe_retailer = _sql_escape(retailer) if hasattr(retailer, "__class__") else str(retailer).replace("'", "''")
     return f"""
@@ -483,7 +475,7 @@ Header strings found in sheets: {header_strings[:20]}
 Only identify the retailer if the clues EXPLICITLY mention the retailer name or a well-known retailer-specific identifier (e.g. "Walgreens", "WIC#", "DPCI", "Staples").
 
 DO NOT GUESS. If the retailer name is not explicitly present in the filename, sheet names, or headers, return null.
-A generic filename like "D56_FCSTs_2026.xlsx" with no retailer name is NOT sufficient — return null.
+A generic filename like "D56_FCSTs_2026.xlsx" with no retailer name is NOT sufficient - return null.
 
 Respond with JSON only:
 {{"retailer": "retailer name or null", "confidence": "high/medium/low", "reason": "one sentence"}}"""
@@ -546,9 +538,9 @@ def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> s
                     except ValueError:
                         pass
 
-                # MM/DD-MM/DD (date range — use end date)
+                # MM/DD-MM/DD (date range - use end date)
                 if not parsed:
-                    m = re.match(r"^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$", s)
+                    m = re.match(r"^(\d{1,2})/(\d{1,2})[--](\d{1,2})/(\d{1,2})$", s)
                     if m:
                         end_mo, end_dy = int(m.group(3)), int(m.group(4))
                         start_mo       = int(m.group(1))
@@ -562,7 +554,7 @@ def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> s
                         except ValueError:
                             pass
 
-                # Mon Wk N — approximate to Saturday
+                # Mon Wk N - approximate to Saturday
                 if not parsed:
                     MONTH_MAP = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
                                  "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
@@ -587,7 +579,7 @@ def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> s
     if latest_date:
         return f"{retailer_clean}_{latest_date.isoformat()}"
 
-    # Fallback — no parseable date found
+    # Fallback - no parseable date found
     week_num = _date.today().isocalendar()[1]
     return f"{retailer_clean}_{year_value}-W{week_num:02d}"
 
@@ -614,7 +606,7 @@ def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       file_set_key: str | None,
                                       file_hash: str | None = None,
                                       filename: str | None = None) -> str:
-    """Update file_audit — writes discovery_result plus dedicated columns for easy querying."""
+    """Update file_audit - writes discovery_result plus dedicated columns for easy querying."""
     result_b64 = base64.b64encode(json.dumps(discovery_result, ensure_ascii=False).encode()).decode()
 
     # Extract the three dedicated columns directly
@@ -669,7 +661,7 @@ def extract_column_schema(ws, sheet_name: str) -> dict:
             return merge_map[(row, col)]["value"]
         return ws.cell(row, col).value
 
-    # Find data block start — first row with >30% numeric values
+    # Find data block start - first row with >30% numeric values
     data_start_row = None
     for row_idx in range(1, min(30, max_row + 1)):
         values = [ws.cell(row_idx, c).value for c in range(1, max_col + 1)]
@@ -753,7 +745,7 @@ def extract_column_schema(ws, sheet_name: str) -> dict:
 
 def build_date_schema_prompt(schema: dict, filename: str) -> str:
     """
-    Pass 1 — AI identifies the sales date column pattern.
+    Pass 1 - AI identifies the sales date column pattern.
     Python then enumerates all matching columns mechanically.
     """
     header_rows = schema.get("header_rows", [])
@@ -780,18 +772,18 @@ def build_date_schema_prompt(schema: dict, filename: str) -> str:
 File: {filename}
 Sheet: {schema["sheet_name"]}
 
-HEADER ROWS (compact — showing only non-empty cells):
+HEADER ROWS (compact - showing only non-empty cells):
 {grid_text}
 
 Your task: Identify the pattern that defines weekly sales date columns.
 
 Sales date columns are a consecutive block with:
 - Weekly date values in one row (e.g. "01/03/26", "12/21-12/27", "Feb Wk 1")
-- Possibly a section label in the row above (e.g. "Sales", "UNITS") — or nothing above them
+- Possibly a section label in the row above (e.g. "Sales", "UNITS") - or nothing above them
 - The block ENDS when the section label changes (e.g. "INV", "Total", "On Order") or a non-date value appears
 
 Identify:
-1. date_axis_row: row number (1-based) of the row containing the ACTUAL DATE VALUES like "01/03/26", "12/21-12/27", "Feb Wk 1" — NOT the column label row with text like "SKU Number" or "Business Unit"
+1. date_axis_row: row number (1-based) of the row containing the ACTUAL DATE VALUES like "01/03/26", "12/21-12/27", "Feb Wk 1" - NOT the column label row with text like "SKU Number" or "Business Unit"
 2. section_label_row: row number (1-based) containing section group labels like "Sales" or "INV" ABOVE the date row (null if none)
 3. sales_section_label: the exact label above the SALES date columns (e.g. "Sales", null if no label)
 4. stop_labels: exact labels that signal the END of the sales block (e.g. ["INV", "TOTAL", "On Order"])
@@ -825,7 +817,7 @@ def detect_date_axis_row(schema: dict) -> int:
             row = h["row"]  # already 1-based
             val = str(h.get("value", "")).strip()
             if (re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", val) or
-                re.match(r"^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$", val) or
+                re.match(r"^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$", val) or
                 re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$", val, re.IGNORECASE) or
                 re.match(r"^wk\s*\d+$", val, re.IGNORECASE)):
                 row_date_counts[row] = row_date_counts.get(row, 0) + 1
@@ -840,7 +832,7 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     Scans columns from first_sales_col, collecting those that match the date pattern.
     Stops when section label changes or date pattern breaks.
     """
-    # Detect date_axis_row from schema directly — more reliable than AI
+    # Detect date_axis_row from schema directly - more reliable than AI
     date_axis_row    = detect_date_axis_row(schema)        # 1-based
     section_label_row = date_schema.get("section_label_row")      # 1-based or None
     sales_label      = (date_schema.get("sales_section_label") or "").strip().upper()
@@ -858,7 +850,7 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     # Date matching patterns
     DATE_PATTERNS = [
         re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}$'),           # MM/DD/YY or MM/DD/YYYY
-        re.compile(r'^\d{1,2}/\d{1,2}[-–]\d{1,2}/\d{1,2}$'), # MM/DD-MM/DD
+        re.compile(r'^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$'), # MM/DD-MM/DD
         re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', re.IGNORECASE),
         re.compile(r'^wk\s*\d+$', re.IGNORECASE),
     ]
@@ -887,7 +879,7 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
 
         # Check if section label signals end of sales block
         if sec_label and stop_labels and sec_label in stop_labels:
-            break  # hit a stop label — sales block ended
+            break  # hit a stop label - sales block ended
 
         # Check if this column has a date value in the date axis row
         if date_val and is_date_value(date_val):
@@ -897,7 +889,7 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
             sales_cols.append(col_num)
             in_sales_block = True
         elif in_sales_block:
-            # Was in sales block — if no date value and no section label, skip (empty col)
+            # Was in sales block - if no date value and no section label, skip (empty col)
             if not date_val and not sec_label:
                 continue
             # Otherwise the block has ended
@@ -909,8 +901,8 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
 def build_column_classify_prompt(schema: dict, filename: str,
                                   date_cols: list, postgres_matched: set) -> str:
     """
-    Pass 2 — AI classifies non-date columns only.
-    Small focused prompt — only the product/inventory/metadata columns.
+    Pass 2 - AI classifies non-date columns only.
+    Small focused prompt - only the product/inventory/metadata columns.
     """
     date_col_set = set(date_cols)
     non_date_cols = [
@@ -954,9 +946,9 @@ Classify each column as one of:
 - description: product name/description text (may contain embedded supplier SKU)
 - cost: unit cost or wholesale price
 - retail_price: retail selling price
-- inventory: the single best current total on-hand quantity to ingest — pick exactly one per sheet
+- inventory: the single best current total on-hand quantity to ingest - pick exactly one per sheet
 - open_order: open purchase order quantity (even if currently zero/empty)
-- other: everything else — DC/store inventory sub-components, prior snapshots, YTD totals, percentages, business unit codes, store counts, etc
+- other: everything else - DC/store inventory sub-components, prior snapshots, YTD totals, percentages, business unit codes, store counts, etc
 
 For inventory: if a sheet has sub-components (DC Inv, Store Inv) alongside a total (Total Inv), classify only the total as inventory. If snapshots are dated, use the most recent total. Only one column per sheet should be classified as inventory.
 - postgres_matched strongly suggests retailer_sku or supplier_sku
@@ -973,14 +965,14 @@ Respond with JSON only:
   ]
 }}"""
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # FILE TYPE DETECTION
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 # Keywords that identify known non-sales file types.
-# Maps keyword (lowercase, found in filename or sheet names) → audit status
+# Maps keyword (lowercase, found in filename or sheet names) -> audit status
 KNOWN_FILE_TYPES = {
-    "on hand inventory alpha": "inventory_report",  # primary match — most specific first
+    "on hand inventory alpha": "inventory_report",  # primary match - most specific first
     "on hand":                 "inventory_report",  # fallback
 }
 
@@ -996,12 +988,12 @@ def detect_known_file_type(filename: str, sheet_names: list) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # PIPELINE STAGES
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 async def stage_qualify(session_id: str):
-    """Stage 1 — qualify each sheet."""
+    """Stage 1 - qualify each sheet."""
     session = _sessions[session_id]
     session["stage"]  = "qualifying"
     session["status"] = "running"
@@ -1013,19 +1005,19 @@ async def stage_qualify(session_id: str):
         if signals["dominant_type"] == "float_above_1":
             session["qualify_results"][sheet_name] = {
                 "disqualified": True,
-                "reason": "Crosshair values predominantly decimals above 1 — dollar revenue",
+                "reason": "Crosshair values predominantly decimals above 1 - dollar revenue",
                 "source": "python",
             }
             continue
         if signals["dominant_type"] == "float_0_to_1":
             session["qualify_results"][sheet_name] = {
                 "disqualified": True,
-                "reason": "Crosshair values predominantly between 0 and 1 — percentage metrics",
+                "reason": "Crosshair values predominantly between 0 and 1 - percentage metrics",
                 "source": "python",
             }
             continue
 
-        # AI call — direct, no webhook
+        # AI call - direct, no webhook
         try:
             text   = await call_ai(build_qualify_prompt(signals), label="qualify")
             clean  = parse_ai_response(text)
@@ -1041,7 +1033,7 @@ async def stage_qualify(session_id: str):
 
 
 async def advance_from_qualify(session_id: str):
-    """After all qualify jobs done — filter qualified sheets, advance to grid location."""
+    """After all qualify jobs done - filter qualified sheets, advance to grid location."""
     session = _sessions[session_id]
     results = session["qualify_results"]
 
@@ -1082,7 +1074,7 @@ async def advance_from_qualify(session_id: str):
 
 async def stage_locate_grid(session_id: str):
     """
-    Stage 2 — pure Python schema extraction.
+    Stage 2 - pure Python schema extraction.
     Opens workbook with full fidelity (merges + borders).
     Extracts per-column schema for all qualified sheets.
     Then advances to Postgres SKU lookup.
@@ -1114,7 +1106,7 @@ async def stage_locate_grid(session_id: str):
 
 
 async def stage_postgres_sku_lookup(session_id: str):
-    """Stage 2b — Postgres SKU lookup on candidate column values from all sheets."""
+    """Stage 2b - Postgres SKU lookup on candidate column values from all sheets."""
     session = _sessions[session_id]
     session["stage"]  = "identifying"
     session["status"] = "running"
@@ -1161,7 +1153,7 @@ async def stage_postgres_sku_lookup(session_id: str):
 
 
 async def stage_schema_classify(session_id: str):
-    """Stage 2c — Pass 1: AI identifies date column pattern per sheet."""
+    """Stage 2c - Pass 1: AI identifies date column pattern per sheet."""
     session = _sessions[session_id]
     session["stage"]  = "locating"
     session["status"] = "running"
@@ -1194,7 +1186,7 @@ async def stage_schema_classify(session_id: str):
             if embedded_matched:
                 col["has_embedded_supplier_sku"] = True
 
-        # Pass 1 — AI identifies date schema pattern
+        # Pass 1 - AI identifies date schema pattern
         try:
             text        = await call_ai(build_date_schema_prompt(schema, session["filename"]), label="date_schema")
             clean       = parse_ai_response(text)
@@ -1216,7 +1208,7 @@ async def stage_schema_classify(session_id: str):
         session.setdefault("_date_schemas", {})[sheet_name] = date_schema
         session.setdefault("_sales_cols",   {})[sheet_name] = sales_cols_0based
 
-        # Pass 2 — AI classifies non-date columns
+        # Pass 2 - AI classifies non-date columns
         try:
             text   = await call_ai(build_column_classify_prompt(schema, session["filename"],
                                                                   sales_cols_1based, matched_values), label="column_classify")
@@ -1367,7 +1359,7 @@ async def stage_schema_classify(session_id: str):
 
 
 async def stage_identify_retailer(session_id: str):
-    """Stage 3 — identify retailer by querying retailer_sku_map."""
+    """Stage 3 - identify retailer by querying retailer_sku_map."""
     session = _sessions[session_id]
     session["stage"]  = "identifying_retailer"
     session["status"] = "running"
@@ -1406,7 +1398,7 @@ async def stage_identify_retailer(session_id: str):
 
 
 async def stage_identify_retailer_ai(session_id: str):
-    """Fallback — identify retailer via AI using filename/sheet/header clues."""
+    """Fallback - identify retailer via AI using filename/sheet/header clues."""
     session = _sessions[session_id]
     session["status"] = "running"
 
@@ -1440,7 +1432,7 @@ async def stage_identify_retailer_ai(session_id: str):
 
 
 async def stage_date_config(session_id: str):
-    """Stage 4 — date config. Pure Python, AI only if year ambiguous."""
+    """Stage 4 - date config. Pure Python, AI only if year ambiguous."""
     session = _sessions[session_id]
     session["stage"]  = "dating"
     session["status"] = "running"
@@ -1480,7 +1472,7 @@ async def stage_date_config(session_id: str):
                 "year_boundary_detected":  year_boundary,
                 "normalize_to":            "week_ending_saturday",
                 "source":                  "python",
-                # Grid fields ingestion needs — stored here so it never reads grid directly
+                # Grid fields ingestion needs - stored here so it never reads grid directly
                 "date_axis_row":           date_axis.get("row", 0),
                 "date_cols":               date_axis.get("cols", []),
                 "data_start_row":          grid.get("data_start_row", 1),
@@ -1514,8 +1506,8 @@ async def stage_date_config(session_id: str):
         # Determine year_start from column count and sequence structure.
         # 52 columns = full year: use majority rule (year with most columns = year_value)
         # <52 columns: use opening pattern
-        #   - January within first 6 columns: prior-year tail → year_start = year_value - 1
-        #   - Q1 month (Jan/Feb/Mar) at start: current year → year_start = year_value
+        #   - January within first 6 columns: prior-year tail -> year_start = year_value - 1
+        #   - Q1 month (Jan/Feb/Mar) at start: current year -> year_start = year_value
         #   - Otherwise: use opening month heuristic (H2 start = prior year)
         if year_boundary and month_sequence:
             valid = [m for m in month_sequence if m is not None]
@@ -1564,7 +1556,7 @@ async def stage_date_config(session_id: str):
 
 
 async def stage_multisheet(session_id: str):
-    """Stage 5 — multi-sheet flag. Pure Python."""
+    """Stage 5 - multi-sheet flag. Pure Python."""
     session   = _sessions[session_id]
     qualified = session["qualified_sheets"]
     multiple  = len(qualified) > 1
@@ -1578,7 +1570,7 @@ async def stage_multisheet(session_id: str):
 
 
 async def stage_write_audit(session_id: str):
-    """Stage 6 — query retailer config, then write to file_audit."""
+    """Stage 6 - query retailer config, then write to file_audit."""
     session       = _sessions[session_id]
     session["stage"]  = "writing"
     session["status"] = "running"
@@ -1633,7 +1625,7 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
 
     if not retailer:                audit_status = "pending_review"
     elif file_set_size is None:     audit_status = "pending_review"
-    elif not retailer_confirmed:    audit_status = "pending_review"  # AI-identified — needs human sign-off
+    elif not retailer_confirmed:    audit_status = "pending_review"  # AI-identified - needs human sign-off
     elif file_set_size > 1:         audit_status = "pending_set"
     else:                           audit_status = "discovery_complete"
 
@@ -1660,7 +1652,7 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
 
 
 async def stage_assemble(session_id: str):
-    """Stage 7 — assemble final result."""
+    """Stage 7 - assemble final result."""
     session = _sessions[session_id]
     session["stage"]  = "complete"
     session["status"] = "complete"
@@ -1681,9 +1673,9 @@ async def stage_assemble(session_id: str):
 
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # ANALYZE ENDPOINT
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -1701,7 +1693,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
         session["result"] = {"error": f"'{filename}' is not an Excel file"}
         return
 
-    # Immediate filename check — internal D365 inventory exports never need
+    # Immediate filename check - internal D365 inventory exports never need
     # sales-data qualification, so route them before opening the workbook at all.
     known_type = detect_known_file_type(filename, [])
     if known_type:
@@ -1729,7 +1721,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
     if len(data) > MAX_UPLOAD_BYTES:
         session["stage"]  = "complete"
         session["status"] = "complete"
-        session["result"] = {"error": "File too large — max 50MB"}
+        session["result"] = {"error": "File too large - max 50MB"}
         return
 
     try:
@@ -1750,7 +1742,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
     if not session.get("file_hash"):
         session["file_hash"] = file_hash(data)
 
-    # Dedup check — skip if this hash belongs to a different file_audit row
+    # Dedup check - skip if this hash belongs to a different file_audit row
     try:
         dedup_rows = await call_postgres(build_dedup_check_sql(session["file_hash"]))
         if dedup_rows and str(dedup_rows[0].get("id")) != str(session.get("file_audit_id")):
@@ -1760,7 +1752,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
             session["status"] = "complete"
             session["result"] = {
                 "skipped":   True,
-                "reason":    f"File already processed — existing row {existing_id} has status '{existing_status}'",
+                "reason":    f"File already processed - existing row {existing_id} has status '{existing_status}'",
                 "file_hash": session["file_hash"],
             }
             return
@@ -1773,7 +1765,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
 @router.post("/analyze")
 async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTasks = BackgroundTasks()):
     """
-    Trigger discovery from a file_audit_id — file is fetched from MinIO via n8n.
+    Trigger discovery from a file_audit_id - file is fetched from MinIO via n8n.
     Used by the polling workflow for received files.
     """
     file_audit_id = request_body.get("file_audit_id")
@@ -1799,7 +1791,7 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
     filename  = audit_row.get("filename", "unknown.xlsx")
     file_hash_val = audit_row.get("file_hash")
 
-    # Atomically claim this row — flips received -> analyzing.
+    # Atomically claim this row - flips received -> analyzing.
     # If another concurrent poll already claimed it, bail out cleanly
     # instead of running discovery twice on the same file.
     try:
@@ -1810,7 +1802,7 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
     if not claim_rows:
         return JSONResponse(content={
             "status": "skipped",
-            "reason": f"file_audit row {safe_id} is no longer 'received' — already claimed or processed",
+            "reason": f"file_audit row {safe_id} is no longer 'received' - already claimed or processed",
         })
 
     session_id = str(uuid.uuid4())
@@ -1836,8 +1828,8 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
         "created_at":       time.time(),
     }
 
-    # Fire fetch-file webhook — file binary will arrive at /file/{job_id}
-    # But discovery needs the binary before it can start — use a flag to wait
+    # Fire fetch-file webhook - file binary will arrive at /file/{job_id}
+    # But discovery needs the binary before it can start - use a flag to wait
     file_job_id = str(uuid.uuid4())
     _jobs[file_job_id] = {
         "session_id": session_id,
@@ -1859,7 +1851,7 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
         Poll for completion. The actual file binary is delivered to
         POST /file/{job_id} (in ingestion.py), which invokes
         handle_discovery_file_binary directly as a background task.
-        This loop just waits for that task to finish — it never overwrites
+        This loop just waits for that task to finish - it never overwrites
         a session that has progressed past the initial 'accepted' stage,
         since that would mean real processing is underway (e.g. AI column
         classification across multiple sheets, which can legitimately take
@@ -1872,7 +1864,7 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
                 return
             if session.get("status") in ("complete", "failed"):
                 return
-        # Timed out — only treat as a real failure if the file binary itself
+        # Timed out - only treat as a real failure if the file binary itself
         # never arrived (session never progressed past "accepted"/"running"
         # with no sheets loaded). Otherwise leave the session alone; it is
         # still legitimately processing and will complete on its own.
