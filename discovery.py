@@ -1531,9 +1531,15 @@ async def stage_date_config(session_id: str):
             else:
                 # <52 columns
                 first_month = valid[0]
-                jan_in_first_6 = any(m == 1 for m in valid[:6])
+                # Find first January position
+                jan_positions = [i for i, m in enumerate(valid) if m == 1]
+                first_jan = jan_positions[0] if jan_positions else None
+                # Q4 months before January means file opens with prior-year tail
+                q4_before_jan = first_jan is not None and any(
+                    m in (10, 11, 12) for m in valid[:first_jan]
+                )
                 q1_at_start = first_month in (1, 2, 3)
-                if jan_in_first_6:
+                if q4_before_jan:
                     year_start = year_value - 1
                 elif q1_at_start:
                     year_start = year_value
