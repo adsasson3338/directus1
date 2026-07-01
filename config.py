@@ -16,6 +16,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL",   "qwen/qwen3-30b-a3b-thinking-2507")
 OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4000"))
+AI_LOG_VERBOSE = os.environ.get("AI_LOG_VERBOSE", "false").lower() == "true"
 
 # ─────────────────────────────────────────────
 # N8N — only fetch-file webhook remains
