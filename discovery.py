@@ -577,9 +577,10 @@ def build_file_set_key(retailer: str, date_config: dict, grid: dict = None) -> s
         month_seq = []
         last_sample_val = None
         if grid and sheet_name:
-            date_axis_g     = grid.get(sheet_name, {}).get("date_axis", {})
-            month_seq       = date_axis_g.get("month_sequence", [])
-            last_sample_val = date_axis_g.get("last_sample_val")
+            date_axis_g          = grid.get(sheet_name, {}).get("date_axis", {})
+            month_seq            = date_axis_g.get("month_sequence", [])
+            last_active_sample   = date_axis_g.get("last_active_sample_val")
+            last_sample_val      = last_active_sample or date_axis_g.get("last_sample_val")
 
         # First try: parse last_sample_val directly (most accurate)
         if last_sample_val:
@@ -1098,7 +1099,7 @@ def detect_known_file_type(filename: str, sheet_names: list) -> str | None:
     Check filename and sheet names against known non-sales file type keywords.
     Returns the audit status to assign, or None if unrecognized.
     """
-    haystack = (filename + " " + " ".join(sheet_names)).lower()
+    haystack = ((filename or "") + " " + " ".join(sheet_names)).lower()
     for keyword, status in KNOWN_FILE_TYPES.items():
         if keyword in haystack:
             return status
@@ -1384,6 +1385,25 @@ async def stage_schema_classify(session_id: str):
                     last_sample_val = h["value"]
                     break
 
+        # Find last ACTIVE column - last date column with at least one non-zero data value
+        # This is the true latest week for file_set_key, not the last column in the sheet
+        last_active_sample_val = None
+        data_start_0 = data_start - 1  # 0-based
+        for col_0 in sorted(sales_cols_0based, reverse=True):
+            has_data = any(
+                rows_data[r][col_0] not in (None, 0, "", " ")
+                for r in range(data_start_0, min(data_start_0 + 200, len(rows_data)))
+                if col_0 < len(rows_data[r])
+            )
+            if has_data:
+                col_1 = col_0 + 1
+                cs = col_schema_map.get(col_1, {})
+                for h in cs.get("header_stack", []):
+                    if any(ch.isdigit() for ch in h["value"]):
+                        last_active_sample_val = h["value"]
+                        break
+                break
+
         year_anchors = [
             {"source": "filename", "value": m.group(1)}
             for m in YEAR_RE.finditer(session["filename"])
@@ -1410,6 +1430,7 @@ async def stage_schema_classify(session_id: str):
             "cols":                   sales_cols_0based,
             "sample_values":          sample_vals,
             "last_sample_val":        last_sample_val,
+            "last_active_sample_val": last_active_sample_val,
             "format":                 date_fmt,
             "year_present":           year_present,
             "interleaved_empty_cols": False,
@@ -1885,6 +1906,7 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
 
     session["_sheets"]   = sheets
     session["_raw_data"] = data
+    session["filename"]  = filename
     if not session.get("file_hash"):
         session["file_hash"] = file_hash(data)
 
