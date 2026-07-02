@@ -685,14 +685,17 @@ async def stage_process_files(session_id: str):
 
 
 async def stage_lookup_supplier_skus(session_id: str):
-    """Look up supplier SKUs from retailer_sku_map."""
+    """Look up supplier SKUs from retailer_sku_map.
+    retailer_sku_map is always the source of truth — any supplier_sku
+    extracted from the file itself is overwritten by the mapped value.
+    """
     session   = _sessions[session_id]
     retailer  = session["retailer"]
     session["stage"]  = "looking_up_skus"
     session["status"] = "running"
 
     sales_rows    = session.get("sales_rows", [])
-    retailer_skus = list({row["retailer_sku"] for row in sales_rows if not row.get("supplier_sku")})
+    retailer_skus = list({row["retailer_sku"] for row in sales_rows})
 
     if retailer_skus:
         try:
@@ -700,7 +703,7 @@ async def stage_lookup_supplier_skus(session_id: str):
             rows    = await call_postgres(sql)
             sku_map = {r["retailer_sku"]: r for r in rows if r.get("supplier_sku")}
             for row in sales_rows:
-                if not row.get("supplier_sku") and row["retailer_sku"] in sku_map:
+                if row["retailer_sku"] in sku_map:
                     row["supplier_sku"] = sku_map[row["retailer_sku"]].get("supplier_sku")
             session["sales_rows"] = sales_rows
         except Exception as e:
