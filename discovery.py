@@ -1830,6 +1830,11 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
 
     session = _sessions[session_id]
 
+    # Clean filename immediately — decode URL encoding and strip MinIO random suffix
+    from urllib.parse import unquote
+    filename = unquote(filename or "")
+    filename = re.sub(r'_[A-Za-z0-9]{5}(\.[^.]+)$', r'\1', filename)
+
     if not filename.lower().endswith((".xlsx", ".xls")):
         file_audit_id = session.get("file_audit_id")
         if file_audit_id:
@@ -1956,7 +1961,9 @@ async def analyze_from_audit(request_body: dict, background_tasks: BackgroundTas
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch audit row: {e}")
 
-    filename  = audit_row.get("filename", "unknown.xlsx")
+    from urllib.parse import unquote
+    filename  = unquote(audit_row.get("filename", "unknown.xlsx") or "unknown.xlsx")
+    filename  = re.sub(r'_[A-Za-z0-9]{5}(\.[^.]+)$', r'\1', filename)
     file_hash_val = audit_row.get("file_hash")
 
     # Atomically claim this row - flips received -> analyzing.
