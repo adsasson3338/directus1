@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Sales Forecast Pivot</title>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/cdn/perspective-viewer.js"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid/dist/cdn/perspective-viewer-datagrid.js"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc/dist/cdn/perspective-viewer-d3fc.js"></script>
+  <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/themes.css" />
+  <style>
+    html, body, perspective-viewer { height: 100%; width: 100%; margin: 0; padding: 0; }
+  </style>
+</head>
+<body>
+  <perspective-viewer id="viewer" style="width:100vw; height:100vh;"></perspective-viewer>
+
+  <script type="module">
+    import perspective from "https://cdn.jsdelivr.net/npm/@finos/perspective/dist/cdn/perspective.js";
+
+    (async () => {
+      const websocket = await perspective.websocket(`ws://${window.location.host}/websocket`);
+      const server_table = await websocket.open_table("forecast");
+      const viewer = document.getElementById("viewer");
+      await viewer.load(server_table);
+
+      // Default layout: entity as row, week as parent column, metric nested underneath.
+      // Drag fields in the UI to rearrange — this is just the starting shape.
+      await viewer.restore({
+        group_by: ["entity_id"],
+        split_by: ["week_start", "metric"],
+        columns: ["value"],
+        aggregates: { value: "sum" },
+        plugin: "Datagrid",
+        theme: "Pro Dark",
+        // Color the "value" column: red for negative, green for positive.
+        // Since metric is nested into columns, this gradient applies wherever
+        // the pct_diff/difference slices land.
+        columns_config: {
+          value: {
+            number_bg_mode: "gradient",
+            pos_bg_color: "#1f9d55",
+            neg_bg_color: "#c0392b",
+          },
+        },
+      });
+    })();
+  </script>
+</body>
+</html>
