@@ -5,7 +5,8 @@ import psycopg2
 import psycopg2.extras
 import tornado.ioloop
 import tornado.web
-from perspective import PerspectiveManager, PerspectiveTornadoHandler, Table
+from perspective import Server
+from perspective.handlers.tornado import PerspectiveTornadoHandler
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pivot-server")
@@ -15,11 +16,12 @@ PG_DSN = os.environ.get(
     "PG_DSN",
     "host=postgres port=5432 dbname=yourdb user=youruser password=yourpass",
 )
-# The flat/unpivoted view or table to read from, e.g. v_forecast_tidy
+# The table or view to read from, e.g. your retailer/sku/week table.
 SOURCE_VIEW = os.environ.get("SOURCE_VIEW", "v_forecast_tidy")
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
 
-MANAGER = PerspectiveManager()
+SERVER = Server()
+CLIENT = SERVER.new_local_client()
 TABLE = None
 
 
@@ -38,8 +40,7 @@ def init_table():
     rows = fetch_rows()
     if not rows:
         raise RuntimeError(f"{SOURCE_VIEW} returned no rows on startup")
-    TABLE = Table(rows)
-    MANAGER.host_table("forecast", TABLE)
+    TABLE = CLIENT.table(rows, name="forecast")
     log.info("Hosted table 'forecast' with %d rows", len(rows))
 
 
@@ -61,7 +62,7 @@ class HealthHandler(tornado.web.RequestHandler):
 def make_app():
     return tornado.web.Application(
         [
-            (r"/websocket", PerspectiveTornadoHandler, {"manager": MANAGER, "check_origin": True}),
+            (r"/websocket", PerspectiveTornadoHandler, {"perspective_server": SERVER, "check_origin": True}),
             (r"/health", HealthHandler),
             (r"/(.*)", tornado.web.StaticFileHandler, {"path": "static", "default_filename": "index.html"}),
         ]
