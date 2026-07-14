@@ -49,41 +49,71 @@
     import perspective from "https://cdn.jsdelivr.net/npm/@perspective-dev/client@4.5.2/dist/cdn/perspective.js";
 
     // Per-table default layouts. Add an entry here for any table where you
-    // want a specific starting view; anything not listed loads flat and
-    // lets you configure it by hand in the sidebar.
+    // want a specific starting view; anything not listed falls back to
+    // GENERIC_DEFAULT below and lets you configure it by hand in the sidebar.
+    const GENERIC_DEFAULT = {
+      plugin: "Datagrid",
+      theme: "Pro Dark",
+      settings: true,
+    };
+
     const TABLE_DEFAULTS = {
-      v_forecast_tidy: {
-        group_by: ["retailer", "retailer_sku"],
-        split_by: ["week_date"],
-        columns: ["units_sold", "forecast", "difference", "difference_pct"],
-        aggregates: {
-          units_sold: "sum",
-          forecast: "sum",
-          difference: "sum",
-          difference_pct: "avg",
-        },
-        sort: [["difference", "asc"]],
+      v_weekly_forecast_report: {
+        version: "4.5.2",
+        columns_config: {},
         plugin: "Datagrid",
-        theme: "Pro Dark",
+        plugin_config: {},
         settings: true,
-        columns_config: {
-          difference: {
-            number_bg_mode: "gradient",
-            number_fg_mode: "gradient",
-            pos_bg_color: "#1f9d55",
-            neg_bg_color: "#c0392b",
-            pos_fg_color: "#4ade80",
-            neg_fg_color: "#f87171",
-          },
-          difference_pct: {
-            number_bg_mode: "gradient",
-            number_fg_mode: "gradient",
-            pos_bg_color: "#1f9d55",
-            neg_bg_color: "#c0392b",
-            pos_fg_color: "#4ade80",
-            neg_fg_color: "#f87171",
-          },
+        theme: "Pro Dark",
+        title: null,
+        group_by: ["retailer", "sku_label"],
+        split_by: ["week_date"],
+        sort: [],
+        filter: [["week_date", ">", "2026-01-01"]],
+        group_rollup_mode: "flat",
+        expressions: {
+          sku_label: "// sku_label\nconcat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
         },
+        columns: ["units_sold", "forecast", "difference", "difference_pct"],
+        aggregates: {},
+      },
+      v_monthly_forecast_report: {
+        version: "4.5.2",
+        columns_config: {},
+        plugin: "Datagrid",
+        plugin_config: {},
+        settings: true,
+        theme: "Pro Dark",
+        title: null,
+        group_by: ["retailer", "sku_label"],
+        split_by: ["month"],
+        sort: [],
+        filter: [["month", ">", "2026-01-01"]],
+        group_rollup_mode: "rollup",
+        expressions: {
+          sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
+        },
+        columns: ["units_sold", "forecast", "difference", "difference_pct"],
+        aggregates: {},
+      },
+      v_quarterly_forecast_report: {
+        version: "4.5.2",
+        columns_config: {},
+        plugin: "Datagrid",
+        plugin_config: {},
+        settings: true,
+        theme: "Pro Dark",
+        title: null,
+        group_by: ["retailer", "sku_label"],
+        split_by: ["quarter"],
+        sort: [],
+        filter: [["quarter", ">", "2026"]],
+        group_rollup_mode: "rollup",
+        expressions: {
+          sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
+        },
+        columns: ["total_units", "quarterly_forecast", "difference", "difference_pct"],
+        aggregates: {},
       },
     };
 
@@ -119,7 +149,7 @@
         if (defaults) {
           await viewer.restore(defaults);
         } else {
-          await viewer.restore({ plugin: "Datagrid", theme: "Pro Dark", settings: true });
+          await viewer.restore(GENERIC_DEFAULT);
         }
         statusEl.textContent = name + " — loaded " + new Date().toLocaleString();
         const url = new URL(window.location);
