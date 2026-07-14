@@ -5,8 +5,20 @@
   <title>Sales Forecast Pivot</title>
   <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@perspective-dev/viewer@4.5.2/dist/css/themes.css" />
   <style>
-    html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #1a1a1e; }
+    html, body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      background: #1a1a1e;
+      overflow: hidden;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+    }
     #header {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -27,8 +39,9 @@
       color: #9ca3af;
     }
     perspective-viewer {
-      height: calc(100vh - 44px);
-      width: 100vw;
+      flex: 1 1 auto;
+      min-height: 0;
+      width: 100%;
       display: block;
     }
   </style>
