@@ -1,0 +1,81 @@
+import logging
+import os
+
+import psycopg2
+import psycopg2.extras
+import tornado.ioloop
+import tornado.web
+from perspective import PerspectiveManager, PerspectiveTornadoHandler, Table
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("pivot-server")
+
+# Connection details — override via environment variables in docker-compose.
+PG_DSN = os.environ.get(
+    "PG_DSN",
+    "host=postgres port=5432 dbname=yourdb user=youruser password=yourpass",
+)
+# The flat/unpivoted view or table to read from, e.g. v_forecast_tidy
+SOURCE_VIEW = os.environ.get("SOURCE_VIEW", "v_forecast_tidy")
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
+
+MANAGER = PerspectiveManager()
+TABLE = None
+
+
+def fetch_rows():
+    conn = psycopg2.connect(PG_DSN)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SELECT * FROM {SOURCE_VIEW}")
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def init_table():
+    global TABLE
+    rows = fetch_rows()
+    if not rows:
+        raise RuntimeError(f"{SOURCE_VIEW} returned no rows on startup")
+    TABLE = Table(rows)
+    MANAGER.host_table("forecast", TABLE)
+    log.info("Hosted table 'forecast' with %d rows", len(rows))
+
+
+def refresh_table():
+    try:
+        rows = fetch_rows()
+        TABLE.clear()
+        TABLE.update(rows)
+        log.info("Refreshed 'forecast' with %d rows", len(rows))
+    except Exception:
+        log.exception("Refresh failed, keeping previous data")
+
+
+class HealthHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write({"status": "ok"})
+
+
+def make_app():
+    return tornado.web.Application(
+        [
+            (r"/websocket", PerspectiveTornadoHandler, {"manager": MANAGER, "check_origin": True}),
+            (r"/health", HealthHandler),
+            (r"/(.*)", tornado.web.StaticFileHandler, {"path": "static", "default_filename": "index.html"}),
+        ]
+    )
+
+
+def main():
+    init_table()
+    app = make_app()
+    app.listen(8888)
+    tornado.ioloop.PeriodicCallback(refresh_table, REFRESH_SECONDS * 1000).start()
+    log.info("Listening on :8888, refreshing every %ss", REFRESH_SECONDS)
+    tornado.ioloop.IOLoop.current().start()
+
+
+if __name__ == "__main__":
+    main()
