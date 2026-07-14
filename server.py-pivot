@@ -18,13 +18,15 @@ PG_DSN = os.environ.get(
     "PG_DSN",
     "host=postgres port=5432 dbname=yourdb user=youruser password=yourpass",
 )
-# The table or view to read from, e.g. your retailer/sku/week table.
-SOURCE_VIEW = os.environ.get("SOURCE_VIEW", "v_forecast_tidy")
+# Comma-separated list of tables/views to host, e.g.
+# "v_forecast_tidy,sales_by_region,inventory_levels"
+# Each is exposed to the browser under its own name via get_hosted_table_names().
+TABLES = [t.strip() for t in os.environ.get("TABLES", "v_forecast_tidy").split(",") if t.strip()]
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
 
 SERVER = Server()
 CLIENT = SERVER.new_local_client()
-TABLE = None
+HOSTED_TABLES = {}  # name -> perspective Table proxy
 
 
 def _json_safe(value):
@@ -37,39 +39,45 @@ def _json_safe(value):
     return value
 
 
-def fetch_rows():
+def fetch_rows(table_name):
     conn = psycopg2.connect(PG_DSN)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"SELECT * FROM {SOURCE_VIEW}")
+            # table_name comes from our own TABLES env var, not user input —
+            # safe to interpolate here, but never do this with request-supplied values.
+            cur.execute(f"SELECT * FROM {table_name}")
             rows = cur.fetchall()
             return [{k: _json_safe(v) for k, v in dict(row).items()} for row in rows]
     finally:
         conn.close()
 
 
-def init_table():
-    global TABLE
-    rows = fetch_rows()
-    if not rows:
-        raise RuntimeError(f"{SOURCE_VIEW} returned no rows on startup")
-    TABLE = CLIENT.table(rows, name="forecast")
-    log.info("Hosted table 'forecast' with %d rows", len(rows))
+def init_tables():
+    for name in TABLES:
+        rows = fetch_rows(name)
+        if not rows:
+            log.warning("%s returned no rows on startup, skipping", name)
+            continue
+        HOSTED_TABLES[name] = CLIENT.table(rows, name=name)
+        log.info("Hosted table '%s' with %d rows", name, len(rows))
+    if not HOSTED_TABLES:
+        raise RuntimeError("No tables were successfully loaded from TABLES=%r" % TABLES)
 
 
-def refresh_table():
-    try:
-        rows = fetch_rows()
-        TABLE.clear()
-        TABLE.update(rows)
-        log.info("Refreshed 'forecast' with %d rows", len(rows))
-    except Exception:
-        log.exception("Refresh failed, keeping previous data")
+def refresh_tables():
+    for name, table in HOSTED_TABLES.items():
+        try:
+            rows = fetch_rows(name)
+            table.clear()
+            table.update(rows)
+            log.info("Refreshed '%s' with %d rows", name, len(rows))
+        except Exception:
+            log.exception("Refresh failed for '%s', keeping previous data", name)
 
 
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
-        self.write({"status": "ok"})
+        self.write({"status": "ok", "tables": list(HOSTED_TABLES.keys())})
 
 
 def make_app():
@@ -83,11 +91,11 @@ def make_app():
 
 
 def main():
-    init_table()
+    init_tables()
     app = make_app()
     app.listen(8888)
-    tornado.ioloop.PeriodicCallback(refresh_table, REFRESH_SECONDS * 1000).start()
-    log.info("Listening on :8888, refreshing every %ss", REFRESH_SECONDS)
+    tornado.ioloop.PeriodicCallback(refresh_tables, REFRESH_SECONDS * 1000).start()
+    log.info("Listening on :8888, hosting %s, refreshing every %ss", list(HOSTED_TABLES.keys()), REFRESH_SECONDS)
     tornado.ioloop.IOLoop.current().start()
 
 
