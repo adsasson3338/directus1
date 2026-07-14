@@ -18,7 +18,8 @@
     import perspective from "https://cdn.jsdelivr.net/npm/@finos/perspective/dist/cdn/perspective.js";
 
     (async () => {
-      const websocket = await perspective.websocket(`ws://${window.location.host}/websocket`);
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const websocket = await perspective.websocket(`${wsProtocol}//${window.location.host}/websocket`);
       const server_table = await websocket.open_table("forecast");
       const viewer = document.getElementById("viewer");
       await viewer.load(server_table);
