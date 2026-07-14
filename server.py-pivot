@@ -75,7 +75,7 @@ class HealthHandler(tornado.web.RequestHandler):
 def make_app():
     return tornado.web.Application(
         [
-            (r"/websocket", PerspectiveTornadoHandler, {"perspective_server": SERVER, "check_origin": True}),
+            (r"/websocket", PerspectiveTornadoHandler, {"perspective_server": SERVER}),
             (r"/health", HealthHandler),
             (r"/(.*)", tornado.web.StaticFileHandler, {"path": "static", "default_filename": "index.html"}),
         ]
