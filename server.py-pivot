@@ -1,5 +1,7 @@
+import datetime
 import logging
 import os
+from decimal import Decimal
 
 import psycopg2
 import psycopg2.extras
@@ -25,12 +27,23 @@ CLIENT = SERVER.new_local_client()
 TABLE = None
 
 
+def _json_safe(value):
+    # psycopg2 returns date/datetime and Decimal objects that Perspective's
+    # internal JSON serialization can't handle directly — convert them.
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
 def fetch_rows():
     conn = psycopg2.connect(PG_DSN)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(f"SELECT * FROM {SOURCE_VIEW}")
-            return cur.fetchall()
+            rows = cur.fetchall()
+            return [{k: _json_safe(v) for k, v in dict(row).items()} for row in rows]
     finally:
         conn.close()
 
