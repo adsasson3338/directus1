@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <title>Sales Forecast Pivot</title>
-  <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@perspective-dev/viewer/dist/css/themes.css" />
+  <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@perspective-dev/viewer@4.5.2/dist/css/themes.css" />
   <style>
     html, body, perspective-viewer { height: 100%; width: 100%; margin: 0; padding: 0; }
   </style>
@@ -12,10 +12,9 @@
   <perspective-viewer id="viewer" style="width:100vw; height:100vh;"></perspective-viewer>
 
   <script type="module">
-    import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer/dist/cdn/perspective-viewer.js";
-    import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-datagrid/dist/cdn/perspective-viewer-datagrid.js";
-    import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-d3fc/dist/cdn/perspective-viewer-d3fc.js";
-    import perspective from "https://cdn.jsdelivr.net/npm/@perspective-dev/client/dist/cdn/perspective.js";
+    import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer@4.5.2/dist/cdn/perspective-viewer.js";
+    import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-datagrid@4.5.2/dist/cdn/perspective-viewer-datagrid.js";
+    import perspective from "https://cdn.jsdelivr.net/npm/@perspective-dev/client@4.5.2/dist/cdn/perspective.js";
 
     (async () => {
       const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
