@@ -23,20 +23,29 @@
       const viewer = document.getElementById("viewer");
       await viewer.load(server_table);
 
-      // Default layout: entity as row, week as parent column, metric nested underneath.
+      // Default layout for the retailer/sku/week_date table:
+      // parent rows = retailer -> retailer_sku, parent columns = week_date,
+      // nested under each week = units_sold/forecast/difference/difference_pct.
       // Drag fields in the UI to rearrange — this is just the starting shape.
       await viewer.restore({
-        group_by: ["entity_id"],
-        split_by: ["week_start", "metric"],
-        columns: ["value"],
-        aggregates: { value: "sum" },
+        group_by: ["retailer", "retailer_sku"],
+        split_by: ["week_date"],
+        columns: ["units_sold", "forecast", "difference", "difference_pct"],
+        aggregates: {
+          units_sold: "sum",
+          forecast: "sum",
+          difference: "sum",
+          difference_pct: "avg",
+        },
         plugin: "Datagrid",
         theme: "Pro Dark",
-        // Color the "value" column: red for negative, green for positive.
-        // Since metric is nested into columns, this gradient applies wherever
-        // the pct_diff/difference slices land.
         columns_config: {
-          value: {
+          difference: {
+            number_bg_mode: "gradient",
+            pos_bg_color: "#1f9d55",
+            neg_bg_color: "#c0392b",
+          },
+          difference_pct: {
             number_bg_mode: "gradient",
             pos_bg_color: "#1f9d55",
             neg_bg_color: "#c0392b",
