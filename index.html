@@ -102,7 +102,7 @@
         split_by: ["month"],
         sort: [],
         filter: [["month", ">", "2026-01-01"]],
-        group_rollup_mode: "rollup",
+        group_rollup_mode: "flat",
         expressions: {
           sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
         },
@@ -121,7 +121,7 @@
         split_by: ["quarter"],
         sort: [],
         filter: [["quarter", ">", "2026"]],
-        group_rollup_mode: "rollup",
+        group_rollup_mode: "flat",
         expressions: {
           sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
         },
@@ -145,13 +145,13 @@
           sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
         },
         columns: [
+          "allocation_name",
           "description",
           "av_now",
           "on_hand",
           "in_transit",
           "purchase_order",
           "total_supply",
-          "allocation_name",
           "retailer_on_hand",
           "retailer_inventory_date",
           "forecast_17wk",
@@ -182,8 +182,8 @@
           sku_label: "concat(\"retailer_sku\", ' (', \"variant_sku\", ')')",
         },
         columns: [
-          "variant_description",
           "allocation_name",
+          "variant_description",
           "av_now",
           "on_hand",
           "in_transit",
