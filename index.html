@@ -35,8 +35,11 @@
 </head>
 <body>
   <div id="header">
-    <h1>Sales Forecast — Retailer / SKU / Week</h1>
-    <span id="last-updated">loading…</span>
+    <h1>Sales Forecast Dashboard</h1>
+    <div style="display:flex; align-items:center; gap:14px;">
+      <select id="table-select" style="background:#222; color:#e5e7eb; border:1px solid #3b3b40; border-radius:4px; padding:4px 8px; font-size:12px;"></select>
+      <span id="last-updated">loading…</span>
+    </div>
   </div>
   <perspective-viewer id="viewer" settings></perspective-viewer>
 
@@ -45,18 +48,11 @@
     import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-datagrid@4.5.2/dist/cdn/perspective-viewer-datagrid.js";
     import perspective from "https://cdn.jsdelivr.net/npm/@perspective-dev/client@4.5.2/dist/cdn/perspective.js";
 
-    (async () => {
-      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const websocket = await perspective.websocket(`${wsProtocol}//${window.location.host}/websocket`);
-      const server_table = await websocket.open_table("forecast");
-      const viewer = document.getElementById("viewer");
-      await viewer.load(server_table);
-
-      // Default layout for the retailer/sku/week_date table:
-      // parent rows = retailer -> retailer_sku, parent columns = week_date,
-      // nested under each week = units_sold/forecast/difference/difference_pct.
-      // Drag fields in the UI to rearrange — this is just the starting shape.
-      await viewer.restore({
+    // Per-table default layouts. Add an entry here for any table where you
+    // want a specific starting view; anything not listed loads flat and
+    // lets you configure it by hand in the sidebar.
+    const TABLE_DEFAULTS = {
+      v_forecast_tidy: {
         group_by: ["retailer", "retailer_sku"],
         split_by: ["week_date"],
         columns: ["units_sold", "forecast", "difference", "difference_pct"],
@@ -88,10 +84,52 @@
             neg_fg_color: "#f87171",
           },
         },
-      });
+      },
+    };
 
-      document.getElementById("last-updated").textContent =
-        "loaded " + new Date().toLocaleString();
+    (async () => {
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const websocket = await perspective.websocket(`${wsProtocol}//${window.location.host}/websocket`);
+      const viewer = document.getElementById("viewer");
+      const select = document.getElementById("table-select");
+      const statusEl = document.getElementById("last-updated");
+
+      const tableNames = await websocket.get_hosted_table_names();
+      tableNames.sort();
+
+      select.innerHTML = "";
+      for (const name of tableNames) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      }
+
+      // Respect ?table=name in the URL if present and valid, else first table.
+      const params = new URLSearchParams(window.location.search);
+      const requested = params.get("table");
+      const initial = tableNames.includes(requested) ? requested : tableNames[0];
+      select.value = initial;
+
+      async function loadTable(name) {
+        statusEl.textContent = "loading " + name + "…";
+        const server_table = await websocket.open_table(name);
+        await viewer.load(server_table);
+        const defaults = TABLE_DEFAULTS[name];
+        if (defaults) {
+          await viewer.restore(defaults);
+        } else {
+          await viewer.restore({ plugin: "Datagrid", theme: "Pro Dark", settings: true });
+        }
+        statusEl.textContent = name + " — loaded " + new Date().toLocaleString();
+        const url = new URL(window.location);
+        url.searchParams.set("table", name);
+        window.history.replaceState({}, "", url);
+      }
+
+      select.addEventListener("change", () => loadTable(select.value));
+
+      await loadTable(initial);
     })();
   </script>
 </body>
