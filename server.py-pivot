@@ -32,11 +32,11 @@ REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
 # rebuild), which was colliding with active views and deadlocking Perspective's
 # native engine. Add an entry here for any new table you host.
 TABLE_KEYS = {
-    "v_weekly_forecast_report": ["retailer", "retailer_sku", "week_date"],
-    "v_monthly_forecast_report": ["retailer", "retailer_sku", "month"],
-    "v_quarterly_forecast_report": ["retailer", "retailer_sku", "quarter"],
-    "v_inventory_tracker": ["retailer", "retailer_sku"],
-    "v_inventory_variants": ["retailer", "retailer_sku"],
+    "v_weekly_forecast_report": ["retailer", "retailer_sku", "supplier_sku", "week_date"],
+    "v_monthly_forecast_report": ["retailer", "retailer_sku", "supplier_sku", "month"],
+    "v_quarterly_forecast_report": ["retailer", "retailer_sku", "supplier_sku", "quarter"],
+    "v_inventory_tracker": ["retailer", "retailer_sku", "supplier_sku"],
+    "v_inventory_variants": ["retailer", "retailer_sku", "variant_sku"],
 }
 ROW_ID_COLUMN = "_row_id"
 
