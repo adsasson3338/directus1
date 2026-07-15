@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 import psycopg2
@@ -27,6 +28,10 @@ REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
 SERVER = Server()
 CLIENT = SERVER.new_local_client()
 HOSTED_TABLES = {}  # name -> perspective Table proxy
+# psycopg2 and row conversion are blocking — running them on Tornado's single
+# event loop thread would freeze all requests (websocket, static files,
+# health checks) for the duration of every fetch. Run them here instead.
+DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db-fetch")
 
 
 def _json_safe(value):
@@ -39,8 +44,9 @@ def _json_safe(value):
     return value
 
 
-def fetch_rows(table_name):
-    conn = psycopg2.connect(PG_DSN)
+def _fetch_rows_blocking(table_name):
+    """Runs on a worker thread — never call this directly from the event loop."""
+    conn = psycopg2.connect(PG_DSN, connect_timeout=10, options="-c statement_timeout=15000")
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # table_name comes from our own TABLES env var, not user input —
@@ -52,9 +58,14 @@ def fetch_rows(table_name):
         conn.close()
 
 
-def init_tables():
+async def fetch_rows(table_name):
+    loop = tornado.ioloop.IOLoop.current()
+    return await loop.run_in_executor(DB_EXECUTOR, _fetch_rows_blocking, table_name)
+
+
+async def init_tables():
     for name in TABLES:
-        rows = fetch_rows(name)
+        rows = await fetch_rows(name)
         if not rows:
             log.warning("%s returned no rows on startup, skipping", name)
             continue
@@ -64,10 +75,10 @@ def init_tables():
         raise RuntimeError("No tables were successfully loaded from TABLES=%r" % TABLES)
 
 
-def refresh_tables():
+async def refresh_tables():
     for name, table in HOSTED_TABLES.items():
         try:
-            rows = fetch_rows(name)
+            rows = await fetch_rows(name)
             table.clear()
             table.update(rows)
             log.info("Refreshed '%s' with %d rows", name, len(rows))
@@ -90,14 +101,16 @@ def make_app():
     )
 
 
-def main():
-    init_tables()
+async def main():
+    await init_tables()
     app = make_app()
     app.listen(8888)
     tornado.ioloop.PeriodicCallback(refresh_tables, REFRESH_SECONDS * 1000).start()
     log.info("Listening on :8888, hosting %s, refreshing every %ss", list(HOSTED_TABLES.keys()), REFRESH_SECONDS)
-    tornado.ioloop.IOLoop.current().start()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+
+    asyncio.run(main())
