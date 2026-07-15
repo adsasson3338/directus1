@@ -49,8 +49,11 @@
 <body>
   <div id="header">
     <h1>Sales Forecast Dashboard</h1>
-    <div style="display:flex; align-items:center; gap:14px;">
+    <div style="display:flex; align-items:center; gap:10px;">
       <select id="table-select" style="background:#222; color:#e5e7eb; border:1px solid #3b3b40; border-radius:4px; padding:4px 8px; font-size:12px;"></select>
+      <select id="view-select" style="background:#222; color:#e5e7eb; border:1px solid #3b3b40; border-radius:4px; padding:4px 8px; font-size:12px; max-width:180px;"></select>
+      <button id="save-view-btn" title="Save current layout as a named view" style="background:#2563eb; color:#fff; border:none; border-radius:4px; padding:4px 10px; font-size:12px; cursor:pointer;">Save view</button>
+      <button id="delete-view-btn" title="Delete the selected saved view" style="background:#3b3b40; color:#e5e7eb; border:none; border-radius:4px; padding:4px 10px; font-size:12px; cursor:pointer; display:none;">Delete</button>
       <span id="last-updated">loading…</span>
     </div>
   </div>
@@ -251,19 +254,100 @@
     let currentTableName = null;
     let lastGoodConfig = null;
     let reconnecting = false;
+    let savedViewsCache = {}; // name -> config, for the currently selected table
 
     const viewer = document.getElementById("viewer");
     const select = document.getElementById("table-select");
+    const viewSelect = document.getElementById("view-select");
+    const saveBtn = document.getElementById("save-view-btn");
+    const deleteBtn = document.getElementById("delete-view-btn");
     const statusEl = document.getElementById("last-updated");
+
+    const DEFAULT_VIEW_OPTION = "__default__";
 
     function wsProtocol() {
       return window.location.protocol === "https:" ? "wss:" : "ws:";
+    }
+
+    async function fetchSavedViews(table) {
+      try {
+        const res = await fetch(`/api/views?table=${encodeURIComponent(table)}`);
+        const data = await res.json();
+        return data.views || {};
+      } catch (e) {
+        console.warn("Failed to load saved views for", table, e);
+        return {};
+      }
+    }
+
+    async function saveCurrentView(table) {
+      const name = prompt("Name this view (visible to everyone using the dashboard):");
+      if (!name) return;
+      const config = await viewer.save();
+      try {
+        const res = await fetch("/api/views", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ table, name, config }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        await populateViewSelect(table);
+        viewSelect.value = name;
+      } catch (e) {
+        console.error("Failed to save view", e);
+        alert("Couldn't save the view — check the console for details.");
+      }
+    }
+
+    async function deleteCurrentView(table) {
+      const name = viewSelect.value;
+      if (name === DEFAULT_VIEW_OPTION) return;
+      if (!confirm(`Delete the saved view "${name}" for everyone?`)) return;
+      try {
+        await fetch(`/api/views?table=${encodeURIComponent(table)}&name=${encodeURIComponent(name)}`, {
+          method: "DELETE",
+        });
+        await populateViewSelect(table);
+        await applySelectedView();
+      } catch (e) {
+        console.error("Failed to delete view", e);
+        alert("Couldn't delete the view — check the console for details.");
+      }
+    }
+
+    async function populateViewSelect(table) {
+      savedViewsCache = await fetchSavedViews(table);
+      viewSelect.innerHTML = "";
+      const defaultOpt = document.createElement("option");
+      defaultOpt.value = DEFAULT_VIEW_OPTION;
+      defaultOpt.textContent = "Default layout";
+      viewSelect.appendChild(defaultOpt);
+      for (const name of Object.keys(savedViewsCache).sort()) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        viewSelect.appendChild(opt);
+      }
+      deleteBtn.style.display = "none";
+    }
+
+    async function applySelectedView() {
+      const chosen = viewSelect.value;
+      if (chosen === DEFAULT_VIEW_OPTION) {
+        const defaults = TABLE_DEFAULTS[currentTableName] || GENERIC_DEFAULT;
+        await viewer.restore(defaults);
+        deleteBtn.style.display = "none";
+      } else if (savedViewsCache[chosen]) {
+        await viewer.restore(savedViewsCache[chosen]);
+        deleteBtn.style.display = "inline-block";
+      }
     }
 
     async function loadTable(name, restoreConfig) {
       statusEl.textContent = "loading " + name + "…";
       const server_table = await websocket.open_table(name);
       await viewer.load(server_table);
+      await populateViewSelect(name);
       const defaults = restoreConfig || TABLE_DEFAULTS[name] || GENERIC_DEFAULT;
       await viewer.restore(defaults);
       currentTableName = name;
@@ -337,6 +421,10 @@
       lastGoodConfig = null; // switching tables intentionally — don't carry over old layout
       await loadTable(select.value);
     });
+
+    viewSelect.addEventListener("change", () => applySelectedView());
+    saveBtn.addEventListener("click", () => saveCurrentView(currentTableName));
+    deleteBtn.addEventListener("click", () => deleteCurrentView(currentTableName));
 
     connect().catch((e) => {
       console.error("Initial connection failed", e);
