@@ -76,7 +76,9 @@
         columns_config: {
           units_sold: { fixed: 0 },
           forecast: { fixed: 0 },
-          difference: { fixed: 0 },
+          difference: {
+            number_format: { minimumFractionDigits: 0, maximumFractionDigits: 0 },
+          },
           difference_pct: { fixed: 2 },
         },
         plugin: "Datagrid",
@@ -100,7 +102,9 @@
         columns_config: {
           units_sold: { fixed: 0 },
           forecast: { fixed: 0 },
-          difference: { fixed: 0 },
+          difference: {
+            number_format: { minimumFractionDigits: 0, maximumFractionDigits: 0 },
+          },
           difference_pct: { fixed: 2 },
         },
         plugin: "Datagrid",
@@ -124,7 +128,9 @@
         columns_config: {
           total_units: { fixed: 0 },
           quarterly_forecast: { fixed: 0 },
-          difference: { fixed: 0 },
+          difference: {
+            number_format: { minimumFractionDigits: 0, maximumFractionDigits: 0 },
+          },
           difference_pct: { fixed: 2 },
         },
         plugin: "Datagrid",
