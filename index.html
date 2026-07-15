@@ -158,7 +158,9 @@
           purchase_order: { fixed: 0 },
           total_supply: { fixed: 0 },
           retailer_on_hand: { fixed: 0 },
-          forecast_17wk: { fixed: 0 },
+          forecast_17wk: {
+            number_format: { minimumFractionDigits: 0, maximumFractionDigits: 0 },
+          },
           months_cover: { fixed: 1 },
         },
         plugin: "Datagrid",
@@ -203,7 +205,9 @@
           in_transit: { fixed: 0 },
           purchase_order: { fixed: 0 },
           total_supply: { fixed: 0 },
-          retailer_forecast_17wk: { fixed: 0 },
+          retailer_forecast_17wk: {
+            number_format: { minimumFractionDigits: 0, maximumFractionDigits: 0 },
+          },
           months_cover: { fixed: 1 },
         },
         plugin: "Datagrid",
