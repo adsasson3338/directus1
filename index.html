@@ -73,7 +73,12 @@
     const TABLE_DEFAULTS = {
       v_weekly_forecast_report: {
         version: "4.5.2",
-        columns_config: {},
+        columns_config: {
+          units_sold: { fixed: 0 },
+          forecast: { fixed: 0 },
+          difference: { fixed: 0 },
+          difference_pct: { fixed: 2 },
+        },
         plugin: "Datagrid",
         plugin_config: {},
         settings: true,
@@ -92,7 +97,12 @@
       },
       v_monthly_forecast_report: {
         version: "4.5.2",
-        columns_config: {},
+        columns_config: {
+          units_sold: { fixed: 0 },
+          forecast: { fixed: 0 },
+          difference: { fixed: 0 },
+          difference_pct: { fixed: 2 },
+        },
         plugin: "Datagrid",
         plugin_config: {},
         settings: true,
@@ -111,7 +121,12 @@
       },
       v_quarterly_forecast_report: {
         version: "4.5.2",
-        columns_config: {},
+        columns_config: {
+          total_units: { fixed: 0 },
+          quarterly_forecast: { fixed: 0 },
+          difference: { fixed: 0 },
+          difference_pct: { fixed: 2 },
+        },
         plugin: "Datagrid",
         plugin_config: {},
         settings: true,
@@ -130,7 +145,16 @@
       },
       v_inventory_tracker: {
         version: "4.5.2",
-        columns_config: {},
+        columns_config: {
+          av_now: { fixed: 0 },
+          on_hand: { fixed: 0 },
+          in_transit: { fixed: 0 },
+          purchase_order: { fixed: 0 },
+          total_supply: { fixed: 0 },
+          retailer_on_hand: { fixed: 0 },
+          forecast_17wk: { fixed: 0 },
+          months_cover: { fixed: 1 },
+        },
         plugin: "Datagrid",
         plugin_config: {},
         settings: true,
@@ -167,7 +191,15 @@
       },
       v_inventory_variants: {
         version: "4.5.2",
-        columns_config: {},
+        columns_config: {
+          av_now: { fixed: 0 },
+          on_hand: { fixed: 0 },
+          in_transit: { fixed: 0 },
+          purchase_order: { fixed: 0 },
+          total_supply: { fixed: 0 },
+          retailer_forecast_17wk: { fixed: 0 },
+          months_cover: { fixed: 1 },
+        },
         plugin: "Datagrid",
         plugin_config: {},
         settings: true,
