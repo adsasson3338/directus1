@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 import os
@@ -25,13 +26,30 @@ PG_DSN = os.environ.get(
 TABLES = [t.strip() for t in os.environ.get("TABLES", "v_forecast_tidy").split(",") if t.strip()]
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
 
+# The columns that together uniquely identify one row in each table.
+# Used to build a synthetic composite primary key so refreshes can do an
+# indexed update() (merge/patch) instead of clear()+update() (full wipe and
+# rebuild), which was colliding with active views and deadlocking Perspective's
+# native engine. Add an entry here for any new table you host.
+TABLE_KEYS = {
+    "v_weekly_forecast_report": ["retailer", "retailer_sku", "week_date"],
+    "v_monthly_forecast_report": ["retailer", "retailer_sku", "month"],
+    "v_quarterly_forecast_report": ["retailer", "retailer_sku", "quarter"],
+    "v_inventory_tracker": ["retailer", "retailer_sku"],
+    "v_inventory_variants": ["retailer", "retailer_sku"],
+}
+ROW_ID_COLUMN = "_row_id"
+
 SERVER = Server()
 CLIENT = SERVER.new_local_client()
 HOSTED_TABLES = {}  # name -> perspective Table proxy
-# psycopg2 and row conversion are blocking — running them on Tornado's single
-# event loop thread would freeze all requests (websocket, static files,
-# health checks) for the duration of every fetch. Run them here instead.
-DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db-fetch")
+# psycopg2 and row conversion are blocking, and so are Perspective's own
+# clear()/update() calls into its native engine — none of this may ever run
+# directly on Tornado's event loop thread, or it can freeze every other
+# request (websocket, static files, health checks) for however long it takes,
+# or in the worst case deadlock entirely against an active view. Run all of
+# it here instead.
+WORK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pivot-work")
 
 
 def _json_safe(value):
@@ -44,8 +62,14 @@ def _json_safe(value):
     return value
 
 
+def _add_row_id(row, key_columns):
+    row[ROW_ID_COLUMN] = "|".join(str(row.get(c, "")) for c in key_columns)
+    return row
+
+
 def _fetch_rows_blocking(table_name):
     """Runs on a worker thread — never call this directly from the event loop."""
+    key_columns = TABLE_KEYS.get(table_name)
     conn = psycopg2.connect(PG_DSN, connect_timeout=10, options="-c statement_timeout=15000")
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -53,34 +77,56 @@ def _fetch_rows_blocking(table_name):
             # safe to interpolate here, but never do this with request-supplied values.
             cur.execute(f"SELECT * FROM {table_name}")
             rows = cur.fetchall()
-            return [{k: _json_safe(v) for k, v in dict(row).items()} for row in rows]
+            rows = [{k: _json_safe(v) for k, v in dict(row).items()} for row in rows]
+            if key_columns:
+                rows = [_add_row_id(row, key_columns) for row in rows]
+            return rows
     finally:
         conn.close()
 
 
 async def fetch_rows(table_name):
     loop = tornado.ioloop.IOLoop.current()
-    return await loop.run_in_executor(DB_EXECUTOR, _fetch_rows_blocking, table_name)
+    return await loop.run_in_executor(WORK_EXECUTOR, _fetch_rows_blocking, table_name)
+
+
+def _create_table_blocking(name, rows):
+    key_columns = TABLE_KEYS.get(name)
+    if key_columns:
+        return CLIENT.table(rows, name=name, index=ROW_ID_COLUMN)
+    log.warning("No TABLE_KEYS entry for '%s' — falling back to full clear()+update() refreshes", name)
+    return CLIENT.table(rows, name=name)
 
 
 async def init_tables():
+    loop = tornado.ioloop.IOLoop.current()
     for name in TABLES:
         rows = await fetch_rows(name)
         if not rows:
             log.warning("%s returned no rows on startup, skipping", name)
             continue
-        HOSTED_TABLES[name] = CLIENT.table(rows, name=name)
-        log.info("Hosted table '%s' with %d rows", name, len(rows))
+        HOSTED_TABLES[name] = await loop.run_in_executor(WORK_EXECUTOR, _create_table_blocking, name, rows)
+        log.info("Hosted table '%s' with %d rows (indexed: %s)", name, len(rows), name in TABLE_KEYS)
     if not HOSTED_TABLES:
         raise RuntimeError("No tables were successfully loaded from TABLES=%r" % TABLES)
 
 
 async def refresh_tables():
+    loop = tornado.ioloop.IOLoop.current()
     for name, table in HOSTED_TABLES.items():
         try:
             rows = await fetch_rows(name)
-            table.clear()
-            table.update(rows)
+
+            def _apply_update(t=table, r=rows, indexed=name in TABLE_KEYS):
+                # Indexed tables: update() alone merges/patches by _row_id —
+                # no full wipe, so it doesn't collide with an active view the
+                # way clear()+update() did. Un-indexed tables (no TABLE_KEYS
+                # entry) fall back to the old full-replace behavior.
+                if not indexed:
+                    t.clear()
+                t.update(r)
+
+            await loop.run_in_executor(WORK_EXECUTOR, _apply_update)
             log.info("Refreshed '%s' with %d rows", name, len(rows))
         except Exception:
             log.exception("Refresh failed for '%s', keeping previous data", name)
@@ -111,6 +157,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
