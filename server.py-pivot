@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,9 @@ PG_DSN = os.environ.get(
 # Each is exposed to the browser under its own name via get_hosted_table_names().
 TABLES = [t.strip() for t in os.environ.get("TABLES", "v_forecast_tidy").split(",") if t.strip()]
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
+# Where saved named views are persisted. Mount this path to a Docker volume
+# so saved views survive container rebuilds.
+SAVED_VIEWS_PATH = os.environ.get("SAVED_VIEWS_PATH", "/app/data/saved_views.json")
 
 # The columns that together uniquely identify one row in each table.
 # Used to build a synthetic composite primary key so refreshes can do an
@@ -50,6 +54,7 @@ HOSTED_TABLES = {}  # name -> perspective Table proxy
 # or in the worst case deadlock entirely against an active view. Run all of
 # it here instead.
 WORK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pivot-work")
+SAVED_VIEWS_LOCK = asyncio.Lock()
 
 
 def _json_safe(value):
@@ -137,11 +142,90 @@ class HealthHandler(tornado.web.RequestHandler):
         self.write({"status": "ok", "tables": list(HOSTED_TABLES.keys())})
 
 
+def _load_saved_views_blocking():
+    if not os.path.exists(SAVED_VIEWS_PATH):
+        return {}
+    try:
+        with open(SAVED_VIEWS_PATH, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        log.exception("Failed to read %s, treating as empty", SAVED_VIEWS_PATH)
+        return {}
+
+
+def _write_saved_views_blocking(data):
+    os.makedirs(os.path.dirname(SAVED_VIEWS_PATH), exist_ok=True)
+    tmp_path = SAVED_VIEWS_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, SAVED_VIEWS_PATH)  # atomic on POSIX — avoids a half-written file on crash
+
+
+class SavedViewsHandler(tornado.web.RequestHandler):
+    """
+    GET    /api/views?table=NAME           -> {"views": {viewName: config, ...}}
+    POST   /api/views   body {"table":, "name":, "config":}  -> save/overwrite a view
+    DELETE /api/views?table=NAME&name=VIEWNAME               -> remove a view
+    """
+
+    async def get(self):
+        table = self.get_argument("table", None)
+        if not table:
+            self.set_status(400)
+            self.write({"error": "table query param required"})
+            return
+        loop = tornado.ioloop.IOLoop.current()
+        async with SAVED_VIEWS_LOCK:
+            data = await loop.run_in_executor(WORK_EXECUTOR, _load_saved_views_blocking)
+        self.write({"views": data.get(table, {})})
+
+    async def post(self):
+        try:
+            body = json.loads(self.request.body)
+            table = body["table"]
+            name = body["name"].strip()
+            config = body["config"]
+        except (KeyError, ValueError, json.JSONDecodeError):
+            self.set_status(400)
+            self.write({"error": "expected JSON body with table, name, config"})
+            return
+        if not name:
+            self.set_status(400)
+            self.write({"error": "name cannot be empty"})
+            return
+
+        loop = tornado.ioloop.IOLoop.current()
+        async with SAVED_VIEWS_LOCK:
+            data = await loop.run_in_executor(WORK_EXECUTOR, _load_saved_views_blocking)
+            data.setdefault(table, {})[name] = config
+            await loop.run_in_executor(WORK_EXECUTOR, _write_saved_views_blocking, data)
+        log.info("Saved view '%s' for table '%s'", name, table)
+        self.write({"status": "ok"})
+
+    async def delete(self):
+        table = self.get_argument("table", None)
+        name = self.get_argument("name", None)
+        if not table or not name:
+            self.set_status(400)
+            self.write({"error": "table and name query params required"})
+            return
+
+        loop = tornado.ioloop.IOLoop.current()
+        async with SAVED_VIEWS_LOCK:
+            data = await loop.run_in_executor(WORK_EXECUTOR, _load_saved_views_blocking)
+            removed = data.get(table, {}).pop(name, None)
+            if removed is not None:
+                await loop.run_in_executor(WORK_EXECUTOR, _write_saved_views_blocking, data)
+        log.info("Deleted view '%s' for table '%s' (existed: %s)", name, table, removed is not None)
+        self.write({"status": "ok", "existed": removed is not None})
+
+
 def make_app():
     return tornado.web.Application(
         [
             (r"/websocket", PerspectiveTornadoHandler, {"perspective_server": SERVER}),
             (r"/health", HealthHandler),
+            (r"/api/views", SavedViewsHandler),
             (r"/(.*)", tornado.web.StaticFileHandler, {"path": "static", "default_filename": "index.html"}),
         ]
     )
