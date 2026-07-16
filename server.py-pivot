@@ -116,23 +116,35 @@ async def init_tables():
         raise RuntimeError("No tables were successfully loaded from TABLES=%r" % TABLES)
 
 
-async def refresh_tables():
+LAST_REFRESH_AT = {}  # table name -> monotonic timestamp of last successful refresh
+MIN_REFRESH_INTERVAL_SECONDS = 10  # floor between on-demand refreshes per table
+
+
+async def refresh_one_table(name):
+    table = HOSTED_TABLES.get(name)
+    if table is None:
+        raise KeyError(f"'{name}' is not a hosted table")
     loop = tornado.ioloop.IOLoop.current()
-    for name, table in HOSTED_TABLES.items():
+    rows = await fetch_rows(name)
+
+    def _apply_update(t=table, r=rows, indexed=name in TABLE_KEYS):
+        # Indexed tables: update() alone merges/patches by _row_id — no full
+        # wipe, so it doesn't collide with an active view the way
+        # clear()+update() did. Un-indexed tables fall back to full-replace.
+        if not indexed:
+            t.clear()
+        t.update(r)
+
+    await loop.run_in_executor(WORK_EXECUTOR, _apply_update)
+    LAST_REFRESH_AT[name] = loop.time()
+    log.info("Refreshed '%s' with %d rows", name, len(rows))
+    return len(rows)
+
+
+async def refresh_tables():
+    for name in list(HOSTED_TABLES.keys()):
         try:
-            rows = await fetch_rows(name)
-
-            def _apply_update(t=table, r=rows, indexed=name in TABLE_KEYS):
-                # Indexed tables: update() alone merges/patches by _row_id —
-                # no full wipe, so it doesn't collide with an active view the
-                # way clear()+update() did. Un-indexed tables (no TABLE_KEYS
-                # entry) fall back to the old full-replace behavior.
-                if not indexed:
-                    t.clear()
-                t.update(r)
-
-            await loop.run_in_executor(WORK_EXECUTOR, _apply_update)
-            log.info("Refreshed '%s' with %d rows", name, len(rows))
+            await refresh_one_table(name)
         except Exception:
             log.exception("Refresh failed for '%s', keeping previous data", name)
 
@@ -220,12 +232,46 @@ class SavedViewsHandler(tornado.web.RequestHandler):
         self.write({"status": "ok", "existed": removed is not None})
 
 
+class RefreshTableHandler(tornado.web.RequestHandler):
+    """
+    POST /api/refresh?table=NAME -> forces an immediate re-pull from Postgres
+    for that one table, instead of waiting for the periodic cycle. Throttled
+    per-table so many people opening the page at once doesn't hammer Postgres.
+    """
+
+    async def post(self):
+        name = self.get_argument("table", None)
+        if not name:
+            self.set_status(400)
+            self.write({"error": "table query param required"})
+            return
+        if name not in HOSTED_TABLES:
+            self.set_status(404)
+            self.write({"error": f"'{name}' is not a hosted table"})
+            return
+
+        loop = tornado.ioloop.IOLoop.current()
+        last = LAST_REFRESH_AT.get(name)
+        if last is not None and (loop.time() - last) < MIN_REFRESH_INTERVAL_SECONDS:
+            self.write({"status": "skipped", "reason": "refreshed recently"})
+            return
+
+        try:
+            row_count = await refresh_one_table(name)
+            self.write({"status": "ok", "rows": row_count})
+        except Exception:
+            log.exception("On-demand refresh failed for '%s'", name)
+            self.set_status(500)
+            self.write({"status": "error"})
+
+
 def make_app():
     return tornado.web.Application(
         [
             (r"/websocket", PerspectiveTornadoHandler, {"perspective_server": SERVER}),
             (r"/health", HealthHandler),
             (r"/api/views", SavedViewsHandler),
+            (r"/api/refresh", RefreshTableHandler),
             (r"/(.*)", tornado.web.StaticFileHandler, {"path": "static", "default_filename": "index.html"}),
         ]
     )
