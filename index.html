@@ -54,6 +54,7 @@
       <select id="view-select" style="background:#222; color:#e5e7eb; border:1px solid #3b3b40; border-radius:4px; padding:4px 8px; font-size:12px; max-width:180px;"></select>
       <button id="save-view-btn" title="Save current layout as a named view" style="background:#2563eb; color:#fff; border:none; border-radius:4px; padding:4px 10px; font-size:12px; cursor:pointer;">Save view</button>
       <button id="delete-view-btn" title="Delete the selected saved view" style="background:#3b3b40; color:#e5e7eb; border:none; border-radius:4px; padding:4px 10px; font-size:12px; cursor:pointer; display:none;">Delete</button>
+      <input id="search-box" type="text" placeholder="Search…" style="background:#222; color:#e5e7eb; border:1px solid #3b3b40; border-radius:4px; padding:4px 8px; font-size:12px; width:160px;" />
       <span id="last-updated">loading…</span>
     </div>
   </div>
@@ -96,6 +97,7 @@
         group_rollup_mode: "flat",
         expressions: {
           sku_label: "// sku_label\nconcat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
+          search_corpus: "// search_corpus\nconcat(\"retailer\", ' ', \"retailer_sku\", ' ', \"supplier_sku\")",
         },
         columns: ["units_sold", "forecast", "difference", "difference_pct"],
         aggregates: {},
@@ -124,6 +126,7 @@
         group_rollup_mode: "flat",
         expressions: {
           sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
+          search_corpus: "concat(\"retailer\", ' ', \"retailer_sku\", ' ', \"supplier_sku\")",
         },
         columns: ["units_sold", "forecast", "difference", "difference_pct"],
         aggregates: {},
@@ -152,6 +155,7 @@
         group_rollup_mode: "flat",
         expressions: {
           sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
+          search_corpus: "concat(\"retailer\", ' ', \"retailer_sku\", ' ', \"supplier_sku\")",
         },
         columns: ["total_units", "quarterly_forecast", "difference", "difference_pct"],
         aggregates: {},
@@ -182,6 +186,7 @@
         group_rollup_mode: "flat",
         expressions: {
           sku_label: "concat(\"retailer_sku\", ' (', \"supplier_sku\", ')')",
+          search_corpus: "concat(\"retailer\", ' ', \"retailer_sku\", ' ', \"supplier_sku\", ' ', \"description\", ' ', \"allocation_name\", ' ', \"status\")",
         },
         columns: [
           "allocation_name",
@@ -229,6 +234,7 @@
         group_rollup_mode: "flat",
         expressions: {
           sku_label: "concat(\"retailer_sku\", ' (', \"variant_sku\", ')')",
+          search_corpus: "concat(\"retailer\", ' ', \"retailer_sku\", ' ', \"variant_sku\", ' ', \"variant_description\", ' ', \"allocation_name\", ' ', \"status\")",
         },
         columns: [
           "allocation_name",
@@ -410,6 +416,11 @@
     // from a deadlock), since that closes the socket the same way a network
     // drop would.
     window.addEventListener("unhandledrejection", (event) => {
+      if (disconnectedForVisibility) {
+        // Expected — we intentionally terminated the connection.
+        event.preventDefault();
+        return;
+      }
       const msg = String((event.reason && event.reason.message) || event.reason || "");
       if (msg.includes("WebSocket transport error") || msg.includes("ClientError") || msg.includes("Websocket")) {
         event.preventDefault();
@@ -417,14 +428,66 @@
       }
     });
 
+    const searchBox = document.getElementById("search-box");
+    let searchDebounceTimer = null;
+
+    async function applySearch(text) {
+      const current = await viewer.save();
+      const otherFilters = (current.filter || []).filter((f) => f[0] !== "search_corpus");
+      const newFilters = text ? [...otherFilters, ["search_corpus", "contains", text]] : otherFilters;
+      await viewer.restore({ filter: newFilters });
+    }
+
+    searchBox.addEventListener("input", () => {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => applySearch(searchBox.value.trim()), 300);
+    });
+
     select.addEventListener("change", async () => {
       lastGoodConfig = null; // switching tables intentionally — don't carry over old layout
+      searchBox.value = "";
       await loadTable(select.value);
     });
 
     viewSelect.addEventListener("change", () => applySelectedView());
     saveBtn.addEventListener("click", () => saveCurrentView(currentTableName));
     deleteBtn.addEventListener("click", () => deleteCurrentView(currentTableName));
+
+    let disconnectedForVisibility = false;
+
+    async function disconnectForBackground() {
+      if (!websocket) return;
+      try {
+        // Snapshot the layout so we can restore it exactly when we come back.
+        lastGoodConfig = await viewer.save();
+      } catch (e) {
+        // ignore — best effort
+      }
+      try {
+        await websocket.terminate();
+      } catch (e) {
+        console.warn("Error terminating websocket on background", e);
+      }
+      websocket = null;
+      disconnectedForVisibility = true;
+      statusEl.textContent = "paused (tab in background)";
+    }
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        // Give it a short grace period — don't disconnect for a quick tab
+        // switch, only for the tab actually sitting unattended for a while.
+        setTimeout(() => {
+          if (document.hidden) disconnectForBackground();
+        }, 60000);
+      } else if (disconnectedForVisibility) {
+        disconnectedForVisibility = false;
+        connect().catch((e) => {
+          console.error("Reconnect after becoming visible failed", e);
+          scheduleReconnect();
+        });
+      }
+    });
 
     connect().catch((e) => {
       console.error("Initial connection failed", e);
