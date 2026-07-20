@@ -78,6 +78,20 @@ def build_fetch_date_patterns_sql() -> str:
     return "SELECT retailer, pattern_regex, resolution_rule, format_description FROM date_format_patterns WHERE status = 'active'"
 
 
+def build_fetch_existing_patterns_for_dedup_sql() -> str:
+    """
+    ALL patterns regardless of status (active AND pending_review) - used
+    only to check "has AI already been asked about a shape like this," never
+    to trust an unapproved pattern for actual date computation. Without
+    this, re-processing the same file (or a similar one) asks AI fresh and
+    writes a fresh pending_review row every time. Includes status so
+    callers can tell an active-backed match (safe to persist a computed
+    date for ingestion to trust directly) from a pending one (computed for
+    internal use only, not yet safe to hand to ingestion as fact).
+    """
+    return "SELECT retailer, pattern_regex, resolution_rule, format_description, status FROM date_format_patterns"
+
+
 def build_insert_date_pattern_sql(retailer: str | None, pattern_regex: str, format_description: str,
                                    resolution_rule: dict, example_header: str, source_file: str) -> str:
     """
@@ -153,18 +167,27 @@ def compute_date_from_match(match: "re.Match", resolution_rule: dict) -> str | N
     date arithmetic, every time, for whichever column's own header it's
     given - never a value borrowed from a different column's example.
 
-    Only implements methods Python actually knows how to compute. An
-    unrecognized method returns None deliberately - the caller (discovery,
+    Dispatches on the STRUCTURE of capture_groups (which keys are present),
+    not on the AI-supplied "method" string. In production, a model
+    correctly identified year/week capture groups but wrote method:
+    "unknown" instead of the requested "iso_year_week" - the structure was
+    right, the label wasn't. Requiring an exact method-string match would
+    have silently refused to compute a date for a genuinely well-formed
+    resolution, purely because of an inconsistent label. The "method"
+    field is still recorded (useful for human review / audit trail) but is
+    no longer load-bearing for the computation itself.
+
+    Only implements structures Python actually knows how to compute. An
+    unrecognized structure returns None deliberately - the caller (discovery,
     for column enumeration; ingestion, for date resolution) can still use
     the pattern MATCH itself for its own purposes even when no computed
     date is available yet - that's an honest, bounded gap rather than a
     wrong silent answer, and is closed by adding a new branch here, once,
     for both pipelines simultaneously.
     """
-    method = resolution_rule.get("method")
-    groups = resolution_rule.get("capture_groups", {})
+    groups = resolution_rule.get("capture_groups", {}) or {}
     try:
-        if method == "iso_year_week":
+        if "year" in groups and "week" in groups:
             year = int(match.group(groups["year"]))
             week = int(match.group(groups["week"]))
             d = date.fromisocalendar(year, max(1, min(week, 53)), 6)  # Saturday, matching normalize_to_saturday
