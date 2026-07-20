@@ -1203,18 +1203,30 @@ def build_new_pattern_prompt(unresolved: list, filename: str) -> str:
 
 File: {filename}
 
-These columns already contain real sales-shaped numeric data (confirmed by Python),
-but their header text doesn't match any known date format:
+These {len(unresolved)} columns already contain real sales-shaped numeric data
+(confirmed by Python), but their header text doesn't match any known date format:
 
 {header_lines}
 
-For each one that genuinely represents a sales date or period, determine the
-calendar date/range it represents, AND generalize the pattern (not just this
-one value) so it can be recognized automatically next time without asking AI again.
+You MUST evaluate all {len(unresolved)} columns listed above and return a
+resolution for EVERY one that genuinely represents a sales date or period —
+do not stop after the first one, and do not treat the example below as the
+only column to resolve. If most or all of them share the same underlying
+format (which is common - it's usually one repeating header convention
+applied across every week), return one resolution object per column, all
+following the same general_pattern.
 
-Respond with JSON only:
+For each one, determine the calendar date/range it represents, AND
+generalize the pattern (not just this one value) so it can be recognized
+automatically next time without asking AI again.
+
+Respond with JSON only, one object per resolved column - for example, if
+columns 5 and 6 both matched a repeating weekly format:
 {{"resolutions": [
   {{"col": 5, "represents": "2026-01-03 to 2026-01-09",
+    "general_pattern": "^\\\\d{{6}}\\\\s*Units$",
+    "pattern_description": "YYYYWW Units", "resolution_method": "yearweek_units"}},
+  {{"col": 6, "represents": "2026-01-10 to 2026-01-16",
     "general_pattern": "^\\\\d{{6}}\\\\s*Units$",
     "pattern_description": "YYYYWW Units", "resolution_method": "yearweek_units"}}
 ]}}
@@ -1243,9 +1255,12 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
     except Exception:
         return {}
 
-    valid_cols     = {c for c, _ in unresolved}
-    header_by_col  = dict(unresolved)
-    resolved       = {}
+    valid_cols        = {c for c, _ in unresolved}
+    header_by_col     = dict(unresolved)
+    resolved          = {}
+    written_patterns  = set()  # dedupe: most columns share ONE underlying
+                                # pattern (one repeating weekly convention) -
+                                # write it to Postgres once, not once per column
 
     for r in result.get("resolutions", []) if isinstance(result, dict) else []:
         col, represents, pattern = r.get("col"), r.get("represents"), r.get("general_pattern")
@@ -1258,13 +1273,15 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
             continue
 
         resolved[col] = represents
+        if pattern in written_patterns:
+            continue  # already written this exact pattern this run - don't duplicate
+        written_patterns.add(pattern)
         try:
             await call_postgres(build_insert_date_pattern_sql(
                 retailer, pattern, r.get("pattern_description", "AI-discovered"),
                 {"method": r.get("resolution_method", "unknown")},
                 header_by_col[col], filename,
             ))
-            await load_date_patterns(force=True)  # so the rest of THIS run can use it immediately
         except Exception:
             pass  # write-back failing shouldn't block resolving THIS file's columns
 
