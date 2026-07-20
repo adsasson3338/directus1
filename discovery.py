@@ -23,6 +23,7 @@ from shared import (
     build_fetch_audit_row_sql,
     load_date_patterns, match_known_patterns, normalize_header_shape,
     compute_date_from_match, build_insert_date_pattern_sql,
+    build_fetch_existing_patterns_for_dedup_sql,
 )
 
 # ---------------------------------------------
@@ -1173,7 +1174,7 @@ If an example is NOT actually a date/period column (e.g. a product ID, UPC,
 or a summary/total column), omit it entirely rather than guessing."""
 
 
-async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: str | None) -> dict:
+async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: str | None) -> tuple[dict, dict]:
     """
     Escalates only the small residual (sales-shaped data + unrecognized
     header) to AI - and only ONE representative example per distinct header
@@ -1186,21 +1187,69 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
     per-column meaning is computed correctly for every column, not copied
     from whichever one example AI happened to look at.
 
-    A column matching the pattern but whose method Python can't yet compute
-    still counts as a real date column (resolved[col] = None) - enumeration
-    doesn't depend on having a computed date, only on the header matching a
-    confirmed-genuine pattern.
+    Before asking AI anything, checks EVERY unresolved header against ALL
+    existing patterns - active AND pending_review, not just the active-only
+    cache used for trusted matching. Without this, reprocessing the same (or
+    a similarly-formatted) file re-escalates to AI and writes a fresh
+    pending_review row every single run.
+
+    Returns (resolved, trusted_dates):
+      - resolved: {col: date_or_None} for EVERY column that matches a
+        confirmed-genuine pattern, active or pending - used for column
+        ENUMERATION (sales_cols_1based), same as before this change.
+      - trusted_dates: {col: date} ONLY for columns backed by an
+        ALREADY-ACTIVE pattern at resolution time - safe to persist into
+        date_config["resolved_dates"] for ingestion to use directly,
+        without recomputing anything or re-checking the pattern table.
+        A column resolved via a BRAND-NEW pattern discovered THIS run is
+        never in trusted_dates, even though its date IS computed correctly
+        (see resolved) - that pattern is pending_review, and persisting its
+        date as ingestion-ready would silently bypass the human approval
+        gate. It only earns a spot in trusted_dates on a LATER run, once
+        the pattern's been approved in the meantime.
 
     Validates the AI's own generalized pattern actually matches the example
     that produced it before trusting or applying it anywhere. Fails safe:
-    any AI/parse error returns {} and the caller's existing disqualify path
-    still runs, exactly as it did before this feature existed.
+    any AI/parse error returns whatever was already resolved via existing
+    patterns, and the caller's existing disqualify path still runs for the
+    rest, exactly as it did before this feature existed.
     """
     if not unresolved:
-        return {}
+        return {}, {}
+
+    try:
+        existing_patterns = await call_postgres(build_fetch_existing_patterns_for_dedup_sql())
+    except Exception:
+        existing_patterns = []
+
+    def _match_existing(header: str) -> dict | None:
+        for p in existing_patterns:
+            try:
+                if re.match(p["pattern_regex"], header.strip(), re.IGNORECASE):
+                    return p
+            except (re.error, TypeError, KeyError):
+                continue
+        return None
+
+    resolved         = {}
+    trusted_dates    = {}
+    still_unresolved = []
+    for col, header in unresolved:
+        existing = _match_existing(header)
+        if existing:
+            m = re.match(existing["pattern_regex"], header.strip(), re.IGNORECASE)
+            computed = compute_date_from_match(m, existing.get("resolution_rule", {})) if m else None
+            resolved[col] = computed
+            if computed and existing.get("status") == "active":
+                trusted_dates[col] = computed
+        else:
+            still_unresolved.append((col, header))
+
+    if not still_unresolved:
+        return resolved, trusted_dates  # everything already covered by a previously-logged pattern - no AI call needed
 
     shape_examples = {}
-    for col, header in unresolved:
+    for col, header in still_unresolved:
         shape = normalize_header_shape(header)
         shape_examples.setdefault(shape, (col, header))
 
@@ -1209,11 +1258,10 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
         clean  = parse_ai_response(text)
         result = json.loads(clean)
     except (json.JSONDecodeError, ValueError):
-        return {}
+        return resolved, trusted_dates
     except Exception:
-        return {}
+        return resolved, trusted_dates
 
-    resolved         = {}
     written_patterns = set()
 
     for r in result.get("resolutions", []) if isinstance(result, dict) else []:
@@ -1232,11 +1280,13 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
         except re.error:
             continue
 
-        # PYTHON applies the confirmed pattern across EVERY unresolved
-        # header, computing EACH column's own date from ITS OWN match -
-        # never copying one example's meaning onto a different column.
+        # PYTHON applies the confirmed pattern across the REMAINING
+        # unresolved headers, computing EACH column's own date from ITS OWN
+        # match - never copying one example's meaning onto a different column.
+        # Newly-discovered THIS RUN -> pending_review -> resolved[] only,
+        # never trusted_dates (see docstring).
         matched_any = False
-        for col, header in unresolved:
+        for col, header in still_unresolved:
             m = compiled.match(header.strip())
             if m:
                 resolved[col] = compute_date_from_match(m, resolution_rule)
@@ -1252,7 +1302,7 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
             except Exception:
                 pass  # write-back failing shouldn't block resolving THIS file's columns
 
-    return resolved
+    return resolved, trusted_dates
 
 
 def build_column_classify_prompt(schema: dict, filename: str,
@@ -1386,7 +1436,7 @@ async def stage_qualify(session_id: str):
                         unresolved.append((ci, header_val))
 
                 if unresolved:
-                    newly_resolved = await resolve_unrecognized_dates(
+                    newly_resolved, trusted_dates = await resolve_unrecognized_dates(
                         unresolved, session["filename"], session.get("retailer")
                     )
                     if newly_resolved:
@@ -1395,6 +1445,12 @@ async def stage_qualify(session_id: str):
                         # resolution later instead of re-escalating to AI a
                         # second time for the same header shape in this file.
                         session.setdefault("_qualify_resolved_dates", {})[sheet_name] = newly_resolved
+                        # Only active-pattern-backed dates get persisted for
+                        # ingestion to use directly - see resolve_unrecognized_dates.
+                        if trusted_dates:
+                            session.setdefault("_trusted_resolved_dates", {}).setdefault(
+                                sheet_name, {}
+                            ).update(trusted_dates)
                         session.setdefault("flags", {})["new_date_pattern_discovered"] = (
                             f"{len(newly_resolved)} column(s) resolved via AI at qualify stage "
                             f"for sheet '{sheet_name}' - pattern(s) written as pending_review"
@@ -1642,11 +1698,19 @@ async def stage_schema_classify(session_id: str):
                         unresolved.append((col_1, header_val))
 
                 if unresolved:
-                    newly_resolved = await resolve_unrecognized_dates(
+                    newly_resolved, trusted_dates = await resolve_unrecognized_dates(
                         unresolved, session["filename"], session.get("retailer")
                     )
                     if newly_resolved:
                         sales_cols_1based = sorted(newly_resolved.keys())
+                        # date_cols/resolved_dates use 0-based indexing
+                        # (matching sales_cols_0based below) - this
+                        # escalation path works in 1-based (schema/openpyxl
+                        # convention), so convert before merging.
+                        if trusted_dates:
+                            session.setdefault("_trusted_resolved_dates", {}).setdefault(
+                                sheet_name, {}
+                            ).update({c1 - 1: d for c1, d in trusted_dates.items()})
                         session.setdefault("flags", {})["new_date_pattern_discovered"] = (
                             f"{len(newly_resolved)} column(s) resolved via AI for this file - "
                             f"pattern(s) written to date_format_patterns as pending_review, "
@@ -1992,6 +2056,15 @@ async def stage_date_config(session_id: str):
                 "date_axis_row":           date_axis.get("row", 0),
                 "date_cols":               date_axis.get("cols", []),
                 "data_start_row":          grid.get("data_start_row", 1),
+                # Per-column dates already computed by discovery for any
+                # AI-discovered format backed by an ALREADY-ACTIVE pattern -
+                # ingestion reads these directly instead of recomputing them.
+                # Deliberately excludes columns from a pattern discovered
+                # THIS run (still pending_review) - see resolve_unrecognized_dates.
+                "resolved_dates": {
+                    str(k): v for k, v in
+                    session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
+                },
             }
             continue
 
@@ -2025,6 +2098,10 @@ async def stage_date_config(session_id: str):
         result["date_axis_row"]          = date_axis.get("row", 0)
         result["date_cols"]              = date_axis.get("cols", [])
         result["data_start_row"]         = grid.get("data_start_row", 1)
+        result["resolved_dates"] = {
+            str(k): v for k, v in
+            session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
+        }
         session["date_config"][sheet_name] = result
 
     await stage_multisheet(session_id)
