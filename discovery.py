@@ -21,6 +21,8 @@ from shared import (
     normalize_to_saturday,
     _validate_uuid, _sql_escape,
     build_fetch_audit_row_sql,
+    load_date_patterns, match_known_patterns, normalize_header_shape,
+    compute_date_from_match, build_insert_date_pattern_sql,
 )
 
 # ---------------------------------------------
@@ -41,99 +43,16 @@ def parse_ai_response(text: str) -> str:
 router = APIRouter()
 
 # ---------------------------------------------
-# DATE FORMAT PATTERN LIBRARY (Postgres-backed, not hardcoded)
+# DATE FORMAT PATTERN LIBRARY
 # ---------------------------------------------
-# Known date/period header formats used to live here as hardcoded regex
-# constants (DATE_RANGE_RE, FISCAL_WEEK_RE, WK_NUMBER_RE). They now live in
-# the date_format_patterns table instead, so the system can learn new header
-# formats over time (AI discovers one -> written back as pending_review ->
-# human approves -> becomes a fast, deterministic match for every future
-# file) without ever touching this code again.
-#
-# Retailer is NOT known at either point in the pipeline where date-axis
-# detection runs (stage_qualify AND stage_schema_classify both execute
-# before stage_identify_retailer). So pattern matching for THIS PURPOSE
-# always checks the full set of active patterns, any retailer - that's
-# evidence a header shape is a real, previously-approved date axis,
-# regardless of whose file it turns out to be. Retailer-scoping is applied
-# separately, only when a NEWLY discovered pattern is written back (see
-# build_insert_date_pattern_sql) - a pattern approved for one retailer does
-# not silently become a trusted fast path for a different retailer's files.
+# The pattern cache, matching, and computation functions now live in
+# shared.py (load_date_patterns, match_known_patterns, normalize_header_shape,
+# compute_date_from_match, build_insert_date_pattern_sql) - imported above -
+# because ingestion.py needs the exact same logic to compute week_ending
+# dates for real sales rows, not just to decide which columns are date
+# columns. One canonical implementation, used by both pipelines.
 
 YEAR_RE = re.compile(r"\b(20\d{2})\b")
-
-_KNOWN_DATE_PATTERNS: list = []  # cached rows: {retailer, pattern_regex, resolution_rule, format_description}
-
-
-def build_fetch_date_patterns_sql() -> str:
-    """All active date/period header patterns, any retailer - evidence that
-    a header shape is a real, previously-approved date axis."""
-    return "SELECT retailer, pattern_regex, resolution_rule, format_description FROM date_format_patterns WHERE status = 'active'"
-
-
-def build_insert_date_pattern_sql(retailer: str | None, pattern_regex: str, format_description: str,
-                                   resolution_rule: dict, example_header: str, source_file: str) -> str:
-    """
-    Insert a newly AI-discovered date format pattern as pending_review.
-    Scoped to the retailer if known at write time (usually not, given the
-    stage ordering above), else NULL - a human can assign it to a retailer
-    during review, or leave it universal if the format isn't retailer-specific.
-    """
-    retailer_val = f"'{sql_escape(retailer)}'" if retailer else "NULL"
-    rule_b64 = base64.b64encode(json.dumps(resolution_rule, ensure_ascii=False).encode()).decode()
-    return f"""
-INSERT INTO date_format_patterns
-    (retailer, pattern_regex, format_description, resolution_rule, discovered_via, example_header, first_seen_file, status)
-VALUES
-    ({retailer_val}, '{sql_escape(pattern_regex)}', '{sql_escape(format_description)}',
-     convert_from(decode('{rule_b64}', 'base64'), 'UTF8')::jsonb,
-     'ai', '{sql_escape(example_header)}', '{sql_escape(source_file)}', 'pending_review')
-""".strip()
-
-
-async def load_date_patterns(force: bool = False):
-    """
-    Load/refresh the shared pattern cache from Postgres. Cheap - safe to call
-    at the start of any stage that needs pattern matching. Fails soft: if
-    Postgres is briefly unreachable, keeps whatever was cached before rather
-    than crashing an in-progress discovery run.
-    """
-    global _KNOWN_DATE_PATTERNS
-    if _KNOWN_DATE_PATTERNS and not force:
-        return
-    try:
-        rows = await call_postgres(build_fetch_date_patterns_sql())
-        if rows:
-            _KNOWN_DATE_PATTERNS = rows
-    except Exception:
-        pass
-
-
-def normalize_header_shape(header: str) -> str:
-    """Collapse digits to '#' so headers built the same repeating way compare
-    equal regardless of which specific digits they contain - '202601 Units'
-    and '202602 Units' both become '###### Units'. Used to group unresolved
-    headers by distinct FORMAT before asking AI anything, so AI only needs
-    to see and generalize one representative example per shape, not every
-    individual column that shares it."""
-    return re.sub(r"\d", "#", header.strip())
-
-
-def match_known_patterns(header: str) -> dict | None:
-    """Try a header string against the loaded pattern library. Returns the
-    matching pattern row (with pattern_regex/resolution_rule/format_description),
-    or None if nothing matches - a malformed stored pattern is skipped rather
-    than allowed to crash detection for every file."""
-    if not isinstance(header, str):
-        return None
-    s = header.strip()
-    for p in _KNOWN_DATE_PATTERNS:
-        try:
-            if re.match(p["pattern_regex"], s, re.IGNORECASE):
-                return p
-        except (re.error, TypeError, KeyError):
-            continue
-    return None
 
 
 def classify_cell(val) -> str:
@@ -1252,36 +1171,6 @@ be able to compute a specific date for them without further work).
 
 If an example is NOT actually a date/period column (e.g. a product ID, UPC,
 or a summary/total column), omit it entirely rather than guessing."""
-
-
-def compute_date_from_match(match: "re.Match", resolution_rule: dict) -> str | None:
-    """
-    Computes an actual date from a regex match using an AI-supplied,
-    Python-executed method - this is the piece that answers "how does
-    Python know what an obscure date format MEANS": AI supplies WHICH
-    capture group is the year/week (a narrow, one-time judgment call),
-    and this function does the actual date arithmetic, per column, using
-    that column's own captured digits - never a value borrowed from a
-    different column's example.
-
-    Only implements methods Python actually knows how to compute. An
-    unrecognized method returns None deliberately - the column still
-    counts as a real date column (enumeration doesn't depend on this),
-    it just won't have a computed date until this function is extended
-    for that method, which is an honest, bounded gap rather than a wrong
-    silent answer.
-    """
-    method = resolution_rule.get("method")
-    groups = resolution_rule.get("capture_groups", {})
-    try:
-        if method == "iso_year_week":
-            year = int(match.group(groups["year"]))
-            week = int(match.group(groups["week"]))
-            d = date.fromisocalendar(year, max(1, min(week, 53)), 6)  # Saturday, matching normalize_to_saturday
-            return d.isoformat()
-    except (KeyError, ValueError, IndexError, Exception):
-        return None
-    return None
 
 
 async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: str | None) -> dict:
