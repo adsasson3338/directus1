@@ -21,6 +21,7 @@ from shared import (
     normalize_to_saturday,
     _validate_uuid, _validate_date, _sql_escape,
     build_fetch_audit_row_sql,
+    load_date_patterns, match_known_patterns, compute_date_from_match,
 )
 
 router = APIRouter()
@@ -118,6 +119,25 @@ def _resolve_date(val, year: int) -> Optional[date]:
             return normalize_to_saturday(approx)
         except (ValueError, OverflowError):
             return None
+
+    # None of the formats above matched - check the shared, Postgres-backed
+    # pattern library for a format discovered and APPROVED since this
+    # function was last extended (e.g. "YYYYWW Units"). Only patterns with
+    # status='active' are ever loaded here (see load_date_patterns), so a
+    # newly-discovered-but-not-yet-approved format still correctly falls
+    # through to None below, exactly as it did before this existed - it
+    # doesn't get ingested until a human approves it, same discipline as
+    # everywhere else this pattern library is used.
+    match = match_known_patterns(s)
+    if match:
+        m2 = re.match(match["pattern_regex"], s, re.IGNORECASE)
+        if m2:
+            computed = compute_date_from_match(m2, match.get("resolution_rule", {}))
+            if computed:
+                try:
+                    return normalize_to_saturday(date.fromisoformat(computed))
+                except (ValueError, OverflowError):
+                    return None
     return None
 
 
@@ -155,13 +175,24 @@ def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) ->
             continue
 
         # For formats with year already embedded, resolve directly
-        # and update prev_month but don't apply the monotonic rule
+        # and update prev_month but don't apply the monotonic rule.
+        # Includes pattern-matched formats whose method is self-contained
+        # (e.g. "iso_year_week" - the year is literally in the header text,
+        # same as "01/04/25" or an ISO string - it doesn't need the
+        # monotonic Dec->Jan rule to figure out which year it belongs to).
+        SELF_CONTAINED_YEAR_METHODS = {"iso_year_week"}
+        pattern_match = match_known_patterns(val) if isinstance(val, str) else None
+        has_pattern_embedded_year = (
+            pattern_match is not None
+            and pattern_match.get("resolution_rule", {}).get("method") in SELF_CONTAINED_YEAR_METHODS
+        )
         has_embedded_year = (
             isinstance(val, (datetime, date)) or
             (isinstance(val, str) and (
                 re.match(r'^\d{4}-\d{2}-\d{2}', val.strip()) or
                 re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', val.strip())
-            ))
+            )) or
+            has_pattern_embedded_year
         )
         if has_embedded_year:
             resolved = _resolve_date(val, current_year)
@@ -607,6 +638,12 @@ async def stage_process_files(session_id: str):
     session = _sessions[session_id]
     session["stage"]  = "processing"
     session["status"] = "running"
+
+    # Load the shared, approved date-format pattern cache once per run -
+    # match_known_patterns()/compute_date_from_match() (called synchronously
+    # inside _resolve_date, deep in extract_sales_and_inventory below) rely
+    # on this being populated already, same as discovery's stage_qualify.
+    await load_date_patterns()
 
     audit_rows = session.get("_audit_rows", {})
     if not audit_rows:
