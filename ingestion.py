@@ -167,6 +167,16 @@ def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) ->
     prev_month    = None
     date_map      = {}
 
+    # Discovery already computed and persisted dates for any AI-discovered
+    # format backed by an ALREADY-ACTIVE pattern at discovery time (see
+    # discovery.py's resolve_unrecognized_dates / stage_date_config). Use
+    # those directly - no regex, no pattern-table query, no date arithmetic
+    # needed at all for these columns. JSON round-trips dict keys as
+    # strings, so date_config's int column indices come back as strings.
+    resolved_dates = {
+        int(k): v for k, v in date_config.get("resolved_dates", {}).items()
+    }
+
     for col_idx in date_col_idxs:
         if col_idx >= len(header_row):
             continue
@@ -174,18 +184,39 @@ def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) ->
         if val is None:
             continue
 
+        if col_idx in resolved_dates:
+            try:
+                date_map[col_idx] = date.fromisoformat(resolved_dates[col_idx])
+            except (ValueError, TypeError):
+                pass  # malformed persisted value - fall through to recompute below
+            else:
+                # Self-contained-year formats don't need this for their OWN
+                # resolution, but keep it updated in case a LATER column in
+                # the same axis uses a different, monotonic-dependent format.
+                prev_month = _extract_leading_month(val)
+                continue
+
         # For formats with year already embedded, resolve directly
         # and update prev_month but don't apply the monotonic rule.
-        # Includes pattern-matched formats whose method is self-contained
-        # (e.g. "iso_year_week" - the year is literally in the header text,
-        # same as "01/04/25" or an ISO string - it doesn't need the
-        # monotonic Dec->Jan rule to figure out which year it belongs to).
-        SELF_CONTAINED_YEAR_METHODS = {"iso_year_week"}
+        # Includes pattern-matched formats whose CAPTURE GROUPS carry their
+        # own year (e.g. year+week groups, same shape compute_date_from_match
+        # dispatches on) - the year is literally in the header text, same as
+        # "01/04/25" or an ISO string - it doesn't need the monotonic
+        # Dec->Jan rule to figure out which year it belongs to.
+        #
+        # Checked by capture_groups STRUCTURE, not by resolution_rule.method:
+        # a real production response had correct year/week capture groups
+        # but method: "unknown" instead of the requested name - trusting the
+        # method string here would have wrongly applied the monotonic rule
+        # to a format that already carries its own year.
+        #
+        # Reaching this point at all means resolved_dates didn't cover this
+        # column - either an older discovery_result predating this field, or
+        # a pattern that was still pending_review at discovery time but has
+        # SINCE been approved (this fallback is what picks that case up).
         pattern_match = match_known_patterns(val) if isinstance(val, str) else None
-        has_pattern_embedded_year = (
-            pattern_match is not None
-            and pattern_match.get("resolution_rule", {}).get("method") in SELF_CONTAINED_YEAR_METHODS
-        )
+        pattern_groups = (pattern_match or {}).get("resolution_rule", {}).get("capture_groups", {}) or {}
+        has_pattern_embedded_year = pattern_match is not None and "year" in pattern_groups
         has_embedded_year = (
             isinstance(val, (datetime, date)) or
             (isinstance(val, str) and (
