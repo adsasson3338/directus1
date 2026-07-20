@@ -1103,6 +1103,56 @@ def find_sales_shaped_columns(schema: dict) -> list:
     return candidates
 
 
+def find_data_start_row_from_rows(rows: list) -> int:
+    """
+    Raw-rows equivalent of extract_column_schema()'s data_start_row
+    detection: first row where >30% of non-null values are numeric. 0-based
+    (raw row tuples), unlike extract_column_schema()'s 1-based version.
+    Needed so the shape-prefilter below doesn't scan header rows - a header
+    STRING sitting in the same column as real numeric data underneath it
+    would otherwise break the "this column is numeric-only" check entirely.
+    """
+    for ri in range(min(30, len(rows))):
+        row = rows[ri]
+        non_null = [v for v in row if v is not None]
+        numeric  = [v for v in non_null if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if non_null and len(numeric) / len(non_null) > 0.3:
+            return ri
+    return 1
+
+
+def find_sales_shaped_columns_from_rows(rows: list) -> list:
+    """
+    Raw-rows equivalent of find_sales_shaped_columns(), for use at QUALIFY
+    time - before extract_column_schema()'s richer schema object exists
+    (that requires reopening the full, non-read-only workbook, which only
+    happens after a sheet has already passed qualify). Without this, a
+    genuinely new date format gets disqualified at qualify time and never
+    reaches the schema-level escalation at all, since qualify runs first
+    and stops the pipeline on rejection.
+
+    Only scans from the detected data-start row onward - scanning header
+    rows too would mix header STRING values into the "numeric-only" check
+    for every column and cause it to find nothing at all.
+
+    0-based column indices (raw row tuples), unlike the schema-based
+    version above, which uses openpyxl's 1-based column numbering.
+    """
+    if not rows:
+        return []
+    data_start = find_data_start_row_from_rows(rows)
+    sample_rows = rows[data_start:data_start + 60]
+    max_col = max((len(r) for r in sample_rows), default=0)
+    candidates = []
+    for ci in range(max_col):
+        vals = [r[ci] for r in sample_rows if ci < len(r) and r[ci] is not None]
+        if len(vals) < 10:
+            continue
+        if vals and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
+            candidates.append(ci)
+    return candidates
+
+
 def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
     """
     Among the header rows, find the one with the most non-empty values
@@ -1124,6 +1174,23 @@ def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
                 row_counts[h["row"]] = row_counts.get(h["row"], 0) + 1
     if not row_counts:
         return 1
+    return max(row_counts, key=row_counts.get)
+
+
+def find_probable_header_row_from_rows(rows: list, candidate_cols: list) -> int:
+    """Raw-rows equivalent of find_probable_header_row() - which of the
+    first several rows has non-empty string values for the most candidate
+    columns. 0-based row index, matching raw row tuples."""
+    row_counts = {}
+    for ri, row in enumerate(rows[:15]):
+        count = sum(
+            1 for ci in candidate_cols
+            if ci < len(row) and isinstance(row[ci], str) and row[ci].strip()
+        )
+        if count:
+            row_counts[ri] = count
+    if not row_counts:
+        return 0
     return max(row_counts, key=row_counts.get)
 
 
@@ -1313,6 +1380,41 @@ async def stage_qualify(session_id: str):
 
     for sheet_name, rows in session["_sheets"].items():
         signals = extract_qualify_signals(rows, sheet_name, session["filename"])
+
+        # No known pattern matched anything for this sheet's date axis.
+        # Before trusting that as "no sales data" evidence (which would
+        # likely disqualify the sheet here, PERMANENTLY - stage_qualify runs
+        # before stage_schema_classify, so if this sheet is rejected now, the
+        # schema-level escalation built for this same purpose is never
+        # reached), check whether sales-shaped numeric data exists under
+        # headers that just aren't recognized yet, and escalate that
+        # residual to AI right here, at qualify time.
+        if signals.get("date_col_count", 0) == 0:
+            shaped_cols = find_sales_shaped_columns_from_rows(rows)
+            if shaped_cols:
+                header_row = find_probable_header_row_from_rows(rows, shaped_cols)
+                unresolved = []
+                for ci in shaped_cols:
+                    header_val = ""
+                    if header_row < len(rows) and ci < len(rows[header_row]) and rows[header_row][ci] is not None:
+                        header_val = str(rows[header_row][ci]).strip()
+                    if header_val and not match_known_patterns(header_val):
+                        unresolved.append((ci, header_val))
+
+                if unresolved:
+                    newly_resolved = await resolve_unrecognized_dates(
+                        unresolved, session["filename"], session.get("retailer")
+                    )
+                    if newly_resolved:
+                        signals["date_col_count"] = len(newly_resolved)
+                        # Store so stage_schema_classify can reuse this exact
+                        # resolution later instead of re-escalating to AI a
+                        # second time for the same header shape in this file.
+                        session.setdefault("_qualify_resolved_dates", {})[sheet_name] = newly_resolved
+                        session.setdefault("flags", {})["new_date_pattern_discovered"] = (
+                            f"{len(newly_resolved)} column(s) resolved via AI at qualify stage "
+                            f"for sheet '{sheet_name}' - pattern(s) written as pending_review"
+                        )
 
         # Deterministic fast paths
         if signals["dominant_type"] == "float_above_1":
@@ -1525,6 +1627,16 @@ async def stage_schema_classify(session_id: str):
         # pending_review and does NOT become a trusted match for any other
         # file (or even a re-run of this same enumeration) until a human
         # approves it - matching how new retailers are already handled.
+        if not sales_cols_1based:
+            # Reuse a resolution already made at qualify time for this exact
+            # sheet, if one exists - avoids a second AI call and a second
+            # pending_review pattern write for the same header shape within
+            # one file's processing. Qualify-time keys are 0-based (raw row
+            # tuples); this stage's are 1-based (openpyxl/schema convention).
+            qualify_resolved = session.get("_qualify_resolved_dates", {}).get(sheet_name)
+            if qualify_resolved:
+                sales_cols_1based = sorted(c0 + 1 for c0 in qualify_resolved.keys())
+
         if not sales_cols_1based:
             shaped_cols = find_sales_shaped_columns(schema)
             if shaped_cols:
