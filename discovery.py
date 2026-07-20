@@ -109,6 +109,16 @@ async def load_date_patterns(force: bool = False):
         pass
 
 
+def normalize_header_shape(header: str) -> str:
+    """Collapse digits to '#' so headers built the same repeating way compare
+    equal regardless of which specific digits they contain - '202601 Units'
+    and '202602 Units' both become '###### Units'. Used to group unresolved
+    headers by distinct FORMAT before asking AI anything, so AI only needs
+    to see and generalize one representative example per shape, not every
+    individual column that shares it."""
+    return re.sub(r"\d", "#", header.strip())
+
+
 def match_known_patterns(header: str) -> dict | None:
     """Try a header string against the loaded pattern library. Returns the
     matching pattern row (with pattern_regex/resolution_rule/format_description),
@@ -1194,60 +1204,119 @@ def find_probable_header_row_from_rows(rows: list, candidate_cols: list) -> int:
     return max(row_counts, key=row_counts.get)
 
 
-def build_new_pattern_prompt(unresolved: list, filename: str) -> str:
-    """unresolved: list of (col_num, header_text) tuples - columns Python has
-    already confirmed contain real sales-shaped numeric data, whose header
-    text just doesn't match any pattern in date_format_patterns yet."""
-    header_lines = "\n".join(f"col {c}: {repr(h)}" for c, h in unresolved)
-    return f"""You are identifying what sales date or period each column header represents.
+def build_new_pattern_prompt(shape_examples: list, filename: str) -> str:
+    """
+    shape_examples: list of (col_num, header_text) - ONE representative
+    example per DISTINCT header shape among the unresolved residual, not
+    every individual column. AI's job is narrowed to correctly generalizing
+    each distinct shape into a regex WITH capture groups identifying which
+    part is the year/week/month/day - not to state what any one example
+    means. Python computes the actual date for every matched column itself
+    (see compute_date_from_match), using those capture groups against each
+    column's OWN header text - so every column gets its own genuinely
+    correct date, not a copy of whatever the one example represented.
+    """
+    header_lines = "\n".join(f"- {repr(h)}" for _, h in shape_examples)
+    return f"""You are identifying whether column headers in a sales spreadsheet represent a date or sales period.
 
 File: {filename}
 
-These {len(unresolved)} columns already contain real sales-shaped numeric data
-(confirmed by Python), but their header text doesn't match any known date format:
+These are examples of DISTINCT header shapes among columns that already contain
+real sales-shaped numeric data (confirmed by Python), but don't match any known
+date format:
 
 {header_lines}
 
-You MUST evaluate all {len(unresolved)} columns listed above and return a
-resolution for EVERY one that genuinely represents a sales date or period —
-do not stop after the first one, and do not treat the example below as the
-only column to resolve. If most or all of them share the same underlying
-format (which is common - it's usually one repeating header convention
-applied across every week), return one resolution object per column, all
-following the same general_pattern.
+For each example that genuinely represents a sales date or period, provide a
+generalized regex pattern WITH CAPTURE GROUPS marking which part is the year
+and which part is the week number (or month/day, if applicable) - Python will
+use these groups to compute the correct date for every column that matches
+this pattern, not just this one example. Do not just describe what this one
+example means; the year/week must be extractable from ANY matching header via
+the capture groups you provide.
 
-For each one, determine the calendar date/range it represents, AND
-generalize the pattern (not just this one value) so it can be recognized
-automatically next time without asking AI again.
-
-Respond with JSON only, one object per resolved column - for example, if
-columns 5 and 6 both matched a repeating weekly format:
+Respond with JSON only:
 {{"resolutions": [
-  {{"col": 5, "represents": "2026-01-03 to 2026-01-09",
-    "general_pattern": "^\\\\d{{6}}\\\\s*Units$",
-    "pattern_description": "YYYYWW Units", "resolution_method": "yearweek_units"}},
-  {{"col": 6, "represents": "2026-01-10 to 2026-01-16",
-    "general_pattern": "^\\\\d{{6}}\\\\s*Units$",
-    "pattern_description": "YYYYWW Units", "resolution_method": "yearweek_units"}}
+  {{"example_header": "202601 Units",
+    "general_pattern": "^(\\\\d{{4}})(\\\\d{{2}})\\\\s*Units$",
+    "capture_groups": {{"year": 1, "week": 2}},
+    "resolution_method": "iso_year_week",
+    "pattern_description": "YYYYWW Units"}}
 ]}}
 
-If a column is NOT actually a date/period column, omit it entirely rather than guessing."""
+resolution_method must be one of: "iso_year_week" (capture_groups: year, week),
+"date_range" (already handled, shouldn't appear here), or "unknown" if the
+format is a genuine date/period but doesn't fit a method Python can compute yet
+(Python will still use it to identify which columns are date columns, but won't
+be able to compute a specific date for them without further work).
+
+If an example is NOT actually a date/period column (e.g. a product ID, UPC,
+or a summary/total column), omit it entirely rather than guessing."""
+
+
+def compute_date_from_match(match: "re.Match", resolution_rule: dict) -> str | None:
+    """
+    Computes an actual date from a regex match using an AI-supplied,
+    Python-executed method - this is the piece that answers "how does
+    Python know what an obscure date format MEANS": AI supplies WHICH
+    capture group is the year/week (a narrow, one-time judgment call),
+    and this function does the actual date arithmetic, per column, using
+    that column's own captured digits - never a value borrowed from a
+    different column's example.
+
+    Only implements methods Python actually knows how to compute. An
+    unrecognized method returns None deliberately - the column still
+    counts as a real date column (enumeration doesn't depend on this),
+    it just won't have a computed date until this function is extended
+    for that method, which is an honest, bounded gap rather than a wrong
+    silent answer.
+    """
+    method = resolution_rule.get("method")
+    groups = resolution_rule.get("capture_groups", {})
+    try:
+        if method == "iso_year_week":
+            year = int(match.group(groups["year"]))
+            week = int(match.group(groups["week"]))
+            d = date.fromisocalendar(year, max(1, min(week, 53)), 6)  # Saturday, matching normalize_to_saturday
+            return d.isoformat()
+    except (KeyError, ValueError, IndexError, Exception):
+        return None
+    return None
 
 
 async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: str | None) -> dict:
     """
     Escalates only the small residual (sales-shaped data + unrecognized
-    header) to AI. Validates the AI's own generalized pattern actually
-    matches the header that produced it before trusting or persisting
-    anything - a malformed or overly-broad AI answer is discarded, not
-    silently written as a new trusted pattern. Fails safe: any AI/parse
-    error returns {} and the caller's existing disqualify path still runs,
-    exactly as it did before this feature existed.
+    header) to AI - and only ONE representative example per distinct header
+    SHAPE, not every individual column. AI's job is narrowed to correctly
+    generalizing each distinct shape into a regex WITH capture groups
+    identifying year/week - it never states what any single example means.
+    PYTHON then applies that pattern across the FULL unresolved list AND
+    computes each matched column's own date from its OWN captured digits
+    (see compute_date_from_match) - so a genuinely new format's actual
+    per-column meaning is computed correctly for every column, not copied
+    from whichever one example AI happened to look at.
+
+    A column matching the pattern but whose method Python can't yet compute
+    still counts as a real date column (resolved[col] = None) - enumeration
+    doesn't depend on having a computed date, only on the header matching a
+    confirmed-genuine pattern.
+
+    Validates the AI's own generalized pattern actually matches the example
+    that produced it before trusting or applying it anywhere. Fails safe:
+    any AI/parse error returns {} and the caller's existing disqualify path
+    still runs, exactly as it did before this feature existed.
     """
     if not unresolved:
         return {}
+
+    shape_examples = {}
+    for col, header in unresolved:
+        shape = normalize_header_shape(header)
+        shape_examples.setdefault(shape, (col, header))
+
     try:
-        text   = await call_ai(build_new_pattern_prompt(unresolved, filename), label="new_date_pattern")
+        text   = await call_ai(build_new_pattern_prompt(list(shape_examples.values()), filename), label="new_date_pattern")
         clean  = parse_ai_response(text)
         result = json.loads(clean)
     except (json.JSONDecodeError, ValueError):
@@ -1255,35 +1324,44 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
     except Exception:
         return {}
 
-    valid_cols        = {c for c, _ in unresolved}
-    header_by_col     = dict(unresolved)
-    resolved          = {}
-    written_patterns  = set()  # dedupe: most columns share ONE underlying
-                                # pattern (one repeating weekly convention) -
-                                # write it to Postgres once, not once per column
+    resolved         = {}
+    written_patterns = set()
 
     for r in result.get("resolutions", []) if isinstance(result, dict) else []:
-        col, represents, pattern = r.get("col"), r.get("represents"), r.get("general_pattern")
-        if col not in valid_cols or not represents or not pattern:
+        pattern           = r.get("general_pattern")
+        example           = r.get("example_header", "")
+        resolution_rule   = {
+            "method": r.get("resolution_method", "unknown"),
+            "capture_groups": r.get("capture_groups", {}),
+        }
+        if not pattern:
             continue
         try:
-            if not re.match(pattern, header_by_col[col].strip(), re.IGNORECASE):
-                continue  # AI's own generalized pattern doesn't even match its source - reject
+            compiled = re.compile(pattern, re.IGNORECASE)
+            if example and not compiled.match(example.strip()):
+                continue  # AI's own pattern doesn't even match its own example - reject
         except re.error:
             continue
 
-        resolved[col] = represents
-        if pattern in written_patterns:
-            continue  # already written this exact pattern this run - don't duplicate
-        written_patterns.add(pattern)
-        try:
-            await call_postgres(build_insert_date_pattern_sql(
-                retailer, pattern, r.get("pattern_description", "AI-discovered"),
-                {"method": r.get("resolution_method", "unknown")},
-                header_by_col[col], filename,
-            ))
-        except Exception:
-            pass  # write-back failing shouldn't block resolving THIS file's columns
+        # PYTHON applies the confirmed pattern across EVERY unresolved
+        # header, computing EACH column's own date from ITS OWN match -
+        # never copying one example's meaning onto a different column.
+        matched_any = False
+        for col, header in unresolved:
+            m = compiled.match(header.strip())
+            if m:
+                resolved[col] = compute_date_from_match(m, resolution_rule)
+                matched_any = True
+
+        if matched_any and pattern not in written_patterns:
+            written_patterns.add(pattern)
+            try:
+                await call_postgres(build_insert_date_pattern_sql(
+                    retailer, pattern, r.get("pattern_description", "AI-discovered"),
+                    resolution_rule, example, filename,
+                ))
+            except Exception:
+                pass  # write-back failing shouldn't block resolving THIS file's columns
 
     return resolved
 
