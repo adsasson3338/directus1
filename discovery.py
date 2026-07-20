@@ -41,13 +41,90 @@ def parse_ai_response(text: str) -> str:
 router = APIRouter()
 
 # ---------------------------------------------
-# CELL CLASSIFICATION
+# DATE FORMAT PATTERN LIBRARY (Postgres-backed, not hardcoded)
 # ---------------------------------------------
+# Known date/period header formats used to live here as hardcoded regex
+# constants (DATE_RANGE_RE, FISCAL_WEEK_RE, WK_NUMBER_RE). They now live in
+# the date_format_patterns table instead, so the system can learn new header
+# formats over time (AI discovers one -> written back as pending_review ->
+# human approves -> becomes a fast, deterministic match for every future
+# file) without ever touching this code again.
+#
+# Retailer is NOT known at either point in the pipeline where date-axis
+# detection runs (stage_qualify AND stage_schema_classify both execute
+# before stage_identify_retailer). So pattern matching for THIS PURPOSE
+# always checks the full set of active patterns, any retailer - that's
+# evidence a header shape is a real, previously-approved date axis,
+# regardless of whose file it turns out to be. Retailer-scoping is applied
+# separately, only when a NEWLY discovered pattern is written back (see
+# build_insert_date_pattern_sql) - a pattern approved for one retailer does
+# not silently become a trusted fast path for a different retailer's files.
 
-DATE_RANGE_RE  = re.compile(r"^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$")
-FISCAL_WEEK_RE = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$", re.IGNORECASE)
-WK_NUMBER_RE   = re.compile(r"^wk\s*\d+$", re.IGNORECASE)
-YEAR_RE        = re.compile(r"\b(20\d{2})\b")
+YEAR_RE = re.compile(r"\b(20\d{2})\b")
+
+_KNOWN_DATE_PATTERNS: list = []  # cached rows: {retailer, pattern_regex, resolution_rule, format_description}
+
+
+def build_fetch_date_patterns_sql() -> str:
+    """All active date/period header patterns, any retailer - evidence that
+    a header shape is a real, previously-approved date axis."""
+    return "SELECT retailer, pattern_regex, resolution_rule, format_description FROM date_format_patterns WHERE status = 'active'"
+
+
+def build_insert_date_pattern_sql(retailer: str | None, pattern_regex: str, format_description: str,
+                                   resolution_rule: dict, example_header: str, source_file: str) -> str:
+    """
+    Insert a newly AI-discovered date format pattern as pending_review.
+    Scoped to the retailer if known at write time (usually not, given the
+    stage ordering above), else NULL - a human can assign it to a retailer
+    during review, or leave it universal if the format isn't retailer-specific.
+    """
+    retailer_val = f"'{sql_escape(retailer)}'" if retailer else "NULL"
+    rule_b64 = base64.b64encode(json.dumps(resolution_rule, ensure_ascii=False).encode()).decode()
+    return f"""
+INSERT INTO date_format_patterns
+    (retailer, pattern_regex, format_description, resolution_rule, discovered_via, example_header, first_seen_file, status)
+VALUES
+    ({retailer_val}, '{sql_escape(pattern_regex)}', '{sql_escape(format_description)}',
+     convert_from(decode('{rule_b64}', 'base64'), 'UTF8')::jsonb,
+     'ai', '{sql_escape(example_header)}', '{sql_escape(source_file)}', 'pending_review')
+""".strip()
+
+
+async def load_date_patterns(force: bool = False):
+    """
+    Load/refresh the shared pattern cache from Postgres. Cheap - safe to call
+    at the start of any stage that needs pattern matching. Fails soft: if
+    Postgres is briefly unreachable, keeps whatever was cached before rather
+    than crashing an in-progress discovery run.
+    """
+    global _KNOWN_DATE_PATTERNS
+    if _KNOWN_DATE_PATTERNS and not force:
+        return
+    try:
+        rows = await call_postgres(build_fetch_date_patterns_sql())
+        if rows:
+            _KNOWN_DATE_PATTERNS = rows
+    except Exception:
+        pass
+
+
+def match_known_patterns(header: str) -> dict | None:
+    """Try a header string against the loaded pattern library. Returns the
+    matching pattern row (with pattern_regex/resolution_rule/format_description),
+    or None if nothing matches - a malformed stored pattern is skipped rather
+    than allowed to crash detection for every file."""
+    if not isinstance(header, str):
+        return None
+    s = header.strip()
+    for p in _KNOWN_DATE_PATTERNS:
+        try:
+            if re.match(p["pattern_regex"], s, re.IGNORECASE):
+                return p
+        except (re.error, TypeError, KeyError):
+            continue
+    return None
+
 
 def classify_cell(val) -> str:
     if val is None:               return "empty"
@@ -57,17 +134,16 @@ def classify_cell(val) -> str:
     if isinstance(val, float):
         return "float_0_to_1" if 0 <= val <= 1 else "float_above_1"
     if isinstance(val, str):
-        s = val.strip()
-        if DATE_RANGE_RE.match(s):  return "date_range_string"
-        if FISCAL_WEEK_RE.match(s): return "fiscal_week_label"
-        if WK_NUMBER_RE.match(s):   return "week_number_label"
+        match = match_known_patterns(val)
+        if match:
+            return match.get("format_description") or "known_date_pattern"
         return "string"
     return "unknown"
 
 def is_date_like(val) -> bool:
-    return classify_cell(val) in (
-        "datetime", "date_range_string", "fiscal_week_label", "week_number_label"
-    )
+    if isinstance(val, datetime):
+        return True
+    return match_known_patterns(val) is not None if isinstance(val, str) else False
 
 
 
@@ -187,29 +263,19 @@ def find_date_axis(rows) -> dict | None:
         gaps = [cols[i+1] - cols[i] for i in range(len(cols)-1)]
         interleaved = len(set(gaps)) == 1 and gaps[0] == 2
 
-    year_boundary_detected = False
-    if best["format"] in ("date_range_string", "mixed"):
-        months = set()
-        for s in best["samples"]:
-            m = re.match(r'^(\d{1,2})/', s.strip())
-            if m:
-                months.add(int(m.group(1)))
-        if 12 in months and 1 in months:
-            year_boundary_detected = True
-    elif best["format"] == "fiscal_week_label":
-        # Check all date cols (not just samples) for Dec and Jan coexistence
-        month_map = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
-                     'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
-        fiscal_months = set()
-        row = rows[best["row"]]
-        for ci in best["cols"]:
-            if ci < len(row) and isinstance(row[ci], str):
-                mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
-                              row[ci].strip(), re.IGNORECASE)
-                if mf:
-                    fiscal_months.add(month_map[mf.group(1).lower()[:3]])
-        if 12 in fiscal_months and 1 in fiscal_months:
-            year_boundary_detected = True
+    # Year boundary detection: reuse the canonical month-extraction function
+    # rather than re-deriving months here with a second, independent regex.
+    # Works for any pattern extract_month_sequence understands (currently
+    # date_range and fiscal_week); silently contributes nothing for formats
+    # it doesn't yet handle - year_boundary_detected just won't fire for a
+    # brand-new pattern until someone extends extract_month_sequence for it,
+    # which is a bounded, honest limitation rather than a silent wrong answer.
+    candidate_months = extract_month_sequence(rows[best["row"]], cols)
+    year_boundary_detected = any(
+        a == 12 and b == 1
+        for a, b in zip(candidate_months, candidate_months[1:])
+        if a is not None and b is not None
+    )
 
     # Filter out inventory/summary columns that have date headers but are not sales
     # Check the row above the date axis for inventory-related labels
@@ -220,16 +286,20 @@ def find_date_axis(rows) -> dict | None:
     }
     if best["row"] > 0:
         label_row = rows[best["row"] - 1]
-        filtered_cols = []
-        filtered_samples = []
-        for ci, sample in zip(cols, best["samples"]):
-            label = str(label_row[ci]).strip().lower() if ci < len(label_row) and label_row[ci] else ""
-            if any(inv in label for inv in INVENTORY_LABELS):
-                continue  # exclude inventory columns from date axis
-            filtered_cols.append(ci)
-            filtered_samples.append(sample)
-        cols          = filtered_cols
-        best["samples"] = filtered_samples
+        cols = [
+            ci for ci in cols
+            if not any(
+                inv in (str(label_row[ci]).strip().lower() if ci < len(label_row) and label_row[ci] else "")
+                for inv in INVENTORY_LABELS
+            )
+        ]
+        # Rebuild samples from the filtered cols directly, rather than
+        # zipping against the pre-truncated (display-only) samples list -
+        # zip() silently stops at the shorter iterable, which previously
+        # capped `cols` itself at 8 regardless of how many real date
+        # columns existed (a pre-existing bug, not introduced by this pass).
+        row = rows[best["row"]]
+        best["samples"] = [str(row[ci]) for ci in cols[:8] if ci < len(row)]
 
     # Extract ordered tracking months for year_boundary_detected detection (fiscal weeks)
     # and for stage_date_config (via schema path - not from this function's return value)
@@ -858,17 +928,11 @@ def detect_first_sales_col(schema: dict, date_axis_row: int) -> int:
     """
     Detect the first column (1-based) containing a date-like value in the date axis row.
     """
-    DATE_PATTERNS = [
-        re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}$'),
-        re.compile(r'^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$'),
-        re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', re.IGNORECASE),
-        re.compile(r'^wk\s*\d+$', re.IGNORECASE),
-    ]
     for col in sorted(schema.get("columns", []), key=lambda c: c["col"]):
         for h in col.get("header_stack", []):
             if h["row"] == date_axis_row:
                 val = str(h.get("value", "")).strip()
-                if any(p.match(val) for p in DATE_PATTERNS):
+                if match_known_patterns(val):
                     return col["col"]
     return 1
 
@@ -929,10 +993,7 @@ def detect_date_axis_row(schema: dict) -> int:
         for h in col.get("header_stack", []):
             row = h["row"]  # already 1-based
             val = str(h.get("value", "")).strip()
-            if (re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", val) or
-                re.match(r"^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$", val) or
-                re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$", val, re.IGNORECASE) or
-                re.match(r"^wk\s*\d+$", val, re.IGNORECASE)):
+            if match_known_patterns(val):
                 row_date_counts[row] = row_date_counts.get(row, 0) + 1
     if not row_date_counts:
         return 1
@@ -964,16 +1025,8 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
         headers = {h["row"]: h["value"] for h in col.get("header_stack", [])}  # already 1-based
         col_headers[col_num] = headers
 
-    # Date matching patterns
-    DATE_PATTERNS = [
-        re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}$'),           # MM/DD/YY or MM/DD/YYYY
-        re.compile(r'^\d{1,2}/\d{1,2}[--]\d{1,2}/\d{1,2}$'), # MM/DD-MM/DD
-        re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', re.IGNORECASE),
-        re.compile(r'^wk\s*\d+$', re.IGNORECASE),
-    ]
-
     def is_date_value(val: str) -> bool:
-        return any(p.match(val.strip()) for p in DATE_PATTERNS)
+        return match_known_patterns(val) is not None
 
     def get_section_label(col_num: int) -> str:
         if not section_label_row:
@@ -1013,6 +1066,142 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
             break
 
     return sales_cols
+
+
+# ---------------------------------------------
+# NEW-FORMAT DISCOVERY (data-shape prefilter + narrow AI escalation)
+# ---------------------------------------------
+# When find_sales_cols_from_schema() finds nothing (no header matches any
+# approved pattern), the old behavior was to disqualify the sheet outright -
+# a silent, confident-looking failure indistinguishable from "this sheet
+# genuinely has no sales data" (see the 202601-style Walmart header bug).
+#
+# Instead: first ask Python which columns are even PLAUSIBLE sales-data
+# candidates by data shape alone (numeric-only, reasonably populated) -
+# this mechanically excludes blank separator columns, flag/marker columns,
+# inventory-snapshot datetimes, and percentage columns before any header
+# text is interpreted. Only the small residual that survives this AND
+# still doesn't match a known pattern gets escalated to AI - one narrow,
+# well-scoped judgment call, not "figure out the whole sheet."
+
+def find_sales_shaped_columns(schema: dict) -> list:
+    """
+    Returns 1-based column numbers whose underlying DATA looks like real
+    sales numbers - numeric-only, reasonably populated. Doesn't try to be
+    perfectly precise, just eliminates the obvious non-candidates (blanks,
+    text, flags, datetimes) before header text is ever interpreted.
+    """
+    candidates = []
+    for col in schema.get("columns", []):
+        types = set(col.get("data_types", []))
+        total = col.get("total_data_rows", 0)
+        if total < 10:                     # too sparse - likely blank/separator
+            continue
+        if not types or (types - {"integer", "float"}):  # any non-numeric type present
+            continue
+        candidates.append(col["col"])
+    return candidates
+
+
+def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
+    """
+    Among the header rows, find the one with the most non-empty values
+    across the given candidate columns - the probable label row for those
+    columns, regardless of whether any label matches a KNOWN pattern yet.
+
+    Deliberately NOT detect_date_axis_row(): that function's fallback
+    (return 1) fires exactly when NO header matches a known pattern - i.e.
+    exactly the situation this needs to handle (a genuinely new format).
+    Trusting that fallback here would silently point at the wrong row
+    (often a title row) and miss every real candidate column's header text.
+    """
+    row_counts = {}
+    col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
+    for col_1 in candidate_cols:
+        cs = col_schema_map.get(col_1, {})
+        for h in cs.get("header_stack", []):
+            if str(h.get("value", "")).strip():
+                row_counts[h["row"]] = row_counts.get(h["row"], 0) + 1
+    if not row_counts:
+        return 1
+    return max(row_counts, key=row_counts.get)
+
+
+def build_new_pattern_prompt(unresolved: list, filename: str) -> str:
+    """unresolved: list of (col_num, header_text) tuples - columns Python has
+    already confirmed contain real sales-shaped numeric data, whose header
+    text just doesn't match any pattern in date_format_patterns yet."""
+    header_lines = "\n".join(f"col {c}: {repr(h)}" for c, h in unresolved)
+    return f"""You are identifying what sales date or period each column header represents.
+
+File: {filename}
+
+These columns already contain real sales-shaped numeric data (confirmed by Python),
+but their header text doesn't match any known date format:
+
+{header_lines}
+
+For each one that genuinely represents a sales date or period, determine the
+calendar date/range it represents, AND generalize the pattern (not just this
+one value) so it can be recognized automatically next time without asking AI again.
+
+Respond with JSON only:
+{{"resolutions": [
+  {{"col": 5, "represents": "2026-01-03 to 2026-01-09",
+    "general_pattern": "^\\\\d{{6}}\\\\s*Units$",
+    "pattern_description": "YYYYWW Units", "resolution_method": "yearweek_units"}}
+]}}
+
+If a column is NOT actually a date/period column, omit it entirely rather than guessing."""
+
+
+async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: str | None) -> dict:
+    """
+    Escalates only the small residual (sales-shaped data + unrecognized
+    header) to AI. Validates the AI's own generalized pattern actually
+    matches the header that produced it before trusting or persisting
+    anything - a malformed or overly-broad AI answer is discarded, not
+    silently written as a new trusted pattern. Fails safe: any AI/parse
+    error returns {} and the caller's existing disqualify path still runs,
+    exactly as it did before this feature existed.
+    """
+    if not unresolved:
+        return {}
+    try:
+        text   = await call_ai(build_new_pattern_prompt(unresolved, filename), label="new_date_pattern")
+        clean  = parse_ai_response(text)
+        result = json.loads(clean)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    except Exception:
+        return {}
+
+    valid_cols     = {c for c, _ in unresolved}
+    header_by_col  = dict(unresolved)
+    resolved       = {}
+
+    for r in result.get("resolutions", []) if isinstance(result, dict) else []:
+        col, represents, pattern = r.get("col"), r.get("represents"), r.get("general_pattern")
+        if col not in valid_cols or not represents or not pattern:
+            continue
+        try:
+            if not re.match(pattern, header_by_col[col].strip(), re.IGNORECASE):
+                continue  # AI's own generalized pattern doesn't even match its source - reject
+        except re.error:
+            continue
+
+        resolved[col] = represents
+        try:
+            await call_postgres(build_insert_date_pattern_sql(
+                retailer, pattern, r.get("pattern_description", "AI-discovered"),
+                {"method": r.get("resolution_method", "unknown")},
+                header_by_col[col], filename,
+            ))
+            await load_date_patterns(force=True)  # so the rest of THIS run can use it immediately
+        except Exception:
+            pass  # write-back failing shouldn't block resolving THIS file's columns
+
+    return resolved
 
 
 def build_column_classify_prompt(schema: dict, filename: str,
@@ -1115,6 +1304,12 @@ async def stage_qualify(session_id: str):
     session = _sessions[session_id]
     session["stage"]  = "qualifying"
     session["status"] = "running"
+
+    # Load the approved date-format pattern library once per run. Retailer is
+    # not known yet at this stage, so this loads ALL active patterns, any
+    # retailer - evidence a header shape is a real, previously-approved date
+    # axis, regardless of whose file this turns out to be.
+    await load_date_patterns()
 
     for sheet_name, rows in session["_sheets"].items():
         signals = extract_qualify_signals(rows, sheet_name, session["filename"])
@@ -1321,6 +1516,47 @@ async def stage_schema_classify(session_id: str):
 
         # Python enumerates all sales date columns from the pattern
         sales_cols_1based = find_sales_cols_from_schema(schema, date_schema)
+
+        # Nothing matched a known, approved pattern - before disqualifying,
+        # check whether Python-confirmed sales-shaped DATA exists under
+        # headers that just aren't recognized yet, and escalate only that
+        # residual to AI. The AI's resolution is used to finish processing
+        # THIS file now; the generalized pattern it writes back is stored as
+        # pending_review and does NOT become a trusted match for any other
+        # file (or even a re-run of this same enumeration) until a human
+        # approves it - matching how new retailers are already handled.
+        if not sales_cols_1based:
+            shaped_cols = find_sales_shaped_columns(schema)
+            if shaped_cols:
+                # NOT detect_date_axis_row() here - its fallback (row 1) fires
+                # exactly when no header matches a known pattern, which is
+                # precisely this situation. find_probable_header_row() finds
+                # the label row structurally, independent of pattern matching.
+                header_row_probe      = find_probable_header_row(schema, shaped_cols)
+                col_schema_map_probe = {c["col"]: c for c in schema.get("columns", [])}
+                unresolved = []
+                for col_1 in shaped_cols:
+                    cs = col_schema_map_probe.get(col_1, {})
+                    header_val = ""
+                    for h in cs.get("header_stack", []):
+                        if h["row"] == header_row_probe:
+                            header_val = h["value"]
+                            break
+                    if header_val and not match_known_patterns(header_val):
+                        unresolved.append((col_1, header_val))
+
+                if unresolved:
+                    newly_resolved = await resolve_unrecognized_dates(
+                        unresolved, session["filename"], session.get("retailer")
+                    )
+                    if newly_resolved:
+                        sales_cols_1based = sorted(newly_resolved.keys())
+                        session.setdefault("flags", {})["new_date_pattern_discovered"] = (
+                            f"{len(newly_resolved)} column(s) resolved via AI for this file - "
+                            f"pattern(s) written to date_format_patterns as pending_review, "
+                            f"needs human approval before automatic reuse on other files"
+                        )
+
         sales_cols_0based = [c - 1 for c in sales_cols_1based]
 
         session.setdefault("_date_schemas", {})[sheet_name] = date_schema
