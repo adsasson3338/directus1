@@ -3,8 +3,10 @@ shared.py — Unified infrastructure for discovery and ingestion pipelines.
 One session store, direct Postgres and AI calls, webhook only for file fetch.
 """
 import os
+import re
 import json
 import time
+import base64
 import asyncio
 import urllib.request
 import uuid
@@ -54,6 +56,122 @@ FROM file_audit
 WHERE id = '{safe_id}'
 LIMIT 1
 """.strip()
+
+
+# ─────────────────────────────────────────────
+# DATE FORMAT PATTERN LIBRARY (Postgres-backed, shared by discovery + ingestion)
+# ─────────────────────────────────────────────
+# Lives here, not in discovery.py, because BOTH pipelines need to answer the
+# same question - "does this header match a known date/period format, and if
+# so what date does it represent" - discovery when deciding which columns are
+# sales columns, ingestion when actually computing week_ending for real rows.
+# One cache, one set of matching/computation functions, used by both; a
+# pattern newly discovered by discovery.py's AI escalation is immediately
+# usable (once approved) by ingestion.py without any duplicate logic.
+
+_KNOWN_DATE_PATTERNS: list = []  # cached rows: {retailer, pattern_regex, resolution_rule, format_description}
+
+
+def build_fetch_date_patterns_sql() -> str:
+    """All active date/period header patterns, any retailer - evidence that
+    a header shape is a real, previously-approved date axis."""
+    return "SELECT retailer, pattern_regex, resolution_rule, format_description FROM date_format_patterns WHERE status = 'active'"
+
+
+def build_insert_date_pattern_sql(retailer: str | None, pattern_regex: str, format_description: str,
+                                   resolution_rule: dict, example_header: str, source_file: str) -> str:
+    """
+    Insert a newly AI-discovered date format pattern as pending_review.
+    Scoped to the retailer if known at write time, else NULL - a human can
+    assign it to a retailer during review, or leave it universal if the
+    format isn't retailer-specific. Stays untrusted (not usable by either
+    pipeline) until a human flips status to 'active'.
+    """
+    retailer_val = f"'{_sql_escape(retailer)}'" if retailer else "NULL"
+    rule_b64 = base64.b64encode(json.dumps(resolution_rule, ensure_ascii=False).encode()).decode()
+    return f"""
+INSERT INTO date_format_patterns
+    (retailer, pattern_regex, format_description, resolution_rule, discovered_via, example_header, first_seen_file, status)
+VALUES
+    ({retailer_val}, '{_sql_escape(pattern_regex)}', '{_sql_escape(format_description)}',
+     convert_from(decode('{rule_b64}', 'base64'), 'UTF8')::jsonb,
+     'ai', '{_sql_escape(example_header)}', '{_sql_escape(source_file)}', 'pending_review')
+""".strip()
+
+
+async def load_date_patterns(force: bool = False):
+    """
+    Load/refresh the shared pattern cache from Postgres. Cheap - safe to
+    call at the start of any discovery or ingestion run that needs pattern
+    matching. Fails soft: if Postgres is briefly unreachable, keeps
+    whatever was cached before rather than crashing.
+    """
+    global _KNOWN_DATE_PATTERNS
+    if _KNOWN_DATE_PATTERNS and not force:
+        return
+    try:
+        rows = await call_postgres(build_fetch_date_patterns_sql())
+        if rows:
+            _KNOWN_DATE_PATTERNS = rows
+    except Exception:
+        pass
+
+
+def match_known_patterns(header: str) -> dict | None:
+    """Try a header string against the loaded pattern library. Returns the
+    matching pattern row (with pattern_regex/resolution_rule/format_description),
+    or None if nothing matches - a malformed stored pattern is skipped rather
+    than allowed to crash matching for every file."""
+    if not isinstance(header, str):
+        return None
+    s = header.strip()
+    for p in _KNOWN_DATE_PATTERNS:
+        try:
+            if re.match(p["pattern_regex"], s, re.IGNORECASE):
+                return p
+        except (re.error, TypeError, KeyError):
+            continue
+    return None
+
+
+def normalize_header_shape(header: str) -> str:
+    """Collapse digits to '#' so headers built the same repeating way compare
+    equal regardless of which specific digits they contain - '202601 Units'
+    and '202602 Units' both become '###### Units'. Used to group unresolved
+    headers by distinct FORMAT before asking AI anything, so AI only needs
+    to see and generalize one representative example per shape, not every
+    individual column that shares it."""
+    return re.sub(r"\d", "#", header.strip())
+
+
+def compute_date_from_match(match: "re.Match", resolution_rule: dict) -> str | None:
+    """
+    Computes an actual date from a regex match using an AI-supplied,
+    Python-executed method. AI supplies WHICH capture group is the
+    year/week (a narrow, one-time judgment call, made once per distinct
+    format during discovery's escalation); this function does the actual
+    date arithmetic, every time, for whichever column's own header it's
+    given - never a value borrowed from a different column's example.
+
+    Only implements methods Python actually knows how to compute. An
+    unrecognized method returns None deliberately - the caller (discovery,
+    for column enumeration; ingestion, for date resolution) can still use
+    the pattern MATCH itself for its own purposes even when no computed
+    date is available yet - that's an honest, bounded gap rather than a
+    wrong silent answer, and is closed by adding a new branch here, once,
+    for both pipelines simultaneously.
+    """
+    method = resolution_rule.get("method")
+    groups = resolution_rule.get("capture_groups", {})
+    try:
+        if method == "iso_year_week":
+            year = int(match.group(groups["year"]))
+            week = int(match.group(groups["week"]))
+            d = date.fromisocalendar(year, max(1, min(week, 53)), 6)  # Saturday, matching normalize_to_saturday
+            return d.isoformat()
+    except (KeyError, ValueError, IndexError, Exception):
+        return None
+    return None
 
 # ─────────────────────────────────────────────
 # SHARED STATE
