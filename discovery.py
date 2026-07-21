@@ -171,6 +171,23 @@ EMBEDDED_PATTERNS = [
 # GRID DETECTION
 # ---------------------------------------------
 
+# Used in two places: excluding inventory-labeled columns from the sales
+# date axis (find_date_axis, below), and gating column_mapping's
+# "inventory" classification (stage_schema_classify) so AI's judgment on
+# this specific, high-stakes label isn't trusted on its own - a column
+# only counts as inventory if its header actually contains one of these
+# words, regardless of what AI's free-form reasoning concluded. Real
+# production example: the same "Current Week" column, same file, got
+# classified "other" on one discovery run and "inventory" on another -
+# AI reasoning about intent is not reliable enough for a classification
+# that determines which TABLE the data gets written into.
+INVENTORY_LABELS = {
+    'inv', 'inventory', 'on order', 'onorder', 'dc inv', 'store inv',
+    'total inv', 'on hand', 'onhand', 'stock', 'qty on hand',
+    'remaining', 'order qty', 'open order'
+}
+
+
 def find_date_axis(rows) -> dict | None:
     best = {"row": None, "count": 0, "cols": [], "samples": [], "format": None}
     for row_idx, row in enumerate(rows[:15]):
@@ -210,11 +227,8 @@ def find_date_axis(rows) -> dict | None:
 
     # Filter out inventory/summary columns that have date headers but are not sales
     # Check the row above the date axis for inventory-related labels
-    INVENTORY_LABELS = {
-        'inv', 'inventory', 'on order', 'onorder', 'dc inv', 'store inv',
-        'total inv', 'on hand', 'onhand', 'stock', 'qty on hand',
-        'remaining', 'order qty', 'open order'
-    }
+    # (INVENTORY_LABELS is now a module-level constant, shared with the
+    # column_mapping gate in stage_schema_classify)
     if best["row"] > 0:
         label_row = rows[best["row"] - 1]
         cols = [
@@ -1931,10 +1945,34 @@ async def stage_schema_classify(session_id: str):
             "year_anchors":   year_anchors[:6],
         }
 
-        session["column_mapping"][sheet_name] = [
-            {
+        def _has_inventory_keyword(col_0based: int) -> bool:
+            """Does this column's own header text actually contain a real
+            inventory keyword? Used to gate the "inventory" classification -
+            AI's free-form reasoning about what a column "represents" isn't
+            reliable enough on its own for a label that determines which
+            TABLE data gets written into (see INVENTORY_LABELS's docstring
+            for the real production case that showed this: the same column
+            classified two different ways on two runs of the same file)."""
+            cs = col_schema_map.get(col_0based + 1, {})
+            header_text = " ".join(
+                str(h.get("value", "")) for h in cs.get("header_stack", []) if h.get("value")
+            ).lower()
+            return any(kw in header_text for kw in INVENTORY_LABELS)
+
+        column_mapping_list = []
+        for c in col_results:
+            if c.get("classification") == "sales_date":
+                continue
+            classification = c.get("classification")
+            if classification == "inventory" and not _has_inventory_keyword(c["col"]):
+                # AI said inventory, but the header itself has no real
+                # inventory keyword - don't trust the label, fall back to
+                # the safe default rather than risk sales data landing in
+                # the inventory table.
+                classification = "other"
+            column_mapping_list.append({
                 "col":                  c["col"],
-                "classification":       c["classification"],
+                "classification":       classification,
                 "confidence":           c.get("confidence", "high"),
                 "reason":               c.get("reason", ""),
                 "has_embedded_supplier_sku": (
@@ -1942,10 +1980,8 @@ async def stage_schema_classify(session_id: str):
                     col_schema_map.get(c["col"] + 1, {}).get("has_embedded_supplier_sku", False) or
                     col_schema_map.get(c["col"] + 1, {}).get("embedded_postgres_matched", False)
                 ),
-            }
-            for c in col_results
-            if c.get("classification") != "sales_date"
-        ]
+            })
+        session["column_mapping"][sheet_name] = column_mapping_list
 
         # Post-schema: disqualify if no sales date columns found
         if len(sales_cols_0based) == 0:
