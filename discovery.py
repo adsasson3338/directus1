@@ -1451,8 +1451,94 @@ def detect_known_file_type(filename: str, sheet_names: list) -> str | None:
 # PIPELINE STAGES
 # ---------------------------------------------
 
+async def _qualify_one_sheet(session: dict, sheet_name: str, rows: list):
+    """
+    Everything stage_qualify used to do inline, per sheet, in a sequential
+    for-loop - now a standalone coroutine so multiple sheets can run
+    concurrently via asyncio.gather instead of one after another.
+
+    Safe to parallelize: this function's logic depends only on this
+    sheet's own rows/signals - it never reads another sheet's
+    qualify_results, qualified_sheets, or any other sheet-keyed state.
+    Every write below is to a key namespaced by sheet_name (or an append),
+    so concurrent coroutines writing different sheets' results can't
+    clobber each other under asyncio's cooperative single-threaded model.
+    """
+    signals = extract_qualify_signals(rows, sheet_name, session["filename"])
+
+    # No known pattern matched anything for this sheet's date axis.
+    # Before trusting that as "no sales data" evidence (which would
+    # likely disqualify the sheet here, PERMANENTLY - stage_qualify runs
+    # before stage_schema_classify, so if this sheet is rejected now, the
+    # schema-level escalation built for this same purpose is never
+    # reached), check whether sales-shaped numeric data exists under
+    # headers that just aren't recognized yet, and escalate that
+    # residual to AI right here, at qualify time.
+    if signals.get("date_col_count", 0) == 0:
+        shaped_cols = find_sales_shaped_columns_from_rows(rows)
+        if shaped_cols:
+            header_row = find_probable_header_row_from_rows(rows, shaped_cols)
+            unresolved = []
+            for ci in shaped_cols:
+                header_val = ""
+                if header_row < len(rows) and ci < len(rows[header_row]) and rows[header_row][ci] is not None:
+                    header_val = str(rows[header_row][ci]).strip()
+                if header_val and not match_known_patterns(header_val):
+                    unresolved.append((ci, header_val))
+
+            if unresolved:
+                newly_resolved, trusted_dates = await resolve_unrecognized_dates(
+                    unresolved, session["filename"], session.get("retailer")
+                )
+                if newly_resolved:
+                    signals["date_col_count"] = len(newly_resolved)
+                    # Store so stage_schema_classify can reuse this exact
+                    # resolution later instead of re-escalating to AI a
+                    # second time for the same header shape in this file.
+                    session.setdefault("_qualify_resolved_dates", {})[sheet_name] = newly_resolved
+                    # Only active-pattern-backed dates get persisted for
+                    # ingestion to use directly - see resolve_unrecognized_dates.
+                    if trusted_dates:
+                        session.setdefault("_trusted_resolved_dates", {}).setdefault(
+                            sheet_name, {}
+                        ).update(trusted_dates)
+                    session.setdefault("flags", {})["new_date_pattern_discovered"] = (
+                        f"{len(newly_resolved)} column(s) resolved via AI at qualify stage "
+                        f"for sheet '{sheet_name}' - pattern(s) written as pending_review"
+                    )
+
+    # Deterministic fast paths
+    if signals["dominant_type"] == "float_above_1":
+        session["qualify_results"][sheet_name] = {
+            "disqualified": True,
+            "reason": "Crosshair values predominantly decimals above 1 - dollar revenue",
+            "source": "python",
+        }
+        return
+    if signals["dominant_type"] == "float_0_to_1":
+        session["qualify_results"][sheet_name] = {
+            "disqualified": True,
+            "reason": "Crosshair values predominantly between 0 and 1 - percentage metrics",
+            "source": "python",
+        }
+        return
+
+    # AI call - direct, no webhook
+    try:
+        text   = await call_ai(build_qualify_prompt(signals), label="qualify")
+        clean  = parse_ai_response(text)
+        verdict = json.loads(clean)
+    except (json.JSONDecodeError, ValueError) as e:
+        verdict = {"disqualified": None, "reason": f"Parse error: {e}"}
+    except Exception as e:
+        verdict = {"disqualified": None, "reason": f"AI error: {e}"}
+    verdict["source"] = "ai"
+    session["qualify_results"][sheet_name] = verdict
+
+
 async def stage_qualify(session_id: str):
-    """Stage 1 - qualify each sheet."""
+    """Stage 1 - qualify each sheet. Sheets are independent, so they run
+    concurrently rather than one after another - see _qualify_one_sheet."""
     session = _sessions[session_id]
     session["stage"]  = "qualifying"
     session["status"] = "running"
@@ -1463,77 +1549,10 @@ async def stage_qualify(session_id: str):
     # axis, regardless of whose file this turns out to be.
     await load_date_patterns()
 
-    for sheet_name, rows in session["_sheets"].items():
-        signals = extract_qualify_signals(rows, sheet_name, session["filename"])
-
-        # No known pattern matched anything for this sheet's date axis.
-        # Before trusting that as "no sales data" evidence (which would
-        # likely disqualify the sheet here, PERMANENTLY - stage_qualify runs
-        # before stage_schema_classify, so if this sheet is rejected now, the
-        # schema-level escalation built for this same purpose is never
-        # reached), check whether sales-shaped numeric data exists under
-        # headers that just aren't recognized yet, and escalate that
-        # residual to AI right here, at qualify time.
-        if signals.get("date_col_count", 0) == 0:
-            shaped_cols = find_sales_shaped_columns_from_rows(rows)
-            if shaped_cols:
-                header_row = find_probable_header_row_from_rows(rows, shaped_cols)
-                unresolved = []
-                for ci in shaped_cols:
-                    header_val = ""
-                    if header_row < len(rows) and ci < len(rows[header_row]) and rows[header_row][ci] is not None:
-                        header_val = str(rows[header_row][ci]).strip()
-                    if header_val and not match_known_patterns(header_val):
-                        unresolved.append((ci, header_val))
-
-                if unresolved:
-                    newly_resolved, trusted_dates = await resolve_unrecognized_dates(
-                        unresolved, session["filename"], session.get("retailer")
-                    )
-                    if newly_resolved:
-                        signals["date_col_count"] = len(newly_resolved)
-                        # Store so stage_schema_classify can reuse this exact
-                        # resolution later instead of re-escalating to AI a
-                        # second time for the same header shape in this file.
-                        session.setdefault("_qualify_resolved_dates", {})[sheet_name] = newly_resolved
-                        # Only active-pattern-backed dates get persisted for
-                        # ingestion to use directly - see resolve_unrecognized_dates.
-                        if trusted_dates:
-                            session.setdefault("_trusted_resolved_dates", {}).setdefault(
-                                sheet_name, {}
-                            ).update(trusted_dates)
-                        session.setdefault("flags", {})["new_date_pattern_discovered"] = (
-                            f"{len(newly_resolved)} column(s) resolved via AI at qualify stage "
-                            f"for sheet '{sheet_name}' - pattern(s) written as pending_review"
-                        )
-
-        # Deterministic fast paths
-        if signals["dominant_type"] == "float_above_1":
-            session["qualify_results"][sheet_name] = {
-                "disqualified": True,
-                "reason": "Crosshair values predominantly decimals above 1 - dollar revenue",
-                "source": "python",
-            }
-            continue
-        if signals["dominant_type"] == "float_0_to_1":
-            session["qualify_results"][sheet_name] = {
-                "disqualified": True,
-                "reason": "Crosshair values predominantly between 0 and 1 - percentage metrics",
-                "source": "python",
-            }
-            continue
-
-        # AI call - direct, no webhook
-        try:
-            text   = await call_ai(build_qualify_prompt(signals), label="qualify")
-            clean  = parse_ai_response(text)
-            verdict = json.loads(clean)
-        except (json.JSONDecodeError, ValueError) as e:
-            verdict = {"disqualified": None, "reason": f"Parse error: {e}"}
-        except Exception as e:
-            verdict = {"disqualified": None, "reason": f"AI error: {e}"}
-        verdict["source"] = "ai"
-        session["qualify_results"][sheet_name] = verdict
+    await asyncio.gather(*[
+        _qualify_one_sheet(session, sheet_name, rows)
+        for sheet_name, rows in session["_sheets"].items()
+    ])
 
     await advance_from_qualify(session_id)
 
@@ -1658,8 +1677,346 @@ async def stage_postgres_sku_lookup(session_id: str):
     await stage_schema_classify(session_id)
 
 
+async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_values: set):
+    """
+    Everything stage_schema_classify used to do inline, per sheet, in a
+    sequential for-loop - now a standalone coroutine so multiple sheets
+    can run concurrently via asyncio.gather instead of one after another.
+
+    Safe to parallelize: depends only on this sheet's own schema/rows and
+    on _matched_values (read-only, set once before any sheet is processed).
+    Every write is namespaced by sheet_name, or - for the one shared-list
+    mutation (session["qualified_sheets"], when a sheet turns out to have
+    no date columns after all) - a same-value-removal filter with no
+    intervening await, which is safe under asyncio's cooperative
+    single-threaded model regardless of how multiple sheets' coroutines
+    happen to interleave.
+    """
+    schema = session.get("_schemas", {}).get(sheet_name, {})
+    if not schema:
+        session["grid"][sheet_name]           = {"error": "No schema available"}
+        session["column_mapping"][sheet_name] = []
+        return
+
+    for col in schema.get("columns", []):
+        col["postgres_matched"] = any(
+            str(v).upper() in matched_values for v in col.get("sample_non_zero", [])
+        )
+        embedded_matched = any(
+            ext.get("sku", "").upper() in matched_values
+            for ext in col.get("embedded_sku_extractions", [])
+        )
+        col["embedded_postgres_matched"] = embedded_matched
+        if embedded_matched:
+            col["has_embedded_supplier_sku"] = True
+
+    # Pass 1 - AI identifies date schema pattern
+    try:
+        text        = await call_ai(build_date_schema_prompt(schema, session["filename"]), label="date_schema")
+        clean       = parse_ai_response(text)
+        date_schema = json.loads(clean)
+    except (json.JSONDecodeError, ValueError) as e:
+        date_schema = {"error": f"Parse error: {e}"}
+    except Exception as e:
+        date_schema = {"error": f"AI error: {e}"}
+
+    if "error" in date_schema:
+        session["grid"][sheet_name]           = {"error": date_schema["error"]}
+        session["column_mapping"][sheet_name] = []
+        return
+
+    # Python enumerates all sales date columns from the pattern
+    sales_cols_1based = find_sales_cols_from_schema(schema, date_schema)
+
+    # Nothing matched a known, approved pattern - before disqualifying,
+    # check whether Python-confirmed sales-shaped DATA exists under
+    # headers that just aren't recognized yet, and escalate only that
+    # residual to AI. The AI's resolution is used to finish processing
+    # THIS file now; the generalized pattern it writes back is stored as
+    # pending_review and does NOT become a trusted match for any other
+    # file (or even a re-run of this same enumeration) until a human
+    # approves it - matching how new retailers are already handled.
+    if not sales_cols_1based:
+        # Reuse a resolution already made at qualify time for this exact
+        # sheet, if one exists - avoids a second AI call and a second
+        # pending_review pattern write for the same header shape within
+        # one file's processing. Qualify-time keys are 0-based (raw row
+        # tuples); this stage's are 1-based (openpyxl/schema convention).
+        qualify_resolved = session.get("_qualify_resolved_dates", {}).get(sheet_name)
+        if qualify_resolved:
+            sales_cols_1based = sorted(c0 + 1 for c0 in qualify_resolved.keys())
+
+    if not sales_cols_1based:
+        shaped_cols = find_sales_shaped_columns(schema)
+        if shaped_cols:
+            # NOT detect_date_axis_row() here - its fallback (row 1) fires
+            # exactly when no header matches a known pattern, which is
+            # precisely this situation. find_probable_header_row() finds
+            # the label row structurally, independent of pattern matching.
+            header_row_probe      = find_probable_header_row(schema, shaped_cols)
+            col_schema_map_probe = {c["col"]: c for c in schema.get("columns", [])}
+            unresolved = []
+            for col_1 in shaped_cols:
+                cs = col_schema_map_probe.get(col_1, {})
+                header_val = ""
+                for h in cs.get("header_stack", []):
+                    if h["row"] == header_row_probe:
+                        header_val = h["value"]
+                        break
+                if header_val and not match_known_patterns(header_val):
+                    unresolved.append((col_1, header_val))
+
+            if unresolved:
+                newly_resolved, trusted_dates = await resolve_unrecognized_dates(
+                    unresolved, session["filename"], session.get("retailer")
+                )
+                if newly_resolved:
+                    sales_cols_1based = sorted(newly_resolved.keys())
+                    # date_cols/resolved_dates use 0-based indexing
+                    # (matching sales_cols_0based below) - this
+                    # escalation path works in 1-based (schema/openpyxl
+                    # convention), so convert before merging.
+                    if trusted_dates:
+                        session.setdefault("_trusted_resolved_dates", {}).setdefault(
+                            sheet_name, {}
+                        ).update({c1 - 1: d for c1, d in trusted_dates.items()})
+                    session.setdefault("flags", {})["new_date_pattern_discovered"] = (
+                        f"{len(newly_resolved)} column(s) resolved via AI for this file - "
+                        f"pattern(s) written to date_format_patterns as pending_review, "
+                        f"needs human approval before automatic reuse on other files"
+                    )
+
+    sales_cols_0based = [c - 1 for c in sales_cols_1based]
+
+    session.setdefault("_date_schemas", {})[sheet_name] = date_schema
+    session.setdefault("_sales_cols",   {})[sheet_name] = sales_cols_0based
+
+    # Pass 2 - AI classifies non-date columns
+    try:
+        text   = await call_ai(build_column_classify_prompt(schema, session["filename"],
+                                                              sales_cols_1based, matched_values), label="column_classify")
+        clean  = parse_ai_response(text)
+        result = json.loads(clean)
+    except (json.JSONDecodeError, ValueError) as e:
+        result = {"error": f"Parse error: {e}"}
+    except Exception as e:
+        result = {"error": f"AI error: {e}"}
+
+    if "error" in result:
+        session["grid"][sheet_name]           = {"error": result["error"]}
+        session["column_mapping"][sheet_name] = []
+        return
+
+    col_results   = result.get("columns", [])
+    col_results   = [{**c, "col": c["col"] - 1} for c in col_results]
+
+    data_start    = schema["data_start_row"]               # Python
+    # NOT detect_date_axis_row() here either - same reason as the
+    # escalation path above: its fallback (row 1) fires precisely when
+    # headers don't match an ACTIVE pattern, which is exactly the case
+    # for a format discovered THIS run (still pending_review) or one
+    # whose header-row detection otherwise fails. That silently pointed
+    # ingestion at the wrong row (often a title row) for any file using
+    # a newly-discovered format - build_date_map would find nothing but
+    # None values there, sales_rows would come back 0, and nothing
+    # would report this as an error. find_probable_header_row() finds
+    # the label row structurally, independent of pattern status,
+    # working correctly for both known and newly-discovered formats.
+    date_axis_row = find_probable_header_row(schema, sales_cols_1based)  # Python (1-based)
+    rows_data     = session["_sheets"].get(sheet_name, [])
+    axis_row_0    = date_axis_row - 1                      # 0-based
+
+    # Detect format and year flags from actual header values
+    axis_row_vals = [
+        rows_data[axis_row_0][c]
+        for c in sales_cols_0based
+        if axis_row_0 < len(rows_data) and c < len(rows_data[axis_row_0])
+        and rows_data[axis_row_0][c] is not None
+    ]
+    formats = set(classify_cell(v) for v in axis_row_vals)
+    date_fmt = list(formats)[0] if len(formats) == 1 else "mixed"
+
+    year_present  = date_fmt == "datetime" or any(
+        YEAR_RE.search(str(v)) for v in axis_row_vals
+    )
+
+    col_schema_map = {c["col"]: c for c in schema["columns"]}
+    sample_vals    = []
+    for col_0 in sorted(sales_cols_0based)[:8]:
+        col_1 = col_0 + 1
+        cs    = col_schema_map.get(col_1, {})
+        for h in cs.get("header_stack", []):
+            if any(ch.isdigit() for ch in h["value"]):
+                sample_vals.append(h["value"])
+                break
+
+    # Also grab the last date column value for file_set_key calculation
+    last_sample_val = None
+    if sales_cols_0based:
+        last_col_0 = sorted(sales_cols_0based)[-1]
+        last_col_1 = last_col_0 + 1
+        cs = col_schema_map.get(last_col_1, {})
+        for h in cs.get("header_stack", []):
+            if any(ch.isdigit() for ch in h["value"]):
+                last_sample_val = h["value"]
+                break
+
+    # Find last ACTIVE column - last date column with at least one non-zero data value
+    # This is the true latest week for file_set_key, not the last column in the sheet
+    last_active_sample_val = None
+    data_start_0 = data_start - 1  # 0-based
+    for col_0 in sorted(sales_cols_0based, reverse=True):
+        has_data = any(
+            rows_data[r][col_0] not in (None, 0, "", " ")
+            for r in range(data_start_0, min(data_start_0 + 200, len(rows_data)))
+            if col_0 < len(rows_data[r])
+        )
+        if has_data:
+            col_1 = col_0 + 1
+            cs = col_schema_map.get(col_1, {})
+            for h in cs.get("header_stack", []):
+                if any(ch.isdigit() for ch in h["value"]):
+                    last_active_sample_val = h["value"]
+                    break
+            break
+
+    year_anchors = [
+        {"source": "filename", "value": m.group(1)}
+        for m in YEAR_RE.finditer(session["filename"])
+    ]
+
+    # Detect year boundary from actual month sequence
+    # A boundary exists only when December is followed by January (month drops)
+    # A full-year file (Jan->Dec) contains both months but has no boundary
+    month_seq      = extract_month_sequence(rows_data[axis_row_0] if axis_row_0 < len(rows_data) else [], sales_cols_0based)
+    year_boundary  = False
+    prev_m = None
+    for m in month_seq:
+        if m is None:
+            continue
+        if prev_m is not None and prev_m == 12 and m == 1:
+            year_boundary = True
+            break
+        prev_m = m
+
+    date_axis = {
+        "row":                    axis_row_0,
+        "col_count":              len(sales_cols_0based),
+        "date_col_count":         len(sales_cols_0based),
+        "cols":                   sales_cols_0based,
+        "sample_values":          sample_vals,
+        "last_sample_val":        last_sample_val,
+        "last_active_sample_val": last_active_sample_val,
+        "format":                 date_fmt,
+        "year_present":           year_present,
+        "interleaved_empty_cols": False,
+        "year_boundary_detected": year_boundary,
+    }
+
+    # Store month_sequence if boundary detected
+    if year_boundary:
+        date_axis["month_sequence"] = month_seq
+
+    rows     = session["_sheets"].get(sheet_name, [])
+    embedded = detect_embedded_sku(rows, sales_cols_0based, data_start - 1)
+
+    embedded_by_col = {e["col"]: e for e in embedded}
+    for col in schema.get("columns", []):
+        col_0 = col["col"] - 1
+        if col_0 in embedded_by_col:
+            col["embedded_sku_extractions"] = embedded_by_col[col_0]["extractions"]
+            col["has_embedded_supplier_sku"] = True
+
+    sku_candidates = []
+    for c in col_results:
+        col_0 = c["col"]
+        col_1 = col_0 + 1
+        cs    = col_schema_map.get(col_1, {})
+        pre_strings = [
+            {"row": h["row"] - 1, "value": h["value"]}
+            for h in cs.get("header_stack", [])
+        ]
+        col_vals = [
+            rows[r][col_0]
+            for r in range(data_start - 1, min(data_start + 49, len(rows)))
+            if col_0 < len(rows[r]) and rows[r][col_0] is not None
+        ]
+        types   = {}
+        for v in col_vals:
+            t = classify_cell(v)
+            types[t] = types.get(t, 0) + 1
+        dominant = max(types, key=types.get) if types else "string"
+        sku_candidates.append({
+            "col":              col_0,
+            "pre_data_strings": pre_strings,
+            "dominant_type":    dominant,
+            "type_distribution": types,
+            "fill_rate":        round(len(col_vals) / 50, 2),
+            "sample_values":    [str(v) for v in col_vals[:5]],
+        })
+
+    session["grid"][sheet_name] = {
+        "date_axis":      date_axis,
+        "data_start_row": data_start - 1,
+        "sku_candidates": sku_candidates,
+        "embedded_sku":   embedded,
+        "year_anchors":   year_anchors[:6],
+    }
+
+    def _has_inventory_keyword(col_0based: int) -> bool:
+        """Does this column's own header text actually contain a real
+        inventory keyword? Used to gate the "inventory" classification -
+        AI's free-form reasoning about what a column "represents" isn't
+        reliable enough on its own for a label that determines which
+        TABLE data gets written into (see INVENTORY_LABELS's docstring
+        for the real production case that showed this: the same column
+        classified two different ways on two runs of the same file)."""
+        cs = col_schema_map.get(col_0based + 1, {})
+        header_text = " ".join(
+            str(h.get("value", "")) for h in cs.get("header_stack", []) if h.get("value")
+        ).lower()
+        return any(kw in header_text for kw in INVENTORY_LABELS)
+
+    column_mapping_list = []
+    for c in col_results:
+        if c.get("classification") == "sales_date":
+            continue
+        classification = c.get("classification")
+        if classification == "inventory" and not _has_inventory_keyword(c["col"]):
+            # AI said inventory, but the header itself has no real
+            # inventory keyword - don't trust the label, fall back to
+            # the safe default rather than risk sales data landing in
+            # the inventory table.
+            classification = "other"
+        column_mapping_list.append({
+            "col":                  c["col"],
+            "classification":       classification,
+            "confidence":           c.get("confidence", "high"),
+            "reason":               c.get("reason", ""),
+            "has_embedded_supplier_sku": (
+                c.get("has_embedded_supplier_sku", False) or
+                col_schema_map.get(c["col"] + 1, {}).get("has_embedded_supplier_sku", False) or
+                col_schema_map.get(c["col"] + 1, {}).get("embedded_postgres_matched", False)
+            ),
+        })
+    session["column_mapping"][sheet_name] = column_mapping_list
+
+    # Post-schema: disqualify if no sales date columns found
+    if len(sales_cols_0based) == 0:
+        session["qualified_sheets"] = [s for s in session["qualified_sheets"] if s != sheet_name]
+        session["qualify_results"][sheet_name] = {
+            "disqualified": True,
+            "reason": "No weekly sales date columns identified after full layout analysis",
+            "source": "post_schema",
+        }
+        session["grid"].pop(sheet_name, None)
+        session["column_mapping"].pop(sheet_name, None)
+
+
 async def stage_schema_classify(session_id: str):
-    """Stage 2c - Pass 1: AI identifies date column pattern per sheet."""
+    """Stage 2c - Pass 1: AI identifies date column pattern per sheet.
+    Sheets are independent, so they run concurrently rather than one
+    after another - see _schema_classify_one_sheet."""
     session = _sessions[session_id]
     session["stage"]  = "locating"
     session["status"] = "running"
@@ -1673,326 +2030,10 @@ async def stage_schema_classify(session_id: str):
                 matched_values.add(v.upper())
     session["_matched_values"] = matched_values
 
-    for sheet_name in session["qualified_sheets"]:
-        schema = session.get("_schemas", {}).get(sheet_name, {})
-        if not schema:
-            session["grid"][sheet_name]           = {"error": "No schema available"}
-            session["column_mapping"][sheet_name] = []
-            continue
-
-        for col in schema.get("columns", []):
-            col["postgres_matched"] = any(
-                str(v).upper() in matched_values for v in col.get("sample_non_zero", [])
-            )
-            embedded_matched = any(
-                ext.get("sku", "").upper() in matched_values
-                for ext in col.get("embedded_sku_extractions", [])
-            )
-            col["embedded_postgres_matched"] = embedded_matched
-            if embedded_matched:
-                col["has_embedded_supplier_sku"] = True
-
-        # Pass 1 - AI identifies date schema pattern
-        try:
-            text        = await call_ai(build_date_schema_prompt(schema, session["filename"]), label="date_schema")
-            clean       = parse_ai_response(text)
-            date_schema = json.loads(clean)
-        except (json.JSONDecodeError, ValueError) as e:
-            date_schema = {"error": f"Parse error: {e}"}
-        except Exception as e:
-            date_schema = {"error": f"AI error: {e}"}
-
-        if "error" in date_schema:
-            session["grid"][sheet_name]           = {"error": date_schema["error"]}
-            session["column_mapping"][sheet_name] = []
-            continue
-
-        # Python enumerates all sales date columns from the pattern
-        sales_cols_1based = find_sales_cols_from_schema(schema, date_schema)
-
-        # Nothing matched a known, approved pattern - before disqualifying,
-        # check whether Python-confirmed sales-shaped DATA exists under
-        # headers that just aren't recognized yet, and escalate only that
-        # residual to AI. The AI's resolution is used to finish processing
-        # THIS file now; the generalized pattern it writes back is stored as
-        # pending_review and does NOT become a trusted match for any other
-        # file (or even a re-run of this same enumeration) until a human
-        # approves it - matching how new retailers are already handled.
-        if not sales_cols_1based:
-            # Reuse a resolution already made at qualify time for this exact
-            # sheet, if one exists - avoids a second AI call and a second
-            # pending_review pattern write for the same header shape within
-            # one file's processing. Qualify-time keys are 0-based (raw row
-            # tuples); this stage's are 1-based (openpyxl/schema convention).
-            qualify_resolved = session.get("_qualify_resolved_dates", {}).get(sheet_name)
-            if qualify_resolved:
-                sales_cols_1based = sorted(c0 + 1 for c0 in qualify_resolved.keys())
-
-        if not sales_cols_1based:
-            shaped_cols = find_sales_shaped_columns(schema)
-            if shaped_cols:
-                # NOT detect_date_axis_row() here - its fallback (row 1) fires
-                # exactly when no header matches a known pattern, which is
-                # precisely this situation. find_probable_header_row() finds
-                # the label row structurally, independent of pattern matching.
-                header_row_probe      = find_probable_header_row(schema, shaped_cols)
-                col_schema_map_probe = {c["col"]: c for c in schema.get("columns", [])}
-                unresolved = []
-                for col_1 in shaped_cols:
-                    cs = col_schema_map_probe.get(col_1, {})
-                    header_val = ""
-                    for h in cs.get("header_stack", []):
-                        if h["row"] == header_row_probe:
-                            header_val = h["value"]
-                            break
-                    if header_val and not match_known_patterns(header_val):
-                        unresolved.append((col_1, header_val))
-
-                if unresolved:
-                    newly_resolved, trusted_dates = await resolve_unrecognized_dates(
-                        unresolved, session["filename"], session.get("retailer")
-                    )
-                    if newly_resolved:
-                        sales_cols_1based = sorted(newly_resolved.keys())
-                        # date_cols/resolved_dates use 0-based indexing
-                        # (matching sales_cols_0based below) - this
-                        # escalation path works in 1-based (schema/openpyxl
-                        # convention), so convert before merging.
-                        if trusted_dates:
-                            session.setdefault("_trusted_resolved_dates", {}).setdefault(
-                                sheet_name, {}
-                            ).update({c1 - 1: d for c1, d in trusted_dates.items()})
-                        session.setdefault("flags", {})["new_date_pattern_discovered"] = (
-                            f"{len(newly_resolved)} column(s) resolved via AI for this file - "
-                            f"pattern(s) written to date_format_patterns as pending_review, "
-                            f"needs human approval before automatic reuse on other files"
-                        )
-
-        sales_cols_0based = [c - 1 for c in sales_cols_1based]
-
-        session.setdefault("_date_schemas", {})[sheet_name] = date_schema
-        session.setdefault("_sales_cols",   {})[sheet_name] = sales_cols_0based
-
-        # Pass 2 - AI classifies non-date columns
-        try:
-            text   = await call_ai(build_column_classify_prompt(schema, session["filename"],
-                                                                  sales_cols_1based, matched_values), label="column_classify")
-            clean  = parse_ai_response(text)
-            result = json.loads(clean)
-        except (json.JSONDecodeError, ValueError) as e:
-            result = {"error": f"Parse error: {e}"}
-        except Exception as e:
-            result = {"error": f"AI error: {e}"}
-
-        if "error" in result:
-            session["grid"][sheet_name]           = {"error": result["error"]}
-            session["column_mapping"][sheet_name] = []
-            continue
-
-        col_results   = result.get("columns", [])
-        col_results   = [{**c, "col": c["col"] - 1} for c in col_results]
-
-        data_start    = schema["data_start_row"]               # Python
-        # NOT detect_date_axis_row() here either - same reason as the
-        # escalation path above: its fallback (row 1) fires precisely when
-        # headers don't match an ACTIVE pattern, which is exactly the case
-        # for a format discovered THIS run (still pending_review) or one
-        # whose header-row detection otherwise fails. That silently pointed
-        # ingestion at the wrong row (often a title row) for any file using
-        # a newly-discovered format - build_date_map would find nothing but
-        # None values there, sales_rows would come back 0, and nothing
-        # would report this as an error. find_probable_header_row() finds
-        # the label row structurally, independent of pattern status,
-        # working correctly for both known and newly-discovered formats.
-        date_axis_row = find_probable_header_row(schema, sales_cols_1based)  # Python (1-based)
-        rows_data     = session["_sheets"].get(sheet_name, [])
-        axis_row_0    = date_axis_row - 1                      # 0-based
-
-        # Detect format and year flags from actual header values
-        axis_row_vals = [
-            rows_data[axis_row_0][c]
-            for c in sales_cols_0based
-            if axis_row_0 < len(rows_data) and c < len(rows_data[axis_row_0])
-            and rows_data[axis_row_0][c] is not None
-        ]
-        formats = set(classify_cell(v) for v in axis_row_vals)
-        date_fmt = list(formats)[0] if len(formats) == 1 else "mixed"
-
-        year_present  = date_fmt == "datetime" or any(
-            YEAR_RE.search(str(v)) for v in axis_row_vals
-        )
-
-        col_schema_map = {c["col"]: c for c in schema["columns"]}
-        sample_vals    = []
-        for col_0 in sorted(sales_cols_0based)[:8]:
-            col_1 = col_0 + 1
-            cs    = col_schema_map.get(col_1, {})
-            for h in cs.get("header_stack", []):
-                if any(ch.isdigit() for ch in h["value"]):
-                    sample_vals.append(h["value"])
-                    break
-
-        # Also grab the last date column value for file_set_key calculation
-        last_sample_val = None
-        if sales_cols_0based:
-            last_col_0 = sorted(sales_cols_0based)[-1]
-            last_col_1 = last_col_0 + 1
-            cs = col_schema_map.get(last_col_1, {})
-            for h in cs.get("header_stack", []):
-                if any(ch.isdigit() for ch in h["value"]):
-                    last_sample_val = h["value"]
-                    break
-
-        # Find last ACTIVE column - last date column with at least one non-zero data value
-        # This is the true latest week for file_set_key, not the last column in the sheet
-        last_active_sample_val = None
-        data_start_0 = data_start - 1  # 0-based
-        for col_0 in sorted(sales_cols_0based, reverse=True):
-            has_data = any(
-                rows_data[r][col_0] not in (None, 0, "", " ")
-                for r in range(data_start_0, min(data_start_0 + 200, len(rows_data)))
-                if col_0 < len(rows_data[r])
-            )
-            if has_data:
-                col_1 = col_0 + 1
-                cs = col_schema_map.get(col_1, {})
-                for h in cs.get("header_stack", []):
-                    if any(ch.isdigit() for ch in h["value"]):
-                        last_active_sample_val = h["value"]
-                        break
-                break
-
-        year_anchors = [
-            {"source": "filename", "value": m.group(1)}
-            for m in YEAR_RE.finditer(session["filename"])
-        ]
-
-        # Detect year boundary from actual month sequence
-        # A boundary exists only when December is followed by January (month drops)
-        # A full-year file (Jan->Dec) contains both months but has no boundary
-        month_seq      = extract_month_sequence(rows_data[axis_row_0] if axis_row_0 < len(rows_data) else [], sales_cols_0based)
-        year_boundary  = False
-        prev_m = None
-        for m in month_seq:
-            if m is None:
-                continue
-            if prev_m is not None and prev_m == 12 and m == 1:
-                year_boundary = True
-                break
-            prev_m = m
-
-        date_axis = {
-            "row":                    axis_row_0,
-            "col_count":              len(sales_cols_0based),
-            "date_col_count":         len(sales_cols_0based),
-            "cols":                   sales_cols_0based,
-            "sample_values":          sample_vals,
-            "last_sample_val":        last_sample_val,
-            "last_active_sample_val": last_active_sample_val,
-            "format":                 date_fmt,
-            "year_present":           year_present,
-            "interleaved_empty_cols": False,
-            "year_boundary_detected": year_boundary,
-        }
-
-        # Store month_sequence if boundary detected
-        if year_boundary:
-            date_axis["month_sequence"] = month_seq
-
-        rows     = session["_sheets"].get(sheet_name, [])
-        embedded = detect_embedded_sku(rows, sales_cols_0based, data_start - 1)
-
-        embedded_by_col = {e["col"]: e for e in embedded}
-        for col in schema.get("columns", []):
-            col_0 = col["col"] - 1
-            if col_0 in embedded_by_col:
-                col["embedded_sku_extractions"] = embedded_by_col[col_0]["extractions"]
-                col["has_embedded_supplier_sku"] = True
-
-        sku_candidates = []
-        for c in col_results:
-            col_0 = c["col"]
-            col_1 = col_0 + 1
-            cs    = col_schema_map.get(col_1, {})
-            pre_strings = [
-                {"row": h["row"] - 1, "value": h["value"]}
-                for h in cs.get("header_stack", [])
-            ]
-            col_vals = [
-                rows[r][col_0]
-                for r in range(data_start - 1, min(data_start + 49, len(rows)))
-                if col_0 < len(rows[r]) and rows[r][col_0] is not None
-            ]
-            types   = {}
-            for v in col_vals:
-                t = classify_cell(v)
-                types[t] = types.get(t, 0) + 1
-            dominant = max(types, key=types.get) if types else "string"
-            sku_candidates.append({
-                "col":              col_0,
-                "pre_data_strings": pre_strings,
-                "dominant_type":    dominant,
-                "type_distribution": types,
-                "fill_rate":        round(len(col_vals) / 50, 2),
-                "sample_values":    [str(v) for v in col_vals[:5]],
-            })
-
-        session["grid"][sheet_name] = {
-            "date_axis":      date_axis,
-            "data_start_row": data_start - 1,
-            "sku_candidates": sku_candidates,
-            "embedded_sku":   embedded,
-            "year_anchors":   year_anchors[:6],
-        }
-
-        def _has_inventory_keyword(col_0based: int) -> bool:
-            """Does this column's own header text actually contain a real
-            inventory keyword? Used to gate the "inventory" classification -
-            AI's free-form reasoning about what a column "represents" isn't
-            reliable enough on its own for a label that determines which
-            TABLE data gets written into (see INVENTORY_LABELS's docstring
-            for the real production case that showed this: the same column
-            classified two different ways on two runs of the same file)."""
-            cs = col_schema_map.get(col_0based + 1, {})
-            header_text = " ".join(
-                str(h.get("value", "")) for h in cs.get("header_stack", []) if h.get("value")
-            ).lower()
-            return any(kw in header_text for kw in INVENTORY_LABELS)
-
-        column_mapping_list = []
-        for c in col_results:
-            if c.get("classification") == "sales_date":
-                continue
-            classification = c.get("classification")
-            if classification == "inventory" and not _has_inventory_keyword(c["col"]):
-                # AI said inventory, but the header itself has no real
-                # inventory keyword - don't trust the label, fall back to
-                # the safe default rather than risk sales data landing in
-                # the inventory table.
-                classification = "other"
-            column_mapping_list.append({
-                "col":                  c["col"],
-                "classification":       classification,
-                "confidence":           c.get("confidence", "high"),
-                "reason":               c.get("reason", ""),
-                "has_embedded_supplier_sku": (
-                    c.get("has_embedded_supplier_sku", False) or
-                    col_schema_map.get(c["col"] + 1, {}).get("has_embedded_supplier_sku", False) or
-                    col_schema_map.get(c["col"] + 1, {}).get("embedded_postgres_matched", False)
-                ),
-            })
-        session["column_mapping"][sheet_name] = column_mapping_list
-
-        # Post-schema: disqualify if no sales date columns found
-        if len(sales_cols_0based) == 0:
-            session["qualified_sheets"] = [s for s in session["qualified_sheets"] if s != sheet_name]
-            session["qualify_results"][sheet_name] = {
-                "disqualified": True,
-                "reason": "No weekly sales date columns identified after full layout analysis",
-                "source": "post_schema",
-            }
-            session["grid"].pop(sheet_name, None)
-            session["column_mapping"].pop(sheet_name, None)
+    await asyncio.gather(*[
+        _schema_classify_one_sheet(session, sheet_name, matched_values)
+        for sheet_name in session["qualified_sheets"]
+    ])
 
     if not session["qualified_sheets"]:
         file_audit_id = session.get("file_audit_id")
@@ -2161,100 +2202,119 @@ def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
             dc["inventory_as_of_date"] = latest
 
 
+async def _date_config_one_sheet(session: dict, sheet_name: str):
+    """
+    Everything stage_date_config used to do inline, per sheet, in a
+    sequential for-loop - now a standalone coroutine so multiple sheets
+    can run concurrently via asyncio.gather instead of one after another.
+
+    Safe to parallelize: cross_sheet_anchors below only READS other
+    sheets' year_anchors, which are fully populated by stage_schema_classify
+    (a prior stage that has completely finished, for every sheet, before
+    this stage even begins) - nothing in this stage writes year_anchors,
+    so there's no race between sheets reading each other's data here.
+    """
+    grid      = session["grid"].get(sheet_name, {})
+    date_axis = grid.get("date_axis", {})
+    anchors   = grid.get("year_anchors", [])
+
+    if not date_axis:
+        session["date_config"][sheet_name] = {"error": "No date axis"}
+        return
+
+    if date_axis.get("year_present"):
+        year_value = None
+        for a in anchors:
+            y = str(a.get("value", ""))[:4]
+            if y.isdigit():
+                year_value = int(y)
+                break
+        if not year_value:
+            for sample in date_axis.get("sample_values", []):
+                parts = str(sample).replace("-", "/").split("/")
+                if len(parts) >= 3:
+                    y = parts[-1].strip()[:4]
+                    if y.isdigit():
+                        yr = int(y)
+                        year_value = 2000 + yr if yr < 100 else yr
+                        break
+        year_boundary = date_axis.get("year_boundary_detected", False)
+        month_seq     = date_axis.get("month_sequence", [])
+        year_start    = compute_year_start(month_seq, year_value) if year_boundary and month_seq else year_value
+        session["date_config"][sheet_name] = {
+            "date_format":             date_axis["format"],
+            "year_present":            True,
+            "year_value":              year_value,
+            "year_start":              year_start,
+            "year_inference_strategy": "embedded_in_dates",
+            "year_boundary_detected":  year_boundary,
+            "normalize_to":            "week_ending_saturday",
+            "source":                  "python",
+            "date_axis_row":           date_axis.get("row", 0),
+            "date_cols":               date_axis.get("cols", []),
+            "data_start_row":          grid.get("data_start_row", 1),
+            # Seed with whatever the qualify/escalation stages already
+            # trusted - _finalize_date_config below computes the
+            # COMPLETE map (every date column, not just this subset)
+            # and overwrites this with the full result.
+            "resolved_dates": {
+                str(k): v for k, v in
+                session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
+            },
+        }
+        _finalize_date_config(session, sheet_name, session["date_config"][sheet_name])
+        return
+
+    cross_sheet_anchors = [
+        a for other in session["qualified_sheets"] if other != sheet_name
+        for a in session["grid"].get(other, {}).get("year_anchors", [])
+    ]
+
+    year_boundary  = date_axis.get("year_boundary_detected", False)
+    month_sequence = date_axis.get("month_sequence", [])
+
+    try:
+        text   = await call_ai(build_date_prompt(date_axis, anchors, sheet_name,
+                                                  filename=session["filename"],
+                                                  cross_sheet_anchors=cross_sheet_anchors), label="date_config")
+        clean  = parse_ai_response(text)
+        result = json.loads(clean)
+    except (json.JSONDecodeError, ValueError) as e:
+        result = {"error": f"Parse error: {e}"}
+    except Exception as e:
+        result = {"error": f"AI error: {e}"}
+
+    year_value = result.get("year_value", date.today().year)
+    year_start = compute_year_start(month_sequence, year_value) if year_boundary and month_sequence else year_value
+
+    result["normalize_to"]           = "week_ending_saturday"
+    result["source"]                 = "ai"
+    result["year_boundary_detected"] = year_boundary
+    result["year_value"]             = year_value
+    result["year_start"]             = year_start
+    result["date_axis_row"]          = date_axis.get("row", 0)
+    result["date_cols"]              = date_axis.get("cols", [])
+    result["data_start_row"]         = grid.get("data_start_row", 1)
+    result["resolved_dates"] = {
+        str(k): v for k, v in
+        session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
+    }
+    session["date_config"][sheet_name] = result
+    _finalize_date_config(session, sheet_name, session["date_config"][sheet_name])
+
+
 async def stage_date_config(session_id: str):
-    """Stage 4 - date config. Pure Python, AI only if year ambiguous."""
+    """Stage 4 - date config. Pure Python, AI only if year ambiguous.
+    Sheets are independent, so they run concurrently rather than one
+    after another - see _date_config_one_sheet."""
     session = _sessions[session_id]
     session["stage"]  = "dating"
     session["status"] = "running"
 
-    for sheet_name in session["qualified_sheets"]:
-        grid      = session["grid"].get(sheet_name, {})
-        date_axis = grid.get("date_axis", {})
-        anchors   = grid.get("year_anchors", [])
-
-        if not date_axis:
-            session["date_config"][sheet_name] = {"error": "No date axis"}
-            continue
-
-        if date_axis.get("year_present"):
-            year_value = None
-            for a in anchors:
-                y = str(a.get("value", ""))[:4]
-                if y.isdigit():
-                    year_value = int(y)
-                    break
-            if not year_value:
-                for sample in date_axis.get("sample_values", []):
-                    parts = str(sample).replace("-", "/").split("/")
-                    if len(parts) >= 3:
-                        y = parts[-1].strip()[:4]
-                        if y.isdigit():
-                            yr = int(y)
-                            year_value = 2000 + yr if yr < 100 else yr
-                            break
-            year_boundary = date_axis.get("year_boundary_detected", False)
-            month_seq     = date_axis.get("month_sequence", [])
-            year_start    = compute_year_start(month_seq, year_value) if year_boundary and month_seq else year_value
-            session["date_config"][sheet_name] = {
-                "date_format":             date_axis["format"],
-                "year_present":            True,
-                "year_value":              year_value,
-                "year_start":              year_start,
-                "year_inference_strategy": "embedded_in_dates",
-                "year_boundary_detected":  year_boundary,
-                "normalize_to":            "week_ending_saturday",
-                "source":                  "python",
-                "date_axis_row":           date_axis.get("row", 0),
-                "date_cols":               date_axis.get("cols", []),
-                "data_start_row":          grid.get("data_start_row", 1),
-                # Seed with whatever the qualify/escalation stages already
-                # trusted - _finalize_date_config below computes the
-                # COMPLETE map (every date column, not just this subset)
-                # and overwrites this with the full result.
-                "resolved_dates": {
-                    str(k): v for k, v in
-                    session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
-                },
-            }
-            _finalize_date_config(session, sheet_name, session["date_config"][sheet_name])
-            continue
-
-        cross_sheet_anchors = [
-            a for other in session["qualified_sheets"] if other != sheet_name
-            for a in session["grid"].get(other, {}).get("year_anchors", [])
-        ]
-
-        year_boundary  = date_axis.get("year_boundary_detected", False)
-        month_sequence = date_axis.get("month_sequence", [])
-
-        try:
-            text   = await call_ai(build_date_prompt(date_axis, anchors, sheet_name,
-                                                      filename=session["filename"],
-                                                      cross_sheet_anchors=cross_sheet_anchors), label="date_config")
-            clean  = parse_ai_response(text)
-            result = json.loads(clean)
-        except (json.JSONDecodeError, ValueError) as e:
-            result = {"error": f"Parse error: {e}"}
-        except Exception as e:
-            result = {"error": f"AI error: {e}"}
-
-        year_value = result.get("year_value", date.today().year)
-        year_start = compute_year_start(month_sequence, year_value) if year_boundary and month_sequence else year_value
-
-        result["normalize_to"]           = "week_ending_saturday"
-        result["source"]                 = "ai"
-        result["year_boundary_detected"] = year_boundary
-        result["year_value"]             = year_value
-        result["year_start"]             = year_start
-        result["date_axis_row"]          = date_axis.get("row", 0)
-        result["date_cols"]              = date_axis.get("cols", [])
-        result["data_start_row"]         = grid.get("data_start_row", 1)
-        result["resolved_dates"] = {
-            str(k): v for k, v in
-            session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
-        }
-        session["date_config"][sheet_name] = result
-        _finalize_date_config(session, sheet_name, session["date_config"][sheet_name])
+    await asyncio.gather(*[
+        _date_config_one_sheet(session, sheet_name)
+        for sheet_name in session["qualified_sheets"]
+    ])
 
     await stage_multisheet(session_id)
 
