@@ -536,28 +536,102 @@ async def cleanup_stale_jobs():
             _sessions.pop(sid, None)
 
 
+def build_select_stale_analyzing_sql() -> str:
+    """
+    Find file_audit rows stuck in 'analyzing' past the timeout, for the
+    sweep to INSPECT before failing them - not a blind UPDATE. A stuck
+    row's in-memory session lives in the SAME process as this sweep, and
+    is often still alive and running (just slow, not crashed) - a blind
+    SQL-only UPDATE would silently discard the real diagnostic info sitting
+    right there: which stage it's on, how much progress it's made, any
+    errors already accumulated.
+    """
+    return f"""
+SELECT id, filename
+FROM file_audit
+WHERE status = 'analyzing'
+  AND updated_at < now() - INTERVAL '{SESSION_TIMEOUT_SECONDS} seconds'
+""".strip()
+
+
+def build_sweep_fail_row_sql(file_audit_id: str, note: str) -> str:
+    """Fail one stale row with a SPECIFIC diagnostic note - which stage it
+    was on, what had completed, any errors seen - instead of the old
+    generic 'likely crashed' text, which told a human nothing actionable
+    and was often simply wrong (the process can be alive and still stuck)."""
+    safe_id   = _validate_uuid(file_audit_id)
+    safe_note = _sql_escape(note)
+    return f"""
+UPDATE file_audit
+SET status = 'failed',
+    notes  = COALESCE(notes || E'\\n', '') || '{safe_note}',
+    updated_at = now()
+WHERE id = '{safe_id}'
+""".strip()
+
+
 async def sweep_stale_analyzing_rows():
     """
     Recover file_audit rows stuck in 'analyzing'. A row enters this state
-    the moment /analyze claims it (see build_claim_file_audit_sql) and should
-    leave it within minutes under normal discovery runtimes. If a row has
-    sat in 'analyzing' longer than SESSION_TIMEOUT_SECONDS, the process that
-    claimed it almost certainly crashed or was killed before finishing —
-    the in-memory session is gone, so this is a pure SQL recovery, not a
-    lookup against _sessions. Moves it to 'failed' so it surfaces through
-    the existing file_audit alerts webhook instead of sitting invisible.
+    the moment /analyze claims it (see build_claim_file_audit_sql) and
+    should leave it within minutes under normal discovery runtimes.
+
+    Before failing a stale row, checks whether its in-memory session (in
+    _sessions - this sweep runs in the SAME process as discovery/ingestion,
+    so a still-running session is genuinely visible here, not something
+    that requires cross-process coordination) is still alive. If so, the
+    failure note records what was ACTUALLY happening: which stage it
+    reached, how many sheets had been processed, and any errors already
+    seen - not a guess. This is exactly the gap a real incident exposed:
+    a session can be legitimately slow (not crashed) and the row still
+    looks identical to Postgres either way - only the in-memory state
+    tells the two apart.
+
+    Falls back to the old generic note only when no matching in-memory
+    session exists - meaning the process genuinely did restart since this
+    row was claimed, and there's nothing more specific left to say.
     """
     while True:
         await asyncio.sleep(60)
         try:
-            await call_postgres(f"""
-UPDATE file_audit
-SET status = 'failed',
-    notes  = COALESCE(notes || E'\\n', '') || 'Auto-failed: stuck in analyzing past {SESSION_TIMEOUT_SECONDS}s — discovery process likely crashed',
-    updated_at = now()
-WHERE status = 'analyzing'
-  AND updated_at < now() - INTERVAL '{SESSION_TIMEOUT_SECONDS} seconds'
-""".strip())
+            stale_rows = await call_postgres(build_select_stale_analyzing_sql())
         except Exception:
-            # Don't let a transient DB error kill the sweep loop itself
-            pass
+            continue
+
+        for row in stale_rows:
+            file_audit_id = row["id"]
+            note = None
+
+            # Matches discovery's session["file_audit_id"] (singular) or
+            # ingestion's session["file_audit_ids"] (plural - one session
+            # can cover several files at once).
+            for session in list(_sessions.values()):
+                matches = (
+                    session.get("file_audit_id") == file_audit_id
+                    or file_audit_id in (session.get("file_audit_ids") or [])
+                )
+                if matches:
+                    stage           = session.get("stage", "unknown")
+                    qualified_count = len(session.get("qualified_sheets", []) or [])
+                    total_sheets    = len(session.get("_sheets", {}) or {})
+                    recent_errors   = (session.get("errors") or [])[-3:]
+                    note = (
+                        f"Auto-failed: stuck in analyzing past {SESSION_TIMEOUT_SECONDS}s. "
+                        f"Session was still running - last reached stage '{stage}' "
+                        f"({qualified_count}/{total_sheets} sheets qualified so far)."
+                    )
+                    if recent_errors:
+                        note += f" Recent errors: {'; '.join(str(e) for e in recent_errors)}"
+                    break
+
+            if note is None:
+                note = (
+                    f"Auto-failed: stuck in analyzing past {SESSION_TIMEOUT_SECONDS}s — "
+                    f"no matching in-memory session found (process likely restarted "
+                    f"since this row was claimed, so no further detail is available)."
+                )
+
+            try:
+                await call_postgres(build_sweep_fail_row_sql(file_audit_id, note))
+            except Exception:
+                pass  # one row's failure shouldn't stop the rest of the sweep
