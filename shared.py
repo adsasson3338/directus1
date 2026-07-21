@@ -398,6 +398,23 @@ async def call_postgres(sql: str) -> list:
     """Execute SQL and return list of row dicts. Raises on error."""
     conn = await asyncpg.connect(DATABASE_URL)
     try:
+        # asyncpg does NOT parse jsonb/json columns into Python objects by
+        # default - it returns raw JSON text unless a codec is registered
+        # per-connection. Without this, every jsonb column read anywhere in
+        # the system (resolution_rule, discovery_result, resolved_dates,
+        # column_mapping, date_config, ...) comes back as a string, and any
+        # code treating it as an already-parsed dict/list crashes with
+        # exactly this shape of error: "'str' object has no attribute
+        # 'get'". This was never caught in testing because every test in
+        # this codebase mocked call_postgres to return already-parsed
+        # Python dicts directly - a convenience that quietly hid this real
+        # asyncpg behavior until it hit a live database.
+        await conn.set_type_codec(
+            "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+        )
+        await conn.set_type_codec(
+            "json", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+        )
         rows = await conn.fetch(sql)
         return [dict(r) for r in rows]
     finally:
