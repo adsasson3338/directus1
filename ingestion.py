@@ -703,11 +703,18 @@ async def stage_process_files(session_id: str):
     session["stage"]  = "processing"
     session["status"] = "running"
 
-    # Load the shared, approved date-format pattern cache once per run -
-    # match_known_patterns()/compute_date_from_match() (called synchronously
-    # inside _resolve_date, deep in extract_sales_and_inventory below) rely
-    # on this being populated already, same as discovery's stage_qualify.
-    await load_date_patterns()
+    # Force a FRESH reload every ingestion run, not the cached default.
+    # _KNOWN_DATE_PATTERNS is a single, process-wide cache shared with
+    # discovery.py (same running FastAPI app) - once populated, it never
+    # refreshes on its own. A pattern approved via direct SQL (status ->
+    # 'active') between server-start and this run would otherwise be
+    # invisible here: _resolve_date's fallback depends entirely on this
+    # cache, with no fresh check of its own (unlike discovery's escalation
+    # path, which always re-queries fresh for its dedup check) - so a stale
+    # cache here doesn't just cost inefficiency, it SILENTLY drops real
+    # sales data: build_date_map comes back empty, the sheet gets skipped
+    # with no error, and the run reports "complete" with zero rows written.
+    await load_date_patterns(force=True)
 
     audit_rows = session.get("_audit_rows", {})
     if not audit_rows:
