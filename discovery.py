@@ -1124,36 +1124,51 @@ def find_probable_header_row_from_rows(rows: list, candidate_cols: list) -> int:
     return max(row_counts, key=row_counts.get)
 
 
-def build_new_pattern_prompt(shape_examples: list, filename: str) -> str:
+def build_new_pattern_prompt(shape_groups: dict, filename: str) -> str:
     """
-    shape_examples: list of (col_num, header_text) - ONE representative
-    example per DISTINCT header shape among the unresolved residual, not
-    every individual column. AI's job is narrowed to correctly generalizing
-    each distinct shape into a regex WITH capture groups identifying which
-    part is the year/week/month/day - not to state what any one example
-    means. Python computes the actual date for every matched column itself
-    (see compute_date_from_match), using those capture groups against each
-    column's OWN header text - so every column gets its own genuinely
-    correct date, not a copy of whatever the one example represented.
+    shape_groups: {shape_key: [(col_num, header_text), ...]} - a FEW
+    examples per DISTINCT header shape (spanning the range seen, not just
+    one), not every individual column. Showing the range matters: a single
+    example like "202601 Units" is genuinely ambiguous (01 could be month
+    or week) - only seeing a value like "202652" rules out month. AI's job
+    is narrowed to correctly generalizing each distinct shape into a regex
+    WITH capture groups identifying which part is the year/week/month/day -
+    not to state what any one example means. Python computes the actual
+    date for every matched column itself (see compute_date_from_match),
+    using those capture groups against each column's OWN header text - so
+    every column gets its own genuinely correct date, not a copy of
+    whatever one example represented.
     """
-    header_lines = "\n".join(f"- {repr(h)}" for _, h in shape_examples)
+    group_blocks = []
+    for examples in shape_groups.values():
+        lines = "\n".join(f"  - {repr(h)}" for _, h in examples)
+        group_blocks.append(lines)
+    header_lines = "\n\n".join(group_blocks)
     return f"""You are identifying whether column headers in a sales spreadsheet represent a date or sales period.
 
 File: {filename}
 
 These are examples of DISTINCT header shapes among columns that already contain
 real sales-shaped numeric data (confirmed by Python), but don't match any known
-date format:
+date format. Each group below shows multiple examples of the SAME shape,
+spanning the actual range of values seen - not just one instance:
 
 {header_lines}
 
-For each example that genuinely represents a sales date or period, provide a
+IMPORTANT - a common ambiguity: a 2-digit trailing number could be a MONTH
+(01-12) or a WEEK NUMBER (01-53). Do not assume month by default. Look at the
+actual range of examples shown for each shape - if any value exceeds 12, it
+cannot be a month, and must be a week number (or something else entirely).
+Only conclude "month" if every example you can see is consistent with a
+12-month range AND you have another reason to believe it's monthly data.
+
+For each shape that genuinely represents a sales date or period, provide a
 generalized regex pattern WITH CAPTURE GROUPS marking which part is the year
-and which part is the week number (or month/day, if applicable) - Python will
-use these groups to compute the correct date for every column that matches
-this pattern, not just this one example. Do not just describe what this one
-example means; the year/week must be extractable from ANY matching header via
-the capture groups you provide.
+and which part is the week (or month/day, if applicable) - Python will use
+these groups to compute the correct date for every column that matches this
+pattern, not just the examples shown. Do not just describe what one example
+means; the year/week must be extractable from ANY matching header via the
+capture groups you provide.
 
 Respond with JSON only:
 {{"resolutions": [
@@ -1248,13 +1263,24 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
     if not still_unresolved:
         return resolved, trusted_dates  # everything already covered by a previously-logged pattern - no AI call needed
 
-    shape_examples = {}
+    # Group by shape, keeping a FEW examples spanning the range - not just
+    # the first one seen. A single example is often genuinely ambiguous
+    # (e.g. "202601 Units": 01 could be month or week); seeing the column
+    # with the lowest AND highest index within a shape (columns run in
+    # temporal order in every real file seen so far) gives AI the range it
+    # needs to tell month and week formats apart, rather than defaulting to
+    # whichever is more common in general data (month).
+    shape_groups = {}
     for col, header in still_unresolved:
         shape = normalize_header_shape(header)
-        shape_examples.setdefault(shape, (col, header))
+        shape_groups.setdefault(shape, []).append((col, header))
+    for shape, examples in shape_groups.items():
+        examples.sort(key=lambda ch: ch[0])
+        if len(examples) > 2:
+            shape_groups[shape] = [examples[0], examples[-1]]
 
     try:
-        text   = await call_ai(build_new_pattern_prompt(list(shape_examples.values()), filename), label="new_date_pattern")
+        text   = await call_ai(build_new_pattern_prompt(shape_groups, filename), label="new_date_pattern")
         clean  = parse_ai_response(text)
         result = json.loads(clean)
     except (json.JSONDecodeError, ValueError):
