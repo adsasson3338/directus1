@@ -24,6 +24,7 @@ from shared import (
     load_date_patterns, match_known_patterns, normalize_header_shape,
     compute_date_from_match, build_insert_date_pattern_sql,
     build_fetch_existing_patterns_for_dedup_sql,
+    build_date_map, resolve_date_header,
 )
 
 # ---------------------------------------------
@@ -1768,7 +1769,18 @@ async def stage_schema_classify(session_id: str):
         col_results   = [{**c, "col": c["col"] - 1} for c in col_results]
 
         data_start    = schema["data_start_row"]               # Python
-        date_axis_row = detect_date_axis_row(schema)           # Python (1-based)
+        # NOT detect_date_axis_row() here either - same reason as the
+        # escalation path above: its fallback (row 1) fires precisely when
+        # headers don't match an ACTIVE pattern, which is exactly the case
+        # for a format discovered THIS run (still pending_review) or one
+        # whose header-row detection otherwise fails. That silently pointed
+        # ingestion at the wrong row (often a title row) for any file using
+        # a newly-discovered format - build_date_map would find nothing but
+        # None values there, sales_rows would come back 0, and nothing
+        # would report this as an error. find_probable_header_row() finds
+        # the label row structurally, independent of pattern status,
+        # working correctly for both known and newly-discovered formats.
+        date_axis_row = find_probable_header_row(schema, sales_cols_1based)  # Python (1-based)
         rows_data     = session["_sheets"].get(sheet_name, [])
         axis_row_0    = date_axis_row - 1                      # 0-based
 
@@ -2036,6 +2048,61 @@ async def stage_identify_retailer_ai(session_id: str):
     await stage_date_config(session_id)
 
 
+def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
+    """
+    Computes and persists EVERYTHING ingestion needs to resolve dates,
+    so ingestion never has to figure anything out itself - only read this.
+
+    Two things get computed here, both previously computed independently
+    (and inconsistently) by ingestion.py at ingestion time:
+
+    1. resolved_dates: the COMPLETE col_idx -> date mapping for every date
+       column, not just ones from an AI-discovered, already-active pattern
+       (which is all this dict held before this function existed). Calls
+       the same build_date_map() used to live only in ingestion.py, moved
+       to shared.py so discovery can call it once and persist the answer.
+
+    2. inventory_as_of_date: the single most-recent resolvable date found
+       in the inventory column's header rows, if this sheet has one -
+       previously scanned by ingestion at ingestion time using its own
+       _resolve_date() calls.
+
+    Mutates dc in place. Safe to call even if something's missing (no
+    inventory column, no rows) - those cases just leave the corresponding
+    field empty/unset rather than raising.
+    """
+    rows = session.get("_sheets", {}).get(sheet_name, [])
+    axis_row_0 = dc.get("date_axis_row", 0)
+    header_row = rows[axis_row_0] if axis_row_0 < len(rows) else ()
+
+    try:
+        complete_map = build_date_map(header_row, dc.get("date_cols", []), dc)
+        dc["resolved_dates"] = {str(k): v.isoformat() for k, v in complete_map.items()}
+    except Exception as e:
+        dc.setdefault("resolved_dates", {})
+        session.setdefault("errors", []).append(f"resolved_dates computation failed for '{sheet_name}': {e}")
+
+    inventory_col = next(
+        (c.get("col") for c in session.get("column_mapping", {}).get(sheet_name, [])
+         if c.get("classification") == "inventory"),
+        None,
+    )
+    if inventory_col is not None:
+        data_start = dc.get("data_start_row", 1)
+        year_value = dc.get("year_value", date.today().year)
+        latest = None
+        for hrow_idx in range(min(data_start, len(rows))):
+            if inventory_col < len(rows[hrow_idx]) and rows[hrow_idx][inventory_col]:
+                try:
+                    parsed = resolve_date_header(str(rows[hrow_idx][inventory_col]).strip(), year_value)
+                except Exception:
+                    parsed = None
+                if parsed and (latest is None or str(parsed) > latest):
+                    latest = str(parsed)
+        if latest:
+            dc["inventory_as_of_date"] = latest
+
+
 async def stage_date_config(session_id: str):
     """Stage 4 - date config. Pure Python, AI only if year ambiguous."""
     session = _sessions[session_id]
@@ -2082,16 +2149,16 @@ async def stage_date_config(session_id: str):
                 "date_axis_row":           date_axis.get("row", 0),
                 "date_cols":               date_axis.get("cols", []),
                 "data_start_row":          grid.get("data_start_row", 1),
-                # Per-column dates already computed by discovery for any
-                # AI-discovered format backed by an ALREADY-ACTIVE pattern -
-                # ingestion reads these directly instead of recomputing them.
-                # Deliberately excludes columns from a pattern discovered
-                # THIS run (still pending_review) - see resolve_unrecognized_dates.
+                # Seed with whatever the qualify/escalation stages already
+                # trusted - _finalize_date_config below computes the
+                # COMPLETE map (every date column, not just this subset)
+                # and overwrites this with the full result.
                 "resolved_dates": {
                     str(k): v for k, v in
                     session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
                 },
             }
+            _finalize_date_config(session, sheet_name, session["date_config"][sheet_name])
             continue
 
         cross_sheet_anchors = [
@@ -2129,6 +2196,7 @@ async def stage_date_config(session_id: str):
             session.get("_trusted_resolved_dates", {}).get(sheet_name, {}).items()
         }
         session["date_config"][sheet_name] = result
+        _finalize_date_config(session, sheet_name, session["date_config"][sheet_name])
 
     await stage_multisheet(session_id)
 
