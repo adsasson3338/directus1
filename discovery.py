@@ -25,6 +25,7 @@ from shared import (
     compute_date_from_match, build_insert_date_pattern_sql,
     build_fetch_existing_patterns_for_dedup_sql,
     build_date_map, resolve_date_header,
+    build_sweep_fail_row_sql,
 )
 
 # ---------------------------------------------
@@ -2423,7 +2424,27 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
             config_sql = build_insert_retailer_config_sql(retailer)
             await call_postgres(config_sql)
     except Exception as e:
-        session["errors"].append(f"Failed to write audit/config: {e}")
+        # Capture the exception TYPE, not just its string - "payload string
+        # too long" means something very different from an asyncpg driver
+        # exception versus a plain Python ValueError, and the bare message
+        # alone doesn't distinguish them. Also measure the ACTUAL SQL size
+        # that was sent, not an estimate - real evidence, not a guess, for
+        # whoever looks at this next.
+        sql_size_bytes = len(sql.encode("utf-8"))
+        detailed = f"Failed to write audit/config: [{type(e).__name__}] {e} (SQL was {sql_size_bytes} bytes)"
+        session["errors"].append(detailed)
+
+        # If the full write failed, the row is otherwise left exactly as it
+        # was before this stage ran (usually still 'analyzing') - silent
+        # and invisible until the sweep eventually catches it, minutes
+        # later, with none of this detail. Attempt a minimal, small
+        # fallback write instead: just status + a diagnostic note, no large
+        # JSONB payload - so the row becomes visibly failed immediately,
+        # with the real reason, rather than sitting stuck.
+        try:
+            await call_postgres(build_sweep_fail_row_sql(file_audit_id, detailed))
+        except Exception:
+            pass  # if even the minimal write fails, the sweep is still the last resort
 
     await stage_assemble(session_id)
 
