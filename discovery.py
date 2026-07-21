@@ -472,11 +472,23 @@ Respond with JSON only:
 
 
 def build_dedup_check_sql(file_hash: str) -> str:
-    """Check if this file has already been seen - any status means duplicate."""
+    """
+    Check if this file has already been seen - genuinely successful or
+    still-in-progress statuses count as a duplicate; 'failed' does not.
+
+    A file that previously failed is exactly the case where a retry
+    should be ALLOWED, not blocked - treating a failed prior attempt as
+    "already handled" (the old behavior: any status at all counted as a
+    match) meant a file that got stuck and failed once could never be
+    resubmitted at all, even after a human reset its own row back to
+    'received' - a brand new submission would still find the OLD failed
+    row under the same hash and skip before even trying.
+    """
     return f"""
 SELECT id, status, filename
 FROM file_audit
 WHERE file_hash = '{file_hash}'
+  AND status != 'failed'
 LIMIT 1
 """.strip()
 
