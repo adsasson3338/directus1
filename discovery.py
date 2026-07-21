@@ -717,14 +717,23 @@ def build_update_file_audit_full_sql(file_audit_id: str, discovery_result: dict,
                                       retailer: str | None, status: str,
                                       file_set_key: str | None,
                                       file_hash: str | None = None,
-                                      filename: str | None = None) -> str:
+                                      filename: str | None = None,
+                                      resolved_dates: dict | None = None) -> str:
     """Update file_audit - writes discovery_result plus dedicated columns for easy querying."""
     result_b64 = base64.b64encode(json.dumps(discovery_result, ensure_ascii=False).encode()).decode()
 
-    # Extract the three dedicated columns directly
+    # Extract the dedicated columns directly
     qs_b64 = base64.b64encode(json.dumps(discovery_result.get("qualified_sheets", []), ensure_ascii=False).encode()).decode()
     cm_b64 = base64.b64encode(json.dumps(discovery_result.get("column_mapping",   {}), ensure_ascii=False).encode()).decode()
     dc_b64 = base64.b64encode(json.dumps(discovery_result.get("date_config",      {}), ensure_ascii=False).encode()).decode()
+    # resolved_dates lives ONLY here, a plain top-level column - never
+    # duplicated inside discovery_result/date_config's nested JSON. Kept
+    # flat and minimal on purpose: {"Sheet1": {"5": "2026-01-03", ...}},
+    # nothing else - not year_start/week_convention/inference strategy/etc,
+    # which stay in date_config where they belong. This is the one field
+    # with a simple, checkable invariant (its count should match date_cols'
+    # count), which is exactly what made it worth pulling out on its own.
+    rd_b64 = base64.b64encode(json.dumps(resolved_dates or {}, ensure_ascii=False).encode()).decode()
 
     retailer_val = f"'{sql_escape(retailer)}'" if retailer else "NULL"
     key_val      = f"'{sql_escape(file_set_key)}'" if file_set_key else "NULL"
@@ -737,6 +746,7 @@ SET discovery_result = convert_from(decode('{result_b64}', 'base64'), 'UTF8')::j
     qualified_sheets = convert_from(decode('{qs_b64}', 'base64'), 'UTF8')::jsonb,
     column_mapping   = convert_from(decode('{cm_b64}', 'base64'), 'UTF8')::jsonb,
     date_config      = convert_from(decode('{dc_b64}', 'base64'), 'UTF8')::jsonb,
+    resolved_dates   = convert_from(decode('{rd_b64}', 'base64'), 'UTF8')::jsonb,
     retailer         = {retailer_val},
     status           = '{status}',
     file_set_key     = {key_val},
@@ -2050,26 +2060,33 @@ async def stage_identify_retailer_ai(session_id: str):
 
 def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
     """
-    Computes and persists EVERYTHING ingestion needs to resolve dates,
-    so ingestion never has to figure anything out itself - only read this.
+    Computes everything ingestion needs to resolve dates, so ingestion
+    never has to figure anything out itself - only read this.
 
     Two things get computed here, both previously computed independently
     (and inconsistently) by ingestion.py at ingestion time:
 
     1. resolved_dates: the COMPLETE col_idx -> date mapping for every date
-       column, not just ones from an AI-discovered, already-active pattern
-       (which is all this dict held before this function existed). Calls
-       the same build_date_map() used to live only in ingestion.py, moved
-       to shared.py so discovery can call it once and persist the answer.
+       column, not just ones from an AI-discovered, already-active pattern.
+       Calls the same build_date_map() used to live only in ingestion.py,
+       moved to shared.py so discovery can call it once and persist the
+       answer. Stored at session["_final_resolved_dates"][sheet_name] -
+       NOT inside dc/date_config - since it now lives in its own dedicated
+       file_audit.resolved_dates column, kept in exactly one place rather
+       than duplicated between a JSON sub-field and a top-level column.
+       dc still carries a SEED value (from the qualify/escalation stages'
+       already-trusted subset) for build_date_map's own internal fast path,
+       but that seed is consumed here, not re-persisted back into dc.
 
     2. inventory_as_of_date: the single most-recent resolvable date found
        in the inventory column's header rows, if this sheet has one -
        previously scanned by ingestion at ingestion time using its own
-       _resolve_date() calls.
+       _resolve_date() calls. This one stays in date_config since it's a
+       single scalar, not the thing that caused today's duplication problem.
 
-    Mutates dc in place. Safe to call even if something's missing (no
-    inventory column, no rows) - those cases just leave the corresponding
-    field empty/unset rather than raising.
+    Safe to call even if something's missing (no inventory column, no
+    rows) - those cases just leave the corresponding field empty/unset
+    rather than raising.
     """
     rows = session.get("_sheets", {}).get(sheet_name, [])
     axis_row_0 = dc.get("date_axis_row", 0)
@@ -2077,10 +2094,15 @@ def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
 
     try:
         complete_map = build_date_map(header_row, dc.get("date_cols", []), dc)
-        dc["resolved_dates"] = {str(k): v.isoformat() for k, v in complete_map.items()}
+        session.setdefault("_final_resolved_dates", {})[sheet_name] = {
+            str(k): v.isoformat() for k, v in complete_map.items()
+        }
     except Exception as e:
-        dc.setdefault("resolved_dates", {})
+        session.setdefault("_final_resolved_dates", {}).setdefault(sheet_name, {})
         session.setdefault("errors", []).append(f"resolved_dates computation failed for '{sheet_name}': {e}")
+    # This dict was only ever a seed for build_date_map's fast path - the
+    # complete result lives at the session level now, not back in dc.
+    dc.pop("resolved_dates", None)
 
     inventory_col = next(
         (c.get("col") for c in session.get("column_mapping", {}).get(sheet_name, [])
@@ -2278,6 +2300,7 @@ async def stage_finalize_audit(session_id: str, file_set_size: int = 1):
     sql = build_update_file_audit_full_sql(
         file_audit_id, result, retailer, audit_status, file_set_key,
         file_hash=session.get("file_hash"), filename=session.get("filename"),
+        resolved_dates=session.get("_final_resolved_dates", {}),
     )
     try:
         await call_postgres(sql)
