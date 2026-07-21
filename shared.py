@@ -10,7 +10,8 @@ import base64
 import asyncio
 import urllib.request
 import uuid
-from datetime import date, timedelta
+from datetime import datetime, date, timedelta
+from typing import Optional
 
 import asyncpg
 import httpx
@@ -195,6 +196,193 @@ def compute_date_from_match(match: "re.Match", resolution_rule: dict) -> str | N
     except (KeyError, ValueError, IndexError, Exception):
         return None
     return None
+
+
+# ─────────────────────────────────────────────
+# DATE HEADER RESOLUTION (moved here from ingestion.py)
+# ─────────────────────────────────────────────
+# This whole algorithm used to live only in ingestion.py, called at
+# ingestion time to figure out which date each column header represents.
+# That meant ingestion was independently RE-DERIVING something discovery
+# had already worked out (or should have) - and every time that derivation
+# used a different piece of state than what discovery actually computed
+# (a stale pattern cache, the wrong header row), it silently produced
+# wrong or empty results with no error, because "figure out the date" and
+# "use the date" were never actually the same, verified computation.
+#
+# Discovery now calls build_date_map() itself (see stage_date_config) and
+# persists the COMPLETE result into date_config[sheet]["resolved_dates"] -
+# every date column, not just ones from newly-discovered patterns.
+# Ingestion no longer calls anything here at all; it only reads that
+# persisted dict. This function stays here as the one place this logic is
+# implemented, used by discovery to compute it once.
+
+MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+}
+
+
+def extract_leading_month(val) -> Optional[int]:
+    """
+    Extract the tracking month from a date header — used to detect year
+    rollovers via monotonic sequence. For date ranges we use the END month
+    since that's what gets resolved as the actual date. For all other formats
+    we use the leading/only month.
+    """
+    if isinstance(val, datetime):
+        return val.month
+    if isinstance(val, date):
+        return val.month
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
+        try:
+            return int(s[5:7])
+        except (ValueError, IndexError):
+            return None
+    m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
+    if m:
+        return int(m.group(3))
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
+    if m:
+        return int(m.group(1))
+    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', s, re.IGNORECASE)
+    if m:
+        return MONTH_MAP[m.group(1).lower()[:3]]
+    return None
+
+
+def resolve_date_header(val, year: int) -> Optional[date]:
+    """
+    Resolve a single date header value to a week-ending Saturday,
+    given an already-determined year. No year logic here — year is
+    passed in from build_date_map which owns that decision.
+    """
+    if isinstance(val, datetime):
+        return normalize_to_saturday(val.date())
+    if isinstance(val, date):
+        return normalize_to_saturday(val)
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
+        try:
+            return normalize_to_saturday(datetime.strptime(s[:10], "%Y-%m-%d").date())
+        except (ValueError, OverflowError):
+            return None
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
+    if m:
+        mm, dd, yy = int(m.group(1)), int(m.group(2)), m.group(3)
+        yyyy = int(yy) if len(yy) == 4 else (2000 + int(yy))
+        try:
+            return normalize_to_saturday(date(yyyy, mm, dd))
+        except (ValueError, OverflowError):
+            return None
+    m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
+    if m:
+        end_month, end_day = int(m.group(3)), int(m.group(4))
+        try:
+            return date(year, end_month, end_day)
+        except (ValueError, OverflowError):
+            return None
+    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$', s, re.IGNORECASE)
+    if m:
+        month_num = MONTH_MAP[m.group(1).lower()[:3]]
+        week_num  = int(m.group(2))
+        try:
+            first_of_month = date(year, month_num, 1)
+            approx = first_of_month + timedelta(days=(week_num - 1) * 7)
+            return normalize_to_saturday(approx)
+        except (ValueError, OverflowError):
+            return None
+
+    match = match_known_patterns(s)
+    if match:
+        m2 = re.match(match["pattern_regex"], s, re.IGNORECASE)
+        if m2:
+            computed = compute_date_from_match(m2, match.get("resolution_rule", {}))
+            if computed:
+                try:
+                    return normalize_to_saturday(date.fromisoformat(computed))
+                except (ValueError, OverflowError):
+                    return None
+    return None
+
+
+def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) -> dict:
+    """
+    Build col_idx -> week_ending date mapping for all date columns.
+
+    Year assignment uses the monotonic-sequence rule:
+    - Start from year_value (discovery's determination)
+    - Extract the leading month from each header in sequence
+    - When the month number drops (e.g. Dec→Jan, or Wk4→Wk1 across months),
+      increment the current year
+    - Assign the current year to each column before resolving its date
+
+    For formats with year embedded (datetime objects, "01/04/25" strings,
+    ISO strings, or a pattern-matched format whose capture groups carry
+    their own year), the embedded year takes precedence and the monotonic
+    rule is skipped for that column.
+    """
+    base_year     = date_config.get("year_value", date.today().year)
+    current_year  = date_config.get("year_start", base_year)
+    prev_month    = None
+    date_map      = {}
+
+    resolved_dates = {
+        int(k): v for k, v in date_config.get("resolved_dates", {}).items()
+    }
+
+    for col_idx in date_col_idxs:
+        if col_idx >= len(header_row):
+            continue
+        val = header_row[col_idx]
+        if val is None:
+            continue
+
+        if col_idx in resolved_dates:
+            try:
+                date_map[col_idx] = date.fromisoformat(resolved_dates[col_idx])
+            except (ValueError, TypeError):
+                pass
+            else:
+                prev_month = extract_leading_month(val)
+                continue
+
+        pattern_match = match_known_patterns(val) if isinstance(val, str) else None
+        pattern_groups = (pattern_match or {}).get("resolution_rule", {}).get("capture_groups", {}) or {}
+        has_pattern_embedded_year = pattern_match is not None and "year" in pattern_groups
+        has_embedded_year = (
+            isinstance(val, (datetime, date)) or
+            (isinstance(val, str) and (
+                re.match(r'^\d{4}-\d{2}-\d{2}', val.strip()) or
+                re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', val.strip())
+            )) or
+            has_pattern_embedded_year
+        )
+        if has_embedded_year:
+            resolved = resolve_date_header(val, current_year)
+            if resolved:
+                date_map[col_idx] = resolved
+                prev_month = extract_leading_month(val)
+            continue
+
+        leading_month = extract_leading_month(val)
+        if leading_month is not None and prev_month is not None:
+            if leading_month < prev_month:
+                current_year += 1
+        if leading_month is not None:
+            prev_month = leading_month
+
+        resolved = resolve_date_header(val, current_year)
+        if resolved:
+            date_map[col_idx] = resolved
+
+    return date_map
+
 
 # ─────────────────────────────────────────────
 # SHARED STATE
