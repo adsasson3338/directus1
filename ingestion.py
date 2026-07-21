@@ -377,6 +377,43 @@ WHERE id = '{safe_id}'
 """.strip()
 
 
+async def mark_session_failed(session_id: str, error_message: str, extra_errors: list = None):
+    """
+    The single, consistent way to fail an ingestion session. Updates BOTH
+    the in-memory session state (for anything actively polling this run)
+    AND file_audit's status in Postgres - the persistent record.
+
+    Before this existed, 6 separate failure points across this file only
+    updated the in-memory session dict. That dict is ephemeral - per
+    shared.py's cleanup_stale_jobs, it's evicted SESSION_GRACE_SECONDS after
+    completion/failure. Meanwhile file_audit.status was only ever written
+    on the SUCCESS path (stage_finalize, "ingested"/"ingested_partial") -
+    never on failure. Net effect: a file that failed partway through stayed
+    stuck at whatever status it had before failing (typically 'ingesting')
+    forever, with zero persistent record anything went wrong, once the
+    in-memory session was evicted.
+
+    Best-effort on the Postgres write: if IT fails too, don't let that mask
+    or crash reporting of the ORIGINAL error - the in-memory session update
+    still happens regardless.
+    """
+    session = _sessions[session_id]
+    session["stage"]  = "failed"
+    session["status"] = "failed"
+    session["result"] = {
+        "error": error_message,
+        "errors": extra_errors if extra_errors is not None else session.get("errors", []),
+    }
+
+    for audit_id in session.get("file_audit_ids", []) or []:
+        try:
+            await call_postgres(build_update_audit_status_sql(
+                audit_id, "failed", session.get("unresolved_skus", [])
+            ))
+        except Exception:
+            pass
+
+
 # ─────────────────────────────────────────────
 # CORE INGESTION LOGIC
 # ─────────────────────────────────────────────
@@ -567,9 +604,7 @@ async def _file_fetch_timeout_handler(sid: str, stage: str):
         if session and session.get("_audit_rows") and session.get("_file_bytes"):
             asyncio.create_task(stage_process_files(sid))
         elif session:
-            session["stage"]  = "failed"
-            session["status"] = "failed"
-            session["result"] = {"error": "File fetch timed out", "errors": session.get("errors", [])}
+            await mark_session_failed(sid, "File fetch timed out")
 
 
 class IngestRequest(BaseModel):
@@ -659,9 +694,7 @@ WHERE id = '{_validate_uuid(audit_id)}'
 
     # If all file fetches failed, fail the session
     if not session["_pending_jobs"] and not session.get("_file_bytes"):
-        session["stage"]  = "failed"
-        session["status"] = "failed"
-        session["result"] = {"error": "Failed to fetch any file binaries", "errors": session["errors"]}
+        await mark_session_failed(session_id, "Failed to fetch any file binaries")
 
 
 async def stage_process_files(session_id: str):
@@ -678,16 +711,12 @@ async def stage_process_files(session_id: str):
 
     audit_rows = session.get("_audit_rows", {})
     if not audit_rows:
-        session["stage"]  = "failed"
-        session["status"] = "failed"
-        session["result"] = {"error": "No audit rows found"}
+        await mark_session_failed(session_id, "No audit rows found")
         return
 
     retailers = set(r.get("retailer") for r in audit_rows.values() if r.get("retailer"))
     if not retailers:
-        session["stage"]  = "failed"
-        session["status"] = "failed"
-        session["result"] = {"error": "No retailer identified in audit rows"}
+        await mark_session_failed(session_id, "No retailer identified in audit rows")
         return
 
     retailer = retailers.pop()
@@ -781,39 +810,13 @@ async def stage_lookup_supplier_skus(session_id: str):
         row["retailer_sku"] for row in sales_rows if not row.get("supplier_sku")
     })
 
-    await stage_validate_schema(session_id)
-
-
-async def stage_validate_schema(session_id: str):
-    """Verify the retailer view exists in Postgres before writing."""
-    session   = _sessions[session_id]
-    retailer  = session["retailer"]
-    session["stage"]  = "validating_schema"
-    session["status"] = "running"
-
-    view_name = re.sub(r"[^a-z0-9_]", "_", retailer.lower()) + "_weekly_sales"
-
-    try:
-        rows = await call_postgres(f"""
-SELECT 1 FROM information_schema.views
-WHERE table_schema = 'public'
-  AND table_name = '{_sql_escape(view_name)}'
-""".strip())
-    except Exception as e:
-        session["stage"]  = "failed"
-        session["status"] = "failed"
-        session["result"] = {"error": f"Schema validation failed: {e}", "errors": session.get("errors", [])}
-        return
-
-    if not rows:
-        session["stage"]  = "failed"
-        session["status"] = "failed"
-        session["result"] = {
-            "error": f"View '{view_name}' does not exist — run schema migration before ingesting '{retailer}'",
-            "errors": session.get("errors", []),
-        }
-        return
-
+    # stage_validate_schema used to sit here, checking for a per-retailer
+    # convenience view ("{retailer}_weekly_sales") before allowing writes.
+    # Removed: the actual write (build_upsert_sales_sql) always targets the
+    # single shared weekly_sales table directly - retailer is just a column
+    # value there - so the view's existence had no bearing on whether the
+    # write would succeed. It was blocking valid data on the absence of an
+    # optional reporting convenience the write path never used.
     await stage_write_sales(session_id)
 
 
