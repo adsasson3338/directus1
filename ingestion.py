@@ -218,15 +218,21 @@ def extract_sales_and_inventory(
     wb: openpyxl.Workbook,
     discovery_result: dict,
     retailer: str,
-    file_audit_id: str
+    file_audit_id: str,
+    resolved_dates: dict | None = None,
 ) -> dict:
     """
     Extract sales rows and inventory rows from workbook using discovery result.
     Returns {sales: [...], inventory: [...], unresolved_skus: [...]}
+
+    resolved_dates lives in its own top-level file_audit column now, not
+    nested inside discovery_result/date_config - kept in exactly one place,
+    not duplicated between a JSON sub-field and a dedicated column.
     """
-    column_mapping = discovery_result.get("column_mapping", {})
-    date_config    = discovery_result.get("date_config", {})
+    column_mapping   = discovery_result.get("column_mapping", {})
+    date_config      = discovery_result.get("date_config", {})
     qualified_sheets = discovery_result.get("qualified_sheets", [])
+    resolved_dates   = resolved_dates or {}
 
     # Accumulate sales by (retailer_sku, week_ending) for rollup across sheets
     sales_map      = {}  # (retailer_sku, week_ending) -> units_sold
@@ -287,10 +293,11 @@ def extract_sales_and_inventory(
 
         # Sales date map: a plain read of what discovery already computed
         # and verified - a col_idx string key -> ISO date string dict, one
-        # entry per real date column. No recomputation, no header lookup,
-        # no pattern matching, no year-tracking state.
+        # entry per real date column, sourced from its own dedicated
+        # file_audit.resolved_dates column. No recomputation, no header
+        # lookup, no pattern matching, no year-tracking state.
         date_map = {}
-        for k, v in dc.get("resolved_dates", {}).items():
+        for k, v in resolved_dates.get(sheet_name, {}).items():
             try:
                 date_map[int(k)] = date.fromisoformat(v)
             except (ValueError, TypeError):
@@ -508,6 +515,7 @@ async def stage_process_files(session_id: str):
 
     for audit_id, audit_row in audit_rows.items():
         discovery_result = audit_row.get("discovery_result")
+        resolved_dates   = audit_row.get("resolved_dates") or {}
         data             = file_bytes.get(audit_id)
 
         if not discovery_result:
@@ -523,7 +531,7 @@ async def stage_process_files(session_id: str):
             session["errors"].append(f"Failed to open workbook for {audit_id}: {e}")
             continue
 
-        extracted = extract_sales_and_inventory(wb, discovery_result, retailer, audit_id)
+        extracted = extract_sales_and_inventory(wb, discovery_result, retailer, audit_id, resolved_dates)
 
         for row in extracted["sales"]:
             key = (row["retailer_sku"], row["week_ending"])
