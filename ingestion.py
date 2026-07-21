@@ -21,7 +21,6 @@ from shared import (
     normalize_to_saturday,
     _validate_uuid, _validate_date, _sql_escape,
     build_fetch_audit_row_sql,
-    load_date_patterns, match_known_patterns, compute_date_from_match,
 )
 
 router = APIRouter()
@@ -29,233 +28,18 @@ router = APIRouter()
 # ─────────────────────────────────────────────
 # DATE HELPERS
 # ─────────────────────────────────────────────
-
-MONTH_MAP = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
-}
-
-
-
-def _extract_leading_month(val) -> Optional[int]:
-    """
-    Extract the tracking month from a date header — used to detect year
-    rollovers via monotonic sequence. For date ranges we use the END month
-    since that's what gets resolved as the actual date. For all other formats
-    we use the leading/only month.
-    """
-    if isinstance(val, datetime):
-        return val.month
-    if isinstance(val, date):
-        return val.month
-    if not isinstance(val, str):
-        return None
-    s = val.strip()
-    # ISO datetime string
-    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
-        try:
-            return int(s[5:7])
-        except (ValueError, IndexError):
-            return None
-    # date_range_string: use END month (that's what gets resolved as the date)
-    m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
-    if m:
-        return int(m.group(3))
-    # plain single date: MM/DD/YY or MM/DD/YYYY
-    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
-    if m:
-        return int(m.group(1))
-    # fiscal_week_label: "Feb Wk 1"
-    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', s, re.IGNORECASE)
-    if m:
-        return MONTH_MAP[m.group(1).lower()[:3]]
-    return None
-
-
-def _resolve_date(val, year: int) -> Optional[date]:
-    """
-    Resolve a single date header value to a week-ending Saturday,
-    given an already-determined year. No year logic here — year is
-    passed in from build_date_map which owns that decision.
-    """
-    if isinstance(val, datetime):
-        return normalize_to_saturday(val.date())
-    if isinstance(val, date):
-        return normalize_to_saturday(val)
-    if not isinstance(val, str):
-        return None
-    s = val.strip()
-    # ISO datetime string — year already embedded, ignore passed year
-    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
-        try:
-            return normalize_to_saturday(datetime.strptime(s[:10], "%Y-%m-%d").date())
-        except (ValueError, OverflowError):
-            return None
-    # plain single date with year embedded — ignore passed year
-    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
-    if m:
-        mm, dd, yy = int(m.group(1)), int(m.group(2)), m.group(3)
-        yyyy = int(yy) if len(yy) == 4 else (2000 + int(yy))
-        try:
-            return normalize_to_saturday(date(yyyy, mm, dd))
-        except (ValueError, OverflowError):
-            return None
-    # date_range_string: use end date with passed year
-    m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
-    if m:
-        end_month, end_day = int(m.group(3)), int(m.group(4))
-        try:
-            return date(year, end_month, end_day)
-        except (ValueError, OverflowError):
-            return None
-    # fiscal_week_label: "Feb Wk 1"
-    m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*(\d+)$', s, re.IGNORECASE)
-    if m:
-        month_num = MONTH_MAP[m.group(1).lower()[:3]]
-        week_num  = int(m.group(2))
-        try:
-            first_of_month = date(year, month_num, 1)
-            approx = first_of_month + timedelta(days=(week_num - 1) * 7)
-            return normalize_to_saturday(approx)
-        except (ValueError, OverflowError):
-            return None
-
-    # None of the formats above matched - check the shared, Postgres-backed
-    # pattern library for a format discovered and APPROVED since this
-    # function was last extended (e.g. "YYYYWW Units"). Only patterns with
-    # status='active' are ever loaded here (see load_date_patterns), so a
-    # newly-discovered-but-not-yet-approved format still correctly falls
-    # through to None below, exactly as it did before this existed - it
-    # doesn't get ingested until a human approves it, same discipline as
-    # everywhere else this pattern library is used.
-    match = match_known_patterns(s)
-    if match:
-        m2 = re.match(match["pattern_regex"], s, re.IGNORECASE)
-        if m2:
-            computed = compute_date_from_match(m2, match.get("resolution_rule", {}))
-            if computed:
-                try:
-                    return normalize_to_saturday(date.fromisoformat(computed))
-                except (ValueError, OverflowError):
-                    return None
-    return None
-
-
-def build_date_map(header_row: tuple, date_col_idxs: list, date_config: dict) -> dict:
-    """
-    Build col_idx -> week_ending date mapping for all date columns.
-
-    Year assignment uses the monotonic-sequence rule:
-    - Start from year_value (discovery's determination)
-    - Extract the leading month from each header in sequence
-    - When the month number drops (e.g. Dec→Jan, or Wk4→Wk1 across months),
-      increment the current year
-    - Assign the current year to each column before resolving its date
-
-    This means ingestion never guesses year logic — it only needs
-    year_value from discovery, and derives everything else from the
-    sequence of headers as they actually appear in the file.
-
-    For formats with year embedded (datetime objects, "01/04/25" strings,
-    ISO strings), the embedded year takes precedence and the monotonic
-    rule is skipped for that column.
-    """
-    base_year    = date_config.get("year_value", date.today().year)
-    # year_start is the document year (year with most columns).
-    # Start the monotonic counter there — the rule handles edge months naturally.
-    current_year  = date_config.get("year_start", base_year)
-    prev_month    = None
-    date_map      = {}
-
-    # Discovery already computed and persisted dates for any AI-discovered
-    # format backed by an ALREADY-ACTIVE pattern at discovery time (see
-    # discovery.py's resolve_unrecognized_dates / stage_date_config). Use
-    # those directly - no regex, no pattern-table query, no date arithmetic
-    # needed at all for these columns. JSON round-trips dict keys as
-    # strings, so date_config's int column indices come back as strings.
-    resolved_dates = {
-        int(k): v for k, v in date_config.get("resolved_dates", {}).items()
-    }
-
-    for col_idx in date_col_idxs:
-        if col_idx >= len(header_row):
-            continue
-        val = header_row[col_idx]
-        if val is None:
-            continue
-
-        if col_idx in resolved_dates:
-            try:
-                date_map[col_idx] = date.fromisoformat(resolved_dates[col_idx])
-            except (ValueError, TypeError):
-                pass  # malformed persisted value - fall through to recompute below
-            else:
-                # Self-contained-year formats don't need this for their OWN
-                # resolution, but keep it updated in case a LATER column in
-                # the same axis uses a different, monotonic-dependent format.
-                prev_month = _extract_leading_month(val)
-                continue
-
-        # For formats with year already embedded, resolve directly
-        # and update prev_month but don't apply the monotonic rule.
-        # Includes pattern-matched formats whose CAPTURE GROUPS carry their
-        # own year (e.g. year+week groups, same shape compute_date_from_match
-        # dispatches on) - the year is literally in the header text, same as
-        # "01/04/25" or an ISO string - it doesn't need the monotonic
-        # Dec->Jan rule to figure out which year it belongs to.
-        #
-        # Checked by capture_groups STRUCTURE, not by resolution_rule.method:
-        # a real production response had correct year/week capture groups
-        # but method: "unknown" instead of the requested name - trusting the
-        # method string here would have wrongly applied the monotonic rule
-        # to a format that already carries its own year.
-        #
-        # Reaching this point at all means resolved_dates didn't cover this
-        # column - either an older discovery_result predating this field, or
-        # a pattern that was still pending_review at discovery time but has
-        # SINCE been approved (this fallback is what picks that case up).
-        pattern_match = match_known_patterns(val) if isinstance(val, str) else None
-        pattern_groups = (pattern_match or {}).get("resolution_rule", {}).get("capture_groups", {}) or {}
-        has_pattern_embedded_year = pattern_match is not None and "year" in pattern_groups
-        has_embedded_year = (
-            isinstance(val, (datetime, date)) or
-            (isinstance(val, str) and (
-                re.match(r'^\d{4}-\d{2}-\d{2}', val.strip()) or
-                re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', val.strip())
-            )) or
-            has_pattern_embedded_year
-        )
-        if has_embedded_year:
-            resolved = _resolve_date(val, current_year)
-            if resolved:
-                date_map[col_idx] = resolved
-                prev_month = _extract_leading_month(val)
-            continue
-
-        # Apply monotonic rule to assign year
-        leading_month = _extract_leading_month(val)
-        if leading_month is not None and prev_month is not None:
-            if leading_month < prev_month:
-                current_year += 1
-        if leading_month is not None:
-            prev_month = leading_month
-
-        resolved = _resolve_date(val, current_year)
-        if resolved:
-            date_map[col_idx] = resolved
-
-    return date_map
-
-
-# Keep parse_date_value as a legacy fallback — not used in main pipeline
-def parse_date_value(val, date_config: dict) -> Optional[date]:
-    """Legacy single-value date parser. Use build_date_map for production paths."""
-    year = date_config.get("year_value", date.today().year)
-    if isinstance(val, datetime):
-        return normalize_to_saturday(val.date())
-    if isinstance(val, date):
-        return normalize_to_saturday(val)
-    return _resolve_date(val, year)
+# There is no date-resolution logic in this file anymore. Discovery computes
+# and persists the complete col_idx -> date mapping (date_config[sheet]
+# ["resolved_dates"]) and the inventory as-of date (date_config[sheet]
+# ["inventory_as_of_date"]) for every qualified sheet - see discovery.py's
+# _finalize_date_config / build_date_map (in shared.py). Ingestion reads
+# those values directly; it never re-derives a date from header text,
+# never touches the pattern table, never needs to know what row the date
+# axis lives in. If a date is missing here, that's a discovery bug to fix,
+# not something ingestion should independently try to work around -
+# exactly the shape of bug (a stale pattern cache, a wrong header row) that
+# silently produced zero-row "successful" ingestions when this logic used
+# to live here, duplicated and independently re-derived.
 
 
 # ─────────────────────────────────────────────
@@ -485,32 +269,32 @@ def extract_sales_and_inventory(
             elif classification == "open_order":
                 open_order_col = col_idx
 
-        # Find date axis from date_config — discovery stores these directly now
-        # so ingestion never needs to read grid at all
-        date_axis_row = dc.get("date_axis_row", 0)
+        # Discovery persists everything date-related now - this reads it,
+        # it never figures anything out. See discovery.py's
+        # _finalize_date_config for where these two fields get computed.
         date_col_idxs = dc.get("date_cols", [])
         data_start    = dc.get("data_start_row", 1)
 
         if not date_col_idxs or retailer_sku_col is None:
             continue
 
-        # Extract inventory snapshot date from column headers above data_start
+        # Inventory as-of date: already computed by discovery, per sheet.
+        # Keep the most recent one across sheets, same as before.
         if inventory_col is not None:
-            for hrow_idx in range(min(data_start, len(rows))):
-                if inventory_col < len(rows[hrow_idx]) and rows[hrow_idx][inventory_col]:
-                    parsed = _resolve_date(
-                        str(rows[hrow_idx][inventory_col]).strip(),
-                        dc.get("year_value", date.today().year)
-                    )
-                    if parsed and (inv_as_of_date is None or str(parsed) > inv_as_of_date):
-                        inv_as_of_date = str(parsed)
+            sheet_inv_date = dc.get("inventory_as_of_date")
+            if sheet_inv_date and (inv_as_of_date is None or sheet_inv_date > inv_as_of_date):
+                inv_as_of_date = sheet_inv_date
 
-        date_axis_row = dc.get("date_axis_row", 0)
-        date_col_idxs = dc.get("date_cols", [])
-
-        # Build date map using monotonic sequence rule — no year guessing
-        header_row = rows[date_axis_row] if date_axis_row < len(rows) else ()
-        date_map   = build_date_map(header_row, date_col_idxs, dc)
+        # Sales date map: a plain read of what discovery already computed
+        # and verified - a col_idx string key -> ISO date string dict, one
+        # entry per real date column. No recomputation, no header lookup,
+        # no pattern matching, no year-tracking state.
+        date_map = {}
+        for k, v in dc.get("resolved_dates", {}).items():
+            try:
+                date_map[int(k)] = date.fromisoformat(v)
+            except (ValueError, TypeError):
+                continue
 
         if not date_map:
             continue
@@ -702,19 +486,6 @@ async def stage_process_files(session_id: str):
     session = _sessions[session_id]
     session["stage"]  = "processing"
     session["status"] = "running"
-
-    # Force a FRESH reload every ingestion run, not the cached default.
-    # _KNOWN_DATE_PATTERNS is a single, process-wide cache shared with
-    # discovery.py (same running FastAPI app) - once populated, it never
-    # refreshes on its own. A pattern approved via direct SQL (status ->
-    # 'active') between server-start and this run would otherwise be
-    # invisible here: _resolve_date's fallback depends entirely on this
-    # cache, with no fresh check of its own (unlike discovery's escalation
-    # path, which always re-queries fresh for its dedup check) - so a stale
-    # cache here doesn't just cost inefficiency, it SILENTLY drops real
-    # sales data: build_date_map comes back empty, the sheet gets skipped
-    # with no error, and the run reports "complete" with zero rows written.
-    await load_date_patterns(force=True)
 
     audit_rows = session.get("_audit_rows", {})
     if not audit_rows:
