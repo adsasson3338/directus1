@@ -1257,6 +1257,46 @@ def find_sales_shaped_columns_from_rows(rows: list) -> list:
     return candidates
 
 
+def _rank_rows_by_distinct_values(entries: list) -> list:
+    """
+    Core ranking logic shared by find_candidate_header_rows (schema-based)
+    and find_candidate_header_rows_from_rows (raw-rows-based, used at
+    qualify time before a schema exists) - the ONE place this algorithm is
+    implemented. Before this, these were two independent copies of the
+    same logic: when one got fixed for a real bug (a merged title tying
+    with the genuine date row on raw non-empty-string count, breaking the
+    tie by insertion order and picking the title), the other silently kept
+    the original bug, sitting unfixed in a different code path that
+    happens to run for genuinely new, unrecognized date formats.
+
+    entries: list of (row_idx, value) tuples - one per (candidate column,
+    header row) pair with a non-empty value, regardless of whether it came
+    from a schema's header_stack or raw row cells.
+
+    Ranks by DISTINCT value count per row first, raw occurrence count
+    second. A genuine per-column date/period axis always varies row to
+    row (week 1 differs from week 2); a merged title/banner spanning
+    multiple columns necessarily repeats the identical text in every one
+    of them.
+
+    Returns candidate rows ranked best-first, or [] if entries is empty -
+    callers apply their own indexing-appropriate fallback (0-based vs
+    1-based) rather than this function guessing one.
+    """
+    row_counts   = {}
+    row_distinct = {}
+    for row_idx, value in entries:
+        row_counts[row_idx] = row_counts.get(row_idx, 0) + 1
+        row_distinct.setdefault(row_idx, set()).add(value)
+    if not row_counts:
+        return []
+    return sorted(
+        row_counts.keys(),
+        key=lambda r: (len(row_distinct.get(r, set())), row_counts[r]),
+        reverse=True,
+    )
+
+
 def find_candidate_header_rows(schema: dict, candidate_cols: list, max_candidates: int = 5) -> list:
     """
     Same ranking logic as find_probable_header_row (distinct value count
@@ -1269,25 +1309,16 @@ def find_candidate_header_rows(schema: dict, candidate_cols: list, max_candidate
     afterward, via a flag, that the top-ranked choice didn't resolve any
     real dates. See _finalize_date_config for where this gets used that way.
     """
-    row_counts    = {}
-    row_distinct  = {}
     col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
+    entries = []
     for col_1 in candidate_cols:
         cs = col_schema_map.get(col_1, {})
         for h in cs.get("header_stack", []):
             val = str(h.get("value", "")).strip()
             if val:
-                row = h["row"]
-                row_counts[row] = row_counts.get(row, 0) + 1
-                row_distinct.setdefault(row, set()).add(val)
-    if not row_counts:
-        return [1]
-    ranked = sorted(
-        row_counts.keys(),
-        key=lambda r: (len(row_distinct.get(r, set())), row_counts[r]),
-        reverse=True,
-    )
-    return ranked[:max_candidates]
+                entries.append((h["row"], val))
+    ranked = _rank_rows_by_distinct_values(entries)
+    return ranked[:max_candidates] if ranked else [1]
 
 
 def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
@@ -1325,20 +1356,28 @@ def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
 
 
 def find_probable_header_row_from_rows(rows: list, candidate_cols: list) -> int:
-    """Raw-rows equivalent of find_probable_header_row() - which of the
+    """
+    Raw-rows equivalent of find_probable_header_row() - which of the
     first several rows has non-empty string values for the most candidate
-    columns. 0-based row index, matching raw row tuples."""
-    row_counts = {}
+    columns. 0-based row index, matching raw row tuples.
+
+    Uses the same shared _rank_rows_by_distinct_values() core as the
+    schema-based version - previously this was an independent copy that
+    still had the original merged-title tie-break bug even after the
+    schema-based version was fixed for it (a title spanning multiple
+    columns repeats identically in each one, tying with a genuinely
+    varying real header row on raw non-empty-string count, and losing that
+    tie only by luck of insertion order). This runs at qualify time, for
+    genuinely new/unrecognized date formats - exactly the case where a
+    wrong tie-break would have gone unnoticed the longest.
+    """
+    entries = []
     for ri, row in enumerate(rows[:15]):
-        count = sum(
-            1 for ci in candidate_cols
-            if ci < len(row) and isinstance(row[ci], str) and row[ci].strip()
-        )
-        if count:
-            row_counts[ri] = count
-    if not row_counts:
-        return 0
-    return max(row_counts, key=row_counts.get)
+        for ci in candidate_cols:
+            if ci < len(row) and isinstance(row[ci], str) and row[ci].strip():
+                entries.append((ri, row[ci].strip()))
+    ranked = _rank_rows_by_distinct_values(entries)
+    return ranked[0] if ranked else 0
 
 
 def build_new_pattern_prompt(shape_groups: dict, filename: str) -> str:
