@@ -1950,6 +1950,78 @@ async def stage_postgres_sku_lookup(session_id: str):
     await stage_schema_classify(session_id)
 
 
+def compute_date_axis_display_fields(schema: dict, rows_data: list, sales_cols_0based: list,
+                                      date_axis_row: int, data_start: int) -> dict:
+    """
+    Computes format/year_present/sample_values/last_sample_val/
+    last_active_sample_val for a GIVEN axis row - the one place this is
+    implemented, called both for the initial computation and again
+    whenever _finalize_date_config's auto-retry logic switches to a
+    different axis row.
+
+    Without this being reusable, a corrected axis row only updated the
+    actual date computation (resolved_dates) - the display fields stayed
+    computed from whatever row was originally (wrongly) chosen, showing
+    stale/wrong text even after the real data was already correct. A
+    discovery result with correct dates but wrong-looking display fields
+    is still a wrong result: a human reviewing it can't tell "this looks
+    wrong and is wrong" apart from "this looks wrong but secretly isn't" -
+    display output needs to be exactly as trustworthy as the underlying
+    computation, not a lower-priority afterthought to it.
+    """
+    axis_row_0 = date_axis_row - 1
+    col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
+
+    axis_row_vals = [
+        rows_data[axis_row_0][c]
+        for c in sales_cols_0based
+        if axis_row_0 < len(rows_data) and c < len(rows_data[axis_row_0])
+        and rows_data[axis_row_0][c] is not None
+    ]
+    formats  = set(classify_cell(v) for v in axis_row_vals)
+    date_fmt = list(formats)[0] if len(formats) == 1 else "mixed"
+    year_present = date_fmt == "datetime" or any(YEAR_RE.search(str(v)) for v in axis_row_vals)
+
+    def _header_value_at_axis_row(cs: dict) -> str | None:
+        for h in cs.get("header_stack", []):
+            if h["row"] == date_axis_row:
+                return h["value"]
+        return None
+
+    sample_vals = []
+    for col_0 in sorted(sales_cols_0based)[:8]:
+        cs  = col_schema_map.get(col_0 + 1, {})
+        val = _header_value_at_axis_row(cs)
+        if val is not None:
+            sample_vals.append(val)
+
+    last_sample_val = None
+    if sales_cols_0based:
+        cs = col_schema_map.get(sorted(sales_cols_0based)[-1] + 1, {})
+        last_sample_val = _header_value_at_axis_row(cs)
+
+    last_active_sample_val = None
+    data_start_0 = data_start - 1
+    for col_0 in sorted(sales_cols_0based, reverse=True):
+        has_data = any(
+            rows_data[r][col_0] not in (None, 0, "", " ")
+            for r in range(data_start_0, min(data_start_0 + 200, len(rows_data)))
+            if col_0 < len(rows_data[r])
+        )
+        if has_data:
+            cs = col_schema_map.get(col_0 + 1, {})
+            last_active_sample_val = _header_value_at_axis_row(cs)
+            break
+
+    return {
+        "format":                 date_fmt,
+        "year_present":           year_present,
+        "sample_values":          sample_vals,
+        "last_sample_val":        last_sample_val,
+        "last_active_sample_val": last_active_sample_val,
+    }
+
+
 async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_values: set, sku_matched_values: set):
     """
     Everything stage_schema_classify used to do inline, per sheet, in a
@@ -2158,59 +2230,22 @@ async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_val
     rows_data     = session["_sheets"].get(sheet_name, [])
     axis_row_0    = date_axis_row - 1                      # 0-based
 
-    # Detect format and year flags from actual header values
-    axis_row_vals = [
-        rows_data[axis_row_0][c]
-        for c in sales_cols_0based
-        if axis_row_0 < len(rows_data) and c < len(rows_data[axis_row_0])
-        and rows_data[axis_row_0][c] is not None
-    ]
-    formats = set(classify_cell(v) for v in axis_row_vals)
-    date_fmt = list(formats)[0] if len(formats) == 1 else "mixed"
-
-    year_present  = date_fmt == "datetime" or any(
-        YEAR_RE.search(str(v)) for v in axis_row_vals
+    # Detect format and year flags from actual header values, plus the
+    # sample/display fields for this axis row - see
+    # compute_date_axis_display_fields, the single shared implementation
+    # also used later if _finalize_date_config's auto-retry logic switches
+    # to a different axis row.
+    display_fields = compute_date_axis_display_fields(
+        schema, rows_data, sales_cols_0based, date_axis_row, data_start
     )
+    date_fmt                = display_fields["format"]
+    year_present            = display_fields["year_present"]
+    sample_vals             = display_fields["sample_values"]
+    last_sample_val         = display_fields["last_sample_val"]
+    last_active_sample_val  = display_fields["last_active_sample_val"]
 
-    col_schema_map = {c["col"]: c for c in schema["columns"]}
-    sample_vals    = []
-    for col_0 in sorted(sales_cols_0based)[:8]:
-        col_1 = col_0 + 1
-        cs    = col_schema_map.get(col_1, {})
-        for h in cs.get("header_stack", []):
-            if any(ch.isdigit() for ch in h["value"]):
-                sample_vals.append(h["value"])
-                break
+    col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
 
-    # Also grab the last date column value for file_set_key calculation
-    last_sample_val = None
-    if sales_cols_0based:
-        last_col_0 = sorted(sales_cols_0based)[-1]
-        last_col_1 = last_col_0 + 1
-        cs = col_schema_map.get(last_col_1, {})
-        for h in cs.get("header_stack", []):
-            if any(ch.isdigit() for ch in h["value"]):
-                last_sample_val = h["value"]
-                break
-
-    # Find last ACTIVE column - last date column with at least one non-zero data value
-    # This is the true latest week for file_set_key, not the last column in the sheet
-    last_active_sample_val = None
-    data_start_0 = data_start - 1  # 0-based
-    for col_0 in sorted(sales_cols_0based, reverse=True):
-        has_data = any(
-            rows_data[r][col_0] not in (None, 0, "", " ")
-            for r in range(data_start_0, min(data_start_0 + 200, len(rows_data)))
-            if col_0 < len(rows_data[r])
-        )
-        if has_data:
-            col_1 = col_0 + 1
-            cs = col_schema_map.get(col_1, {})
-            for h in cs.get("header_stack", []):
-                if any(ch.isdigit() for ch in h["value"]):
-                    last_active_sample_val = h["value"]
-                    break
-            break
 
     year_anchors = [
         {"source": "filename", "value": m.group(1)}
@@ -2574,6 +2609,20 @@ def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
                     dc["date_axis_row"] = axis_row_0
                     complete_map  = trial_map
                     resolved_rate = trial_rate
+
+                    # Update the DISPLAY fields too, not just the real
+                    # computation - a corrected axis with stale
+                    # sample_values/format/etc still showing the old,
+                    # wrong row's text is still a wrong result to whoever
+                    # reviews it, even if resolved_dates is now correct.
+                    grid_axis = session.get("grid", {}).get(sheet_name, {}).get("date_axis")
+                    if grid_axis is not None:
+                        grid_axis["row"] = axis_row_0
+                        grid_axis.update(compute_date_axis_display_fields(
+                            schema, rows, dc.get("date_cols", []), candidate_1based,
+                            dc.get("data_start_row", 1),
+                        ))
+
                     if resolved_rate >= 0.8:
                         break  # good enough - stop trying further candidates
 
