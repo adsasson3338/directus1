@@ -1268,17 +1268,35 @@ def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
     exactly the situation this needs to handle (a genuinely new format).
     Trusting that fallback here would silently point at the wrong row
     (often a title row) and miss every real candidate column's header text.
+
+    Ranks by DISTINCT value count first, raw non-empty count second - not
+    raw count alone. A genuine per-column date/period axis always varies
+    (week 1 differs from week 2); a merged title/banner spanning multiple
+    columns necessarily repeats the identical text in every one of them.
+    Real production case this fixes: a title merged across L1:X1
+    ("10 Week (Gross) Sales Report", propagated into every spanned
+    column's header_stack) tied with the genuine date row on raw
+    non-empty-string count - both showed a string in all 10 candidate
+    columns - and the tie broke by insertion order, silently picking the
+    title row instead of the real dates. Distinct-value ranking fixes this
+    without needing to know whether the values are date-like yet, which
+    matters because this function is also used for genuinely new,
+    unrecognized formats that can't be checked against a known pattern.
     """
-    row_counts = {}
+    row_counts    = {}
+    row_distinct  = {}
     col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
     for col_1 in candidate_cols:
         cs = col_schema_map.get(col_1, {})
         for h in cs.get("header_stack", []):
-            if str(h.get("value", "")).strip():
-                row_counts[h["row"]] = row_counts.get(h["row"], 0) + 1
+            val = str(h.get("value", "")).strip()
+            if val:
+                row = h["row"]
+                row_counts[row] = row_counts.get(row, 0) + 1
+                row_distinct.setdefault(row, set()).add(val)
     if not row_counts:
         return 1
-    return max(row_counts, key=row_counts.get)
+    return max(row_counts, key=lambda r: (len(row_distinct.get(r, set())), row_counts[r]))
 
 
 def find_probable_header_row_from_rows(rows: list, candidate_cols: list) -> int:
@@ -1472,6 +1490,18 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
             "capture_groups": r.get("capture_groups", {}),
         }
         if not pattern:
+            continue
+        # Require the pattern to be anchored at BOTH ends. Matching its own
+        # example (checked below) is necessary but NOT sufficient - a
+        # pattern missing the trailing $ (e.g. "^\d{1,2}\s*week", no $)
+        # still correctly matches its own example, but re.match() only
+        # anchors at the START of a string, so it would ALSO match any
+        # unrelated text that merely starts the same way (a real production
+        # case: "10 Week (Gross) Sales Report" - a report title, not a date
+        # - got misidentified as 10 real date columns because a pattern
+        # like this was approved without this check existing). Reject
+        # outright rather than trying to auto-repair a malformed pattern.
+        if not (pattern.startswith("^") and pattern.endswith("$")):
             continue
         try:
             compiled = re.compile(pattern, re.IGNORECASE)
