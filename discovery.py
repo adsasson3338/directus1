@@ -436,9 +436,10 @@ def build_sku_lookup_sql(candidates: list) -> tuple[str, list]:
 
     sql = f"""SELECT inventory_sku, base_model, base_variant, description, upc
 FROM inventory_view
-WHERE UPPER(inventory_sku) = ANY(ARRAY[{quoted}]::text[])
-   OR UPPER(base_variant)  = ANY(ARRAY[{quoted}]::text[])
-   OR UPPER(base_model)    = ANY(ARRAY[{quoted}]::text[])"""
+WHERE UPPER(inventory_sku)   = ANY(ARRAY[{quoted}]::text[])
+   OR UPPER(base_variant)    = ANY(ARRAY[{quoted}]::text[])
+   OR UPPER(base_model)      = ANY(ARRAY[{quoted}]::text[])
+   OR UPPER(upc::text)       = ANY(ARRAY[{quoted}]::text[])"""
 
     return sql, []
 
@@ -519,6 +520,126 @@ GROUP BY retailer
 ORDER BY matches DESC
 LIMIT 1
 """.strip()
+
+
+def build_retailer_sku_col_identify_sql(all_candidate_values: list) -> str:
+    """
+    One combined query checking every non-date candidate column's values,
+    across every qualified sheet, against retailer_sku_map at once - not
+    one query per column. Returns raw (retailer, retailer_sku) matches;
+    Python attributes them back to whichever specific (sheet, column) each
+    matched value actually came from. Mirrors the existing combined-query
+    approach already used for the supplier-side inventory_view lookup.
+    """
+    quoted = ", ".join(
+        "'" + str(c).replace("'", "''") + "'"
+        for c in all_candidate_values
+        if c and str(c).strip()
+    )
+    if not quoted:
+        quoted = "''"
+    return f"""
+SELECT retailer, retailer_sku
+FROM retailer_sku_map
+WHERE UPPER(retailer_sku) = ANY(ARRAY[{quoted}]::text[])
+  AND active = true
+""".strip()
+
+
+async def identify_retailer_and_sku_col_from_postgres(session: dict):
+    """
+    Determines BOTH the retailer identity and which (sheet, column) is the
+    genuine retailer_sku column, directly from retailer_sku_map - without
+    depending on AI's own column classification to point at a candidate
+    first.
+
+    This replaces the previous architecture's actual dependency: the old
+    stage_identify_retailer only ever checked values from whichever column
+    AI had ALREADY labeled retailer_sku in a prior stage - meaning a wrong,
+    or merely uncertain, AI guess could prevent a genuinely confirmable
+    retailer identity from ever being checked against Postgres at all. A
+    direct database match is more reliable than an AI guess made from
+    limited context, and there's no reason to wait for (or depend on) that
+    guess when the values themselves can be checked immediately.
+
+    For every non-date candidate column (>=3 non-zero samples) across
+    every qualified sheet, checks ALL of its values against
+    retailer_sku_map in ONE combined query, then attributes matches back
+    to whichever specific (sheet, column) and retailer they came from. The
+    (sheet, column, retailer) combination with the strongest match (>=3,
+    the same confirmation threshold already used elsewhere in this file)
+    wins.
+
+    Returns (retailer, {sheet_name: col_0based}, match_count) if confirmed,
+    or (None, {}, 0) if nothing meets the threshold - the caller falls
+    through to the existing AI-based identification exactly as before.
+    """
+    candidates = {}  # (sheet_name, col_1based) -> [sample values]
+    for sheet_name in session["qualified_sheets"]:
+        schema = session.get("_schemas", {}).get(sheet_name, {})
+        # _sales_cols isn't populated yet at this point in the pipeline -
+        # it's only set inside _schema_classify_one_sheet, which runs
+        # AFTER this function (that's the whole point: this runs earlier).
+        # find_date_axis() is the same deterministic, pattern-based check
+        # already used at the qualify stage - reusing it here for the same
+        # purpose (excluding real date columns from SKU candidates) is
+        # correct and consistent, and it only needs raw rows, which are
+        # available from the very start of the pipeline.
+        rows = session.get("_sheets", {}).get(sheet_name, [])
+        axis = find_date_axis(rows)
+        date_cols_1based = {c + 1 for c in (axis.get("cols", []) if axis else [])}
+        for col in schema.get("columns", []):
+            col_1 = col["col"]
+            if col_1 in date_cols_1based:
+                continue
+            samples = col.get("sample_non_zero", [])
+            if len(samples) >= 3:
+                candidates[(sheet_name, col_1)] = [str(v).upper() for v in samples]
+
+    if not candidates:
+        return None, {}, 0
+
+    all_values = sorted({v for vals in candidates.values() for v in vals})
+
+    try:
+        rows = await call_postgres(build_retailer_sku_col_identify_sql(all_values))
+    except Exception:
+        return None, {}, 0
+
+    value_to_retailers = {}
+    for r in rows:
+        v = str(r.get("retailer_sku", "")).upper()
+        retailer = r.get("retailer", "")
+        if v and retailer:
+            value_to_retailers.setdefault(v, set()).add(retailer)
+
+    # Find the single strongest (sheet, column, retailer) combination first,
+    # to decide WHICH retailer is confirmed overall.
+    best_retailer, best_count = None, 0
+    for (sheet_name, col_1), samples in candidates.items():
+        retailer_counts = {}
+        for v in samples:
+            for retailer in value_to_retailers.get(v, ()):
+                retailer_counts[retailer] = retailer_counts.get(retailer, 0) + 1
+        for retailer, count in retailer_counts.items():
+            if count >= 3 and count > best_count:
+                best_retailer, best_count = retailer, count
+
+    if not best_retailer:
+        return None, {}, 0
+
+    # Now, for the CONFIRMED retailer specifically, find which column in
+    # EACH sheet has the strongest match - a multi-sheet file can have the
+    # retailer_sku column at a different position per sheet.
+    confirmed_cols = {}
+    for (sheet_name, col_1), samples in candidates.items():
+        count = sum(1 for v in samples if best_retailer in value_to_retailers.get(v, ()))
+        if count >= 3:
+            existing = confirmed_cols.get(sheet_name)
+            if existing is None or count > existing[1]:
+                confirmed_cols[sheet_name] = (col_1 - 1, count)  # 0-based, matching column_mapping convention
+
+    return best_retailer, {sn: c0 for sn, (c0, _) in confirmed_cols.items()}, best_count
 
 
 def sql_escape(v) -> str:
@@ -1384,16 +1505,69 @@ async def resolve_unrecognized_dates(unresolved: list, filename: str, retailer: 
     return resolved, trusted_dates
 
 
+def find_postgres_confirmed_supplier_sku_cols(schema: dict, date_cols_1based: set, matched_values: set) -> dict:
+    """
+    Columns whose sampled values fully match the known supplier inventory
+    database (inventory_view) get classified deterministically, without
+    ever being sent to AI for this decision - a direct Postgres match is a
+    verified fact, not something that benefits from an AI opinion, the
+    same discipline already applied to date-format resolution and
+    inventory-classification elsewhere in this file.
+
+    Requires at least 3 non-zero samples (avoiding a confident-looking
+    "match" on a column with barely any real data) AND every one of them
+    matching - a partial match is genuinely ambiguous, not confirmed, and
+    still goes through AI like before.
+
+    Only ever classifies as supplier_sku, never retailer_sku:
+    matched_values comes from inventory_view, which is this business's OWN
+    internal product/supplier reference - it has no way to verify a
+    retailer's own internal numbering scheme, which is exactly why
+    retailer_sku classification still depends on AI reading header text
+    (e.g. "Item Nbr") rather than a database match that doesn't exist for it.
+
+    Returns {col_0based: column_mapping_entry}, using the same 0-based
+    indexing and field shape as the AI-driven entries in column_mapping,
+    so the two can be merged directly with no special-casing downstream.
+    """
+    confirmed = {}
+    for col in schema.get("columns", []):
+        col_1 = col["col"]  # 1-based, schema/openpyxl convention
+        if col_1 in date_cols_1based:
+            continue
+        samples = col.get("sample_non_zero", [])
+        if len(samples) >= 3 and all(str(v).upper() in matched_values for v in samples):
+            col_0 = col_1 - 1
+            confirmed[col_0] = {
+                "col": col_0,
+                "classification": "supplier_sku",
+                "confidence": "high",
+                "reason": (
+                    f"All {len(samples)} sampled values matched the supplier "
+                    f"inventory database directly - confirmed by Postgres, not an AI judgment call."
+                ),
+                "has_embedded_supplier_sku": False,
+            }
+    return confirmed
+
+
 def build_column_classify_prompt(schema: dict, filename: str,
-                                  date_cols: list, postgres_matched: set) -> str:
+                                  date_cols: list, postgres_matched: set,
+                                  already_confirmed_cols: set = None) -> str:
     """
     Pass 2 - AI classifies non-date columns only.
     Small focused prompt - only the product/inventory/metadata columns.
+
+    already_confirmed_cols (0-based) excludes columns already classified
+    deterministically via a full Postgres match - see
+    find_postgres_confirmed_supplier_sku_cols. AI never even sees these;
+    there's no judgment call left to make once a match is already confirmed.
     """
     date_col_set = set(date_cols)
+    excluded_1based = date_col_set | {c0 + 1 for c0 in (already_confirmed_cols or set())}
     non_date_cols = [
         c for c in schema.get("columns", [])
-        if c["col"] not in date_col_set
+        if c["col"] not in excluded_1based
         and (c.get("sample_non_zero") or c.get("header_stack"))
     ]
 
@@ -1702,17 +1876,42 @@ async def stage_postgres_sku_lookup(session_id: str):
     except Exception as e:
         session["postgres_results"] = {"matches": [], "error": str(e)}
 
+    # Identify retailer (and which column is retailer_sku, per sheet)
+    # directly from retailer_sku_map, BEFORE column classification runs -
+    # not dependent on AI's own classification pointing at a candidate
+    # first. See identify_retailer_and_sku_col_from_postgres's docstring
+    # for why this replaces waiting for AI's guess. Falls through to the
+    # existing AI-based identification (later, in stage_identify_retailer)
+    # exactly as before if nothing meets the confirmation threshold - nothing
+    # about a brand-new retailer's handling changes.
+    retailer, confirmed_cols, match_count = await identify_retailer_and_sku_col_from_postgres(session)
+    if retailer:
+        session["retailer"] = retailer
+        session["_postgres_confirmed_retailer_sku_cols"] = confirmed_cols
+        session["flags"]["retailer_identification"] = (
+            f"confirmed: {retailer} ({match_count} matches, identified before column classification)"
+        )
+
     await stage_schema_classify(session_id)
 
 
-async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_values: set):
+async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_values: set, sku_matched_values: set):
     """
     Everything stage_schema_classify used to do inline, per sheet, in a
     sequential for-loop - now a standalone coroutine so multiple sheets
     can run concurrently via asyncio.gather instead of one after another.
 
+    matched_values (SKU fields + UPC combined) is AI's informational hint.
+    sku_matched_values (SKU fields only, no UPC) is what actually gates the
+    deterministic supplier_sku bypass - see find_postgres_confirmed_supplier_sku_cols.
+    Keeping these separate matters: a column matching only via UPC is not a
+    supplier's own part number, and every real UPC column seen this session
+    was correctly classified "other" by AI - merging UPC into the same set
+    used for the deterministic bypass would silently override that correct
+    judgment with an incorrect one.
+
     Safe to parallelize: depends only on this sheet's own schema/rows and
-    on _matched_values (read-only, set once before any sheet is processed).
+    on these two read-only sets (set once before any sheet is processed).
     Every write is namespaced by sheet_name, or - for the one shared-list
     mutation (session["qualified_sheets"], when a sheet turns out to have
     no date columns after all) - a same-value-removal filter with no
@@ -1819,16 +2018,55 @@ async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_val
     session.setdefault("_date_schemas", {})[sheet_name] = date_schema
     session.setdefault("_sales_cols",   {})[sheet_name] = sales_cols_0based
 
-    # Pass 2 - AI classifies non-date columns
-    try:
-        text   = await call_ai(build_column_classify_prompt(schema, session["filename"],
-                                                              sales_cols_1based, matched_values), label="column_classify")
-        clean  = parse_ai_response(text)
-        result = json.loads(clean)
-    except (json.JSONDecodeError, ValueError) as e:
-        result = {"error": f"Parse error: {e}"}
-    except Exception as e:
-        result = {"error": f"AI error: {e}"}
+    # Columns Postgres has already confirmed directly - never sent to AI,
+    # since there's no judgment call left to make once every sampled value
+    # has matched the known supplier inventory database. Uses
+    # sku_matched_values specifically (SKU fields only, no UPC) - see this
+    # function's docstring for why UPC is deliberately excluded here.
+    postgres_confirmed = find_postgres_confirmed_supplier_sku_cols(
+        schema, set(sales_cols_1based), sku_matched_values
+    )
+
+    # Column already confirmed as retailer_sku directly against
+    # retailer_sku_map, determined BEFORE this stage even ran - see
+    # identify_retailer_and_sku_col_from_postgres. Also never sent to AI.
+    confirmed_retailer_sku_col_0 = session.get("_postgres_confirmed_retailer_sku_cols", {}).get(sheet_name)
+    if confirmed_retailer_sku_col_0 is not None and confirmed_retailer_sku_col_0 not in postgres_confirmed:
+        postgres_confirmed[confirmed_retailer_sku_col_0] = {
+            "col": confirmed_retailer_sku_col_0,
+            "classification": "retailer_sku",
+            "confidence": "high",
+            "reason": (
+                "Sampled values matched retailer_sku_map directly for this "
+                "confirmed retailer - confirmed by Postgres, not an AI judgment call."
+            ),
+            "has_embedded_supplier_sku": False,
+        }
+
+    remaining_non_date_cols = [
+        c for c in schema.get("columns", [])
+        if c["col"] not in set(sales_cols_1based)
+        and (c["col"] - 1) not in postgres_confirmed
+        and (c.get("sample_non_zero") or c.get("header_stack"))
+    ]
+
+    # Pass 2 - AI classifies non-date columns not already Postgres-confirmed
+    if not remaining_non_date_cols:
+        # Nothing left for AI to do - every non-date column was either part
+        # of the sales axis or already confirmed directly against Postgres.
+        result = {"columns": []}
+    else:
+        try:
+            text   = await call_ai(build_column_classify_prompt(
+                schema, session["filename"], sales_cols_1based, matched_values,
+                already_confirmed_cols=set(postgres_confirmed.keys()),
+            ), label="column_classify")
+            clean  = parse_ai_response(text)
+            result = json.loads(clean)
+        except (json.JSONDecodeError, ValueError) as e:
+            result = {"error": f"Parse error: {e}"}
+        except Exception as e:
+            result = {"error": f"AI error: {e}"}
 
     if "error" in result:
         session["grid"][sheet_name]           = {"error": result["error"]}
@@ -2027,6 +2265,10 @@ async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_val
                 col_schema_map.get(c["col"] + 1, {}).get("embedded_postgres_matched", False)
             ),
         })
+    # Merge in columns Postgres already confirmed directly - AI never saw
+    # these, so they're not in col_results at all.
+    column_mapping_list.extend(postgres_confirmed.values())
+
     session["column_mapping"][sheet_name] = column_mapping_list
 
     # Post-schema: disqualify if no sales date columns found
@@ -2050,16 +2292,33 @@ async def stage_schema_classify(session_id: str):
     session["status"] = "running"
 
     pg_matches     = session.get("postgres_results", {}).get("matches", [])
-    matched_values = set()
+    matched_values = set()      # SKU fields + UPC combined - used as AI's informational hint (postgres_matched)
+    sku_matched_values = set()  # SKU fields ONLY - used to gate the deterministic supplier_sku bypass
     for row in pg_matches:
         for field in ("inventory_sku", "base_variant", "base_model"):
             v = row.get(field, "")
             if v:
-                matched_values.add(v.upper())
+                matched_values.add(str(v).upper())
+                sku_matched_values.add(str(v).upper())
+        v = row.get("upc", "")
+        if v:
+            # UPC deliberately excluded from sku_matched_values: a column
+            # matching only via UPC is NOT a supplier's own part number -
+            # every real UPC column seen this session was correctly
+            # classified "other" by AI ("a standardized universal product
+            # code, not a retailer/supplier SKU"). Merging UPC into the
+            # same set as inventory_sku/base_variant/base_model would have
+            # let the deterministic bypass silently override that correct
+            # judgment with an incorrect one. Still added to the combined
+            # matched_values set below, since "this value is recognized in
+            # our database" remains a useful hint for AI even when it
+            # doesn't dictate a specific classification.
+            matched_values.add(str(v).upper())
     session["_matched_values"] = matched_values
+    session["_sku_matched_values"] = sku_matched_values
 
     await asyncio.gather(*[
-        _schema_classify_one_sheet(session, sheet_name, matched_values)
+        _schema_classify_one_sheet(session, sheet_name, matched_values, sku_matched_values)
         for sheet_name in session["qualified_sheets"]
     ])
 
@@ -2091,10 +2350,19 @@ async def stage_schema_classify(session_id: str):
 
 
 async def stage_identify_retailer(session_id: str):
-    """Stage 3 - identify retailer by querying retailer_sku_map."""
+    """Stage 3 - identify retailer by querying retailer_sku_map.
+
+    If identify_retailer_and_sku_col_from_postgres already confirmed the
+    retailer earlier (in stage_postgres_sku_lookup, before column
+    classification even ran), there's nothing left to do here - skip
+    straight to date config rather than re-running the same lookup."""
     session = _sessions[session_id]
     session["stage"]  = "identifying_retailer"
     session["status"] = "running"
+
+    if session.get("retailer"):
+        await stage_date_config(session_id)
+        return
 
     retailer_sku_candidates = set()
     for sheet_name in session["qualified_sheets"]:
