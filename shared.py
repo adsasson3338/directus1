@@ -136,13 +136,29 @@ def match_known_patterns(header: str) -> dict | None:
     """Try a header string against the loaded pattern library. Returns the
     matching pattern row (with pattern_regex/resolution_rule/format_description),
     or None if nothing matches - a malformed stored pattern is skipped rather
-    than allowed to crash matching for every file."""
+    than allowed to crash matching for every file.
+
+    Also skips any stored pattern not anchored at both ends (^...$) - this
+    is a defensive check at READ time, not just at write time
+    (resolve_unrecognized_dates already rejects unanchored patterns before
+    they're ever written) - because a bad pattern could already exist in
+    the database from before that write-time check was added. An
+    unanchored pattern (e.g. "^\\d{1,2}\\s*week", missing the trailing $)
+    can match far more than its author intended: re.match() only anchors
+    at the START of a string, so without $ it matches ANY text that merely
+    starts the same way - a real production case: "10 Week (Gross) Sales
+    Report", a report title, got misidentified as 10 real date columns
+    this way.
+    """
     if not isinstance(header, str):
         return None
     s = header.strip()
     for p in _KNOWN_DATE_PATTERNS:
         try:
-            if re.match(p["pattern_regex"], s, re.IGNORECASE):
+            regex = p["pattern_regex"]
+            if not (regex.startswith("^") and regex.endswith("$")):
+                continue
+            if re.match(regex, s, re.IGNORECASE):
                 return p
         except (re.error, TypeError, KeyError):
             continue
