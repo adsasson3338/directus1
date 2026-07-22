@@ -2031,17 +2031,28 @@ async def _schema_classify_one_sheet(session: dict, sheet_name: str, matched_val
     # retailer_sku_map, determined BEFORE this stage even ran - see
     # identify_retailer_and_sku_col_from_postgres. Also never sent to AI.
     confirmed_retailer_sku_col_0 = session.get("_postgres_confirmed_retailer_sku_cols", {}).get(sheet_name)
-    if confirmed_retailer_sku_col_0 is not None and confirmed_retailer_sku_col_0 not in postgres_confirmed:
-        postgres_confirmed[confirmed_retailer_sku_col_0] = {
-            "col": confirmed_retailer_sku_col_0,
-            "classification": "retailer_sku",
-            "confidence": "high",
-            "reason": (
-                "Sampled values matched retailer_sku_map directly for this "
-                "confirmed retailer - confirmed by Postgres, not an AI judgment call."
-            ),
-            "has_embedded_supplier_sku": False,
-        }
+    if confirmed_retailer_sku_col_0 is not None:
+        if confirmed_retailer_sku_col_0 in postgres_confirmed:
+            # This column's values matched BOTH inventory_view (supplier_sku)
+            # AND retailer_sku_map (retailer_sku) - a genuine ambiguity, not
+            # something to resolve silently. supplier_sku wins (it ran
+            # first), but this is recorded rather than hidden, so a human
+            # reviewing this file's discovery result can see it happened.
+            session.setdefault("flags", {})[f"sku_classification_conflict_{sheet_name}"] = (
+                f"Column {confirmed_retailer_sku_col_0} matched both the supplier inventory "
+                f"database and retailer_sku_map - classified as supplier_sku; verify this is correct."
+            )
+        else:
+            postgres_confirmed[confirmed_retailer_sku_col_0] = {
+                "col": confirmed_retailer_sku_col_0,
+                "classification": "retailer_sku",
+                "confidence": "high",
+                "reason": (
+                    "Sampled values matched retailer_sku_map directly for this "
+                    "confirmed retailer - confirmed by Postgres, not an AI judgment call."
+                ),
+                "has_embedded_supplier_sku": False,
+            }
 
     remaining_non_date_cols = [
         c for c in schema.get("columns", [])
