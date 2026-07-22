@@ -2511,6 +2511,25 @@ def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
         session.setdefault("_final_resolved_dates", {})[sheet_name] = {
             str(k): v.isoformat() for k, v in complete_map.items()
         }
+
+        # Sanity-check the RESULT, independent of how the axis was
+        # determined - this catches a wrong axis by its symptom (duplicate
+        # or nonsensical resolved dates), not just by fixing each specific
+        # mechanism that could produce one as it's individually found. A
+        # genuine per-column date axis should never resolve two different
+        # columns to the same date - a real production case: a merged
+        # title tied with the real date row and won, and (had it also
+        # picked up bogus values instead of failing outright) would have
+        # shown up here as every column resolving to the same one date.
+        if len(complete_map) >= 2:
+            dates_seen = list(complete_map.values())
+            if len(dates_seen) != len(set(dates_seen)):
+                dupe_count = len(dates_seen) - len(set(dates_seen))
+                session.setdefault("flags", {})[f"duplicate_dates_{sheet_name}"] = (
+                    f"{dupe_count} of {len(dates_seen)} resolved date columns in '{sheet_name}' "
+                    f"share a date with another column - a genuine weekly/period axis should "
+                    f"never repeat a date across columns. Verify the date axis was identified correctly."
+                )
     except Exception as e:
         session.setdefault("_final_resolved_dates", {}).setdefault(sheet_name, {})
         session.setdefault("errors", []).append(f"resolved_dates computation failed for '{sheet_name}': {e}")
