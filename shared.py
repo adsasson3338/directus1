@@ -244,10 +244,12 @@ def extract_leading_month(val) -> Optional[int]:
             return None
     m = re.match(r'^(\d{1,2})/(\d{1,2})[-–](\d{1,2})/(\d{1,2})$', s)
     if m:
-        return int(m.group(3))
+        end_month = int(m.group(3))
+        return end_month if 1 <= end_month <= 12 else None
     m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
     if m:
-        return int(m.group(1))
+        month_num = int(m.group(1))
+        return month_num if 1 <= month_num <= 12 else None
     m = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk\s*\d+$', s, re.IGNORECASE)
     if m:
         return MONTH_MAP[m.group(1).lower()[:3]]
