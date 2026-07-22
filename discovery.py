@@ -1257,6 +1257,39 @@ def find_sales_shaped_columns_from_rows(rows: list) -> list:
     return candidates
 
 
+def find_candidate_header_rows(schema: dict, candidate_cols: list, max_candidates: int = 5) -> list:
+    """
+    Same ranking logic as find_probable_header_row (distinct value count
+    first, raw non-empty count second), but returns the TOP N candidate
+    rows (1-based) instead of just the single best one.
+
+    Exists so a caller can actually TRY each candidate - attempting real
+    date resolution against it - and use the first one that genuinely
+    works, rather than trusting this heuristic alone and only finding out
+    afterward, via a flag, that the top-ranked choice didn't resolve any
+    real dates. See _finalize_date_config for where this gets used that way.
+    """
+    row_counts    = {}
+    row_distinct  = {}
+    col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
+    for col_1 in candidate_cols:
+        cs = col_schema_map.get(col_1, {})
+        for h in cs.get("header_stack", []):
+            val = str(h.get("value", "")).strip()
+            if val:
+                row = h["row"]
+                row_counts[row] = row_counts.get(row, 0) + 1
+                row_distinct.setdefault(row, set()).add(val)
+    if not row_counts:
+        return [1]
+    ranked = sorted(
+        row_counts.keys(),
+        key=lambda r: (len(row_distinct.get(r, set())), row_counts[r]),
+        reverse=True,
+    )
+    return ranked[:max_candidates]
+
+
 def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
     """
     Among the header rows, find the one with the most non-empty values
@@ -1282,21 +1315,13 @@ def find_probable_header_row(schema: dict, candidate_cols: list) -> int:
     without needing to know whether the values are date-like yet, which
     matters because this function is also used for genuinely new,
     unrecognized formats that can't be checked against a known pattern.
+
+    Thin wrapper around find_candidate_header_rows for callers that just
+    want the single top choice - _finalize_date_config uses the full
+    ranked list instead, to retry lower-ranked candidates automatically
+    if the top one doesn't actually resolve real dates.
     """
-    row_counts    = {}
-    row_distinct  = {}
-    col_schema_map = {c["col"]: c for c in schema.get("columns", [])}
-    for col_1 in candidate_cols:
-        cs = col_schema_map.get(col_1, {})
-        for h in cs.get("header_stack", []):
-            val = str(h.get("value", "")).strip()
-            if val:
-                row = h["row"]
-                row_counts[row] = row_counts.get(row, 0) + 1
-                row_distinct.setdefault(row, set()).add(val)
-    if not row_counts:
-        return 1
-    return max(row_counts, key=lambda r: (len(row_distinct.get(r, set())), row_counts[r]))
+    return find_candidate_header_rows(schema, candidate_cols, max_candidates=1)[0]
 
 
 def find_probable_header_row_from_rows(rows: list, candidate_cols: list) -> int:
@@ -2508,9 +2533,65 @@ def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
 
     try:
         complete_map = build_date_map(header_row, dc.get("date_cols", []), dc)
+
+        # If the chosen axis row resolves poorly, automatically retry
+        # against the NEXT-ranked candidate rows before ever falling back
+        # to a flag that requires a human to manually diagnose and
+        # retrigger. find_candidate_header_rows already scored every
+        # plausible row during selection - this reuses those scores rather
+        # than re-deriving them, and picks whichever one ACTUALLY resolves
+        # real dates (verified directly, not just by the heuristic that
+        # ranked it), not just the top-ranked guess. Real case this fixes:
+        # a merged title tied with the genuine date row on the ranking
+        # heuristic and won by insertion order - this retry loop means
+        # that even if a similar tie happens again for a different reason,
+        # the system tries the alternative itself instead of silently
+        # shipping 0 resolved dates.
+        expected_cols = len(dc.get("date_cols", []))
+        resolved_rate = (len(complete_map) / expected_cols) if expected_cols else 1.0
+
+        if expected_cols > 0 and resolved_rate < 0.8:
+            schema = session.get("_schemas", {}).get(sheet_name, {})
+            candidate_cols_1based = [c + 1 for c in dc.get("date_cols", [])]
+            tried_rows = {axis_row_0 + 1}
+            for candidate_1based in find_candidate_header_rows(schema, candidate_cols_1based, max_candidates=5):
+                if candidate_1based in tried_rows:
+                    continue
+                tried_rows.add(candidate_1based)
+                candidate_0based = candidate_1based - 1
+                trial_header_row = rows[candidate_0based] if candidate_0based < len(rows) else ()
+                trial_map  = build_date_map(trial_header_row, dc.get("date_cols", []), dc)
+                trial_rate = (len(trial_map) / expected_cols) if expected_cols else 0
+                if trial_rate > resolved_rate:
+                    session.setdefault("flags", {})[f"date_axis_auto_corrected_{sheet_name}"] = (
+                        f"Initial date axis row for '{sheet_name}' only resolved "
+                        f"{len(complete_map)}/{expected_cols} dates - automatically retried "
+                        f"alternate candidate rows and switched to row {candidate_0based} "
+                        f"(0-based), which resolved {len(trial_map)}/{expected_cols}. "
+                        f"Worth confirming this looks right."
+                    )
+                    axis_row_0    = candidate_0based
+                    dc["date_axis_row"] = axis_row_0
+                    complete_map  = trial_map
+                    resolved_rate = trial_rate
+                    if resolved_rate >= 0.8:
+                        break  # good enough - stop trying further candidates
+
         session.setdefault("_final_resolved_dates", {})[sheet_name] = {
             str(k): v.isoformat() for k, v in complete_map.items()
         }
+
+        # Still bad even after trying alternate candidates - this genuinely
+        # needs a human now, not another automatic retry. Distinct from
+        # date_axis_auto_corrected above: that flag means the system fixed
+        # itself and it's worth a confirming glance; this one means it
+        # couldn't, and ingestion will write nothing for this sheet as-is.
+        if expected_cols > 0 and resolved_rate < 0.5:
+            session.setdefault("flags", {})[f"low_date_resolution_{sheet_name}"] = (
+                f"Tried multiple candidate header rows for '{sheet_name}' - best only resolved "
+                f"{len(complete_map)} of {expected_cols} identified date columns. Ingestion will "
+                f"silently write nothing for this sheet unless this is manually reviewed."
+            )
 
         # Sanity-check the RESULT, independent of how the axis was
         # determined - this catches a wrong axis by its symptom (duplicate
@@ -2530,6 +2611,37 @@ def _finalize_date_config(session: dict, sheet_name: str, dc: dict) -> None:
                     f"share a date with another column - a genuine weekly/period axis should "
                     f"never repeat a date across columns. Verify the date axis was identified correctly."
                 )
+
+        # Second, independent check: do the resolved date columns actually
+        # have real sales DATA beneath them - not just internally
+        # consistent, distinct-looking dates? A wrong axis can still
+        # produce distinct dates (this check doesn't overlap with the
+        # duplicate-date one above) while pointing at rows that don't
+        # correspond to real per-week figures at all. A genuine weekly
+        # sales column should be substantially numeric and populated
+        # across real data rows; checks each resolved column's actual
+        # data, the same way find_sales_shaped_columns already does for
+        # the escalation path - reused here as a final cross-check on the
+        # CONFIRMED axis, not just the candidate one.
+        if complete_map:
+            data_start = dc.get("data_start_row", 1)
+            sample_rows = rows[data_start:data_start + 100]
+            if sample_rows:
+                weak_cols = []
+                for col in complete_map.keys():
+                    non_null = [r[col] for r in sample_rows if col < len(r) and r[col] is not None]
+                    numeric  = [v for v in non_null if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                    fill_rate    = len(non_null) / len(sample_rows)
+                    numeric_rate = (len(numeric) / len(non_null)) if non_null else 0
+                    if fill_rate < 0.1 or numeric_rate < 0.5:
+                        weak_cols.append(col)
+                if len(weak_cols) > len(complete_map) / 2:
+                    session.setdefault("flags", {})[f"weak_sales_data_{sheet_name}"] = (
+                        f"{len(weak_cols)} of {len(complete_map)} resolved date columns in "
+                        f"'{sheet_name}' have little or no real numeric data beneath them - "
+                        f"the date axis may be pointing at the wrong row/columns rather than "
+                        f"genuine per-week sales figures. Verify before trusting this file's data."
+                    )
     except Exception as e:
         session.setdefault("_final_resolved_dates", {}).setdefault(sheet_name, {})
         session.setdefault("errors", []).append(f"resolved_dates computation failed for '{sheet_name}': {e}")
