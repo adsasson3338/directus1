@@ -24,7 +24,7 @@ from shared import (
     load_date_patterns, match_known_patterns, normalize_header_shape,
     compute_date_from_match, build_insert_date_pattern_sql,
     build_fetch_existing_patterns_for_dedup_sql,
-    build_date_map, resolve_date_header,
+    build_date_map, resolve_date_header, extract_leading_month, MONTH_MAP,
     build_sweep_fail_row_sql,
 )
 
@@ -79,41 +79,28 @@ def is_date_like(val) -> bool:
 
 
 
-MONTH_MAP = {
-    'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
-    'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12
-}
-
 def extract_month_sequence(row, col_list: list) -> list:
     """
-    Extract the tracking month for each date column in order.
-    For date-range strings, uses the END month (the resolved date).
-    For fiscal week labels, uses the month number.
-    For datetime objects, uses the month directly.
-    Returns a list of ints (1-12) or None for unparseable values.
+    Extract the tracking month for each date column in order - used for
+    year-boundary detection (does this axis cross a Dec->Jan boundary).
+
+    Thin wrapper around shared.py's extract_leading_month(), which is the
+    ONE place this logic is actually implemented now. This used to be a
+    third, independent copy of the same date-range/fiscal-week regex plus
+    its own MONTH_MAP - meaning a fix to one copy silently left the other
+    two on old behavior. Also means any format extract_leading_month
+    already knows how to handle (embedded-year strings, datetime objects)
+    works here automatically too, without needing its own case added here.
+
+    Returns a list of ints (1-12) or None for unparseable values, one per
+    column in col_list, in order.
     """
     months = []
     for ci in col_list:
         if ci >= len(row) or row[ci] is None:
             months.append(None)
             continue
-        val = row[ci]
-        if isinstance(val, datetime):
-            months.append(val.month)
-            continue
-        s = str(val).strip()
-        # date_range: use END month
-        m = re.match(r'^(\d{1,2})/(\d{1,2})[-\u2013](\d{1,2})/(\d{1,2})$', s)
-        if m:
-            months.append(int(m.group(3)))
-            continue
-        # fiscal week label
-        mf = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+wk',
-                      s, re.IGNORECASE)
-        if mf:
-            months.append(MONTH_MAP[mf.group(1).lower()[:3]])
-            continue
-        months.append(None)
+        months.append(extract_leading_month(row[ci]))
     return months
 
 
@@ -974,6 +961,17 @@ def find_sales_cols_from_schema(schema: dict, date_schema: dict) -> list:
     AI provides only section label context (sales_section_label, stop_labels).
     Everything else is detected by Python.
     """
+    # detect_date_axis_row()'s fallback (row 1, when nothing matches a known
+    # pattern anywhere) is safe HERE specifically, unlike the two other call
+    # sites already replaced with find_probable_header_row() elsewhere in
+    # this file: is_date_value() below independently re-checks the SAME
+    # match_known_patterns() condition per column, so if the fallback fired
+    # (meaning NOTHING matched anywhere in the schema), every column's check
+    # fails regardless of which row was chosen - sales_cols correctly comes
+    # back empty either way. The other two call sites used this row to
+    # determine which row to READ REAL DATA VALUES from - a wrong choice
+    # there directly produced wrong data (a title row instead of a header
+    # row), which is a different, unsafe failure mode this one doesn't share.
     date_axis_row     = detect_date_axis_row(schema)                         # 1-based, Python
     first_sales_col   = detect_first_sales_col(schema, date_axis_row)        # 1-based, Python
     section_label_row = date_schema.get("section_label_row")                 # 1-based or None, AI
