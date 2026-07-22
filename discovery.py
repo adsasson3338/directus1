@@ -13,7 +13,10 @@ import re
 import uuid
 import json
 import time
+from collections import Counter
 from datetime import datetime, date, timedelta
+
+from config import MAX_UPLOAD_BYTES
 
 from shared import (
     _sessions, _jobs,
@@ -213,18 +216,32 @@ def find_date_axis(rows) -> dict | None:
         if a is not None and b is not None
     )
 
-    # Filter out inventory/summary columns that have date headers but are not sales
-    # Check the row above the date axis for inventory-related labels
-    # (INVENTORY_LABELS is now a module-level constant, shared with the
-    # column_mapping gate in stage_schema_classify)
+    # Filter out inventory/summary columns that have date headers but are not sales.
+    # Check the row above the date axis - real sales-week columns share a
+    # UNIFORM label there (blank, or the same repeated word like "Units").
+    # A column whose label disagrees with what the vast majority of its
+    # neighbors show is the anomaly, regardless of what specific word it
+    # uses - this catches inventory/summary columns generically, without
+    # needing to anticipate every synonym a retailer might use (unlike
+    # INVENTORY_LABELS alone, which only catches words already on the
+    # list). Kept alongside the keyword check, not instead of it: if labels
+    # are too varied for a clear majority to exist, the keyword check still
+    # catches the known cases directly.
     if best["row"] > 0:
         label_row = rows[best["row"] - 1]
+
+        def _label_for(ci):
+            return str(label_row[ci]).strip().lower() if ci < len(label_row) and label_row[ci] else ""
+
+        labels = {ci: _label_for(ci) for ci in cols}
+        label_counts = Counter(labels.values())
+        dominant_label, dominant_count = (label_counts.most_common(1) or [(None, 0)])[0]
+        strong_majority = bool(labels) and (dominant_count / len(labels) >= 0.8)
+
         cols = [
             ci for ci in cols
-            if not any(
-                inv in (str(label_row[ci]).strip().lower() if ci < len(label_row) and label_row[ci] else "")
-                for inv in INVENTORY_LABELS
-            )
+            if not any(inv in labels[ci] for inv in INVENTORY_LABELS)
+            and not (strong_majority and labels[ci] != dominant_label)
         ]
         # Rebuild samples from the filtered cols directly, rather than
         # zipping against the pre-truncated (display-only) samples list -
@@ -2530,7 +2547,6 @@ async def handle_discovery_file_binary(session_id: str, data: bytes, filename: s
         session["result"] = {"status": known_type}
         return
 
-    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
     if len(data) > MAX_UPLOAD_BYTES:
         session["stage"]  = "complete"
         session["status"] = "complete"
